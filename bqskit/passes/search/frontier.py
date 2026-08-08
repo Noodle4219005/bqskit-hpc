@@ -72,6 +72,10 @@ class Frontier:
         """Return true if the frontier is empty."""
         return len(self._frontier) == 0
 
+    def __len__(self) -> int:
+        """Return the number of nodes currently queued."""
+        return len(self._frontier)
+
     def clear(self) -> None:
         """Remove all elements from the frontier."""
         self._frontier.clear()

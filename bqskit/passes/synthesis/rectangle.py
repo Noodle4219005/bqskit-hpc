@@ -75,7 +75,10 @@ the same unitary are not detected as duplicates.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
 from typing import Any
 
 from bqskit.compiler.passdata import PassData
@@ -96,6 +99,44 @@ from bqskit.utils.typing import is_integer
 from bqskit.utils.typing import is_real_number
 
 _logger = logging.getLogger(__name__)
+
+# --- per-dispatch probe -----------------------------------------------------
+# Active only when BQPROF_DIR is set (see scripts/bqprof_site/sitecustomize.py
+# for the sibling probes this follows the convention of). One JSON line per
+# iteration that actually dispatches a batch, appended and flushed
+# immediately -- Compiler terminates the runtime server on exit, so an
+# atexit-flushed buffer would never be written. A probe failure must never
+# break the search, so every write is wrapped in a bare except.
+#
+# The file is opened LAZILY, on the first record actually emitted, not at
+# import time. Every bqskit process that imports this module -- including
+# ones that never construct or run RectangleSynthesisPass -- would otherwise
+# create an empty rect_<pid>.jsonl merely by importing it.
+_BQPROF_DIR = os.environ.get('BQPROF_DIR')
+_bqprof_fh = None
+_bqprof_open_attempted = False
+
+
+def _bqprof_emit(record: dict[str, Any]) -> None:
+    global _bqprof_fh, _bqprof_open_attempted
+    if not _BQPROF_DIR:
+        return
+    if _bqprof_fh is None:
+        if _bqprof_open_attempted:
+            return
+        _bqprof_open_attempted = True
+        try:
+            os.makedirs(_BQPROF_DIR, exist_ok=True)
+            _bqprof_fh = open(
+                os.path.join(_BQPROF_DIR, 'rect_%d.jsonl' % os.getpid()),
+                'a', buffering=1,
+            )
+        except Exception:
+            return
+    try:
+        _bqprof_fh.write(json.dumps(record) + '\n')
+    except Exception:
+        pass
 
 
 def structure_key(circuit: Circuit) -> tuple[Any, ...]:
@@ -294,6 +335,7 @@ class RectangleSynthesisPass(SynthesisPass):
 
         while openlists:
             iteration += 1
+            n_discarded_by_pop = 0
 
             # --- select the row -------------------------------------------
             # One node from every already-explored level, then `deepen` from
@@ -302,7 +344,8 @@ class RectangleSynthesisPass(SynthesisPass):
             picks: list[tuple[Circuit, int]] = []
 
             for level in sorted(openlists):
-                node = self._pop_useful(openlists, level, incumbent_layer)
+                node, n_disc = self._pop_useful(openlists, level, incumbent_layer)
+                n_discarded_by_pop += n_disc
                 if node is not None:
                     picks.append((node, level))
 
@@ -312,8 +355,10 @@ class RectangleSynthesisPass(SynthesisPass):
                 deepest += 1
                 openlists.setdefault(deepest, Frontier(utry, self.heuristic_function))
 
+            deepen_this_iter = deepen
             for _ in range(deepen):
-                node = self._pop_useful(openlists, deepest, incumbent_layer)
+                node, n_disc = self._pop_useful(openlists, deepest, incumbent_layer)
+                n_discarded_by_pop += n_disc
                 if node is None:
                     break
                 picks.append((node, deepest))
@@ -333,15 +378,20 @@ class RectangleSynthesisPass(SynthesisPass):
             # --- expand the row into ONE batch ----------------------------
             batch: list[Circuit] = []
             parents: list[int] = []
+            n_dropped_admission = 0
+            n_dup_skipped = 0
             for node, level in picks:
                 if self.max_layer is not None and level + 1 > self.max_layer:
+                    n_dropped_admission += 1
                     continue
                 if incumbent_layer is not None and level + 1 >= incumbent_layer:
+                    n_dropped_admission += 1
                     continue    # sound: g alone already matches the incumbent
                 for succ in layer_gen.gen_successors(node, data):
                     if self.detect_duplicates:
                         key = structure_key(succ)
                         if key in seen:
+                            n_dup_skipped += 1
                             continue
                         seen.add(key)
                     batch.append(succ)
@@ -360,6 +410,25 @@ class RectangleSynthesisPass(SynthesisPass):
                 'Rectangle iteration %d: %d levels, batch of %d.'
                 % (iteration, len(openlists), len(batch)),
             )
+
+            if _BQPROF_DIR:
+                _bqprof_emit({
+                    'iteration': iteration,
+                    'aspect': self.aspect,
+                    'incumbent_layer': incumbent_layer,
+                    'deepest': deepest,
+                    'deepen': deepen_this_iter,
+                    'openlist_sizes': {
+                        lvl: len(f) for lvl, f in openlists.items()
+                    },
+                    'pick_levels': [lvl for _, lvl in picks],
+                    'batch_size': len(batch),
+                    'n_dropped_admission': n_dropped_admission,
+                    'n_dup_skipped': n_dup_skipped,
+                    'n_discarded_by_pop': n_discarded_by_pop,
+                    't': time.perf_counter(),
+                    'pid': os.getpid(),
+                })
 
             circuits = await get_runtime().map(
                 Circuit.instantiate,
@@ -423,22 +492,31 @@ class RectangleSynthesisPass(SynthesisPass):
         openlists: dict[int, Frontier],
         level: int,
         incumbent_layer: int | None,
-    ) -> Circuit | None:
+    ) -> tuple[Circuit | None, int]:
         """Pop the best node at `level`, skipping ones the incumbent dominates.
 
         With g(n) = level and h = 0 the test is f(n) >= g(incumbent), which is
         the paper's prune specialised to this domain -- sound regardless of what
         the ordering heuristic does.
+
+        Returns `(circuit, n_discarded)`: `n_discarded` counts nodes popped and
+        thrown away by the incumbent guard before either a usable node was
+        found or the frontier ran dry. Since the guard is a function of
+        `level` alone (not of the popped node), once it fires it fires for
+        every remaining node at this level -- so this can drain the entire
+        level's frontier in one call.
         """
         frontier = openlists.get(level)
         if frontier is None:
-            return None
+            return None, 0
+        n_discarded = 0
         while not frontier.empty():
             circuit, _extra = frontier.pop()
             if incumbent_layer is not None and level >= incumbent_layer:
+                n_discarded += 1
                 continue
-            return circuit
-        return None
+            return circuit, n_discarded
+        return None, n_discarded
 
     def _get_layer_gen(self, data: PassData) -> LayerGenerator:
         """Mirror of LEAPSynthesisPass._get_layer_gen so the two are swappable."""
