@@ -29,6 +29,7 @@ synthesis pass to convert the circuit to native gates.
     :recursive:
 
     LEAPSynthesisPass
+    RectangleSynthesisPass
     QSearchSynthesisPass
     QFASTDecompositionPass
     QPredictDecompositionPass
@@ -295,6 +296,7 @@ from bqskit.passes.synthesis.bzxz import BlockZXZPass
 from bqskit.passes.synthesis.bzxz import FullBlockZXZPass
 from bqskit.passes.synthesis.diagonal import WalshDiagonalSynthesisPass
 from bqskit.passes.synthesis.leap import LEAPSynthesisPass
+from bqskit.passes.synthesis.rectangle import RectangleSynthesisPass
 from bqskit.passes.synthesis.pas import PermutationAwareSynthesisPass
 from bqskit.passes.synthesis.qfast import QFASTDecompositionPass
 from bqskit.passes.synthesis.qpredict import QPredictDecompositionPass
@@ -336,6 +338,7 @@ __all__ = [
     'SynthesisPass',
     'WalshDiagonalSynthesisPass',
     'LEAPSynthesisPass',
+    'RectangleSynthesisPass',
     'QSearchSynthesisPass',
     'FullQSDPass',
     'QSDPass',

@@ -1,7 +1,10 @@
 """This module implements the LEAPSynthesisPass."""
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
 from typing import Any
 
 import numpy as np
@@ -25,6 +28,150 @@ from bqskit.utils.typing import is_integer
 from bqskit.utils.typing import is_real_number
 
 _logger = logging.getLogger(__name__)
+
+
+# Optional measurement for completed instantiation work that follows LEAP's
+# first successful cost evaluation in a map batch. The source-level hooks below
+# are deliberately guarded so the ordinary LEAP path remains byte-for-byte
+# equivalent in its control flow when the probe is disabled.
+_LEAPWASTE_DIR = os.environ.get('BQPROF_LEAPWASTE_DIR') or os.environ.get(
+    'BQPROF_LEAPWASTE_AGG_DIR',
+)
+_LEAPWASTE_AGGREGATE = os.environ.get('BQPROF_LEAPWASTE_AGGREGATE') == '1'
+# Optional benchmark-only override; unset preserves the normal LEAP defaults.
+_MIN_PREFIX_SIZE_OVERRIDE = os.environ.get('BQSKIT_MIN_PREFIX_SIZE')
+_LEAPWASTE_COUNTER = 0
+_LEAPWASTE_FH_STATE = {'pid': None, 'fh': None}
+_LEAPWASTE_AGG_STATE: dict[str, Any] = {}
+
+
+def _leapwaste_new_synth_id() -> str:
+    """Return a process-qualified identifier for one ``synthesize`` call."""
+    global _LEAPWASTE_COUNTER
+    _LEAPWASTE_COUNTER += 1
+    return f'{os.getpid()}-{_LEAPWASTE_COUNTER}'
+
+
+def _leapwaste_emit(record: dict[str, Any]) -> None:
+    """Append one LEAP iteration record using a fork-safe JSONL handle."""
+    if not _LEAPWASTE_DIR or _LEAPWASTE_AGGREGATE:
+        return
+    try:
+        pid = os.getpid()
+        if _LEAPWASTE_FH_STATE['pid'] != pid:
+            os.makedirs(_LEAPWASTE_DIR, exist_ok=True)
+            _LEAPWASTE_FH_STATE['fh'] = open(
+                os.path.join(_LEAPWASTE_DIR, f'leapiter_{pid}.jsonl'),
+                'a',
+                buffering=1,
+            )
+            _LEAPWASTE_FH_STATE['pid'] = pid
+        _LEAPWASTE_FH_STATE['fh'].write(json.dumps(record) + '\n')
+    except Exception:
+        pass
+
+
+def _leapwaste_aggregate_flush(force: bool = False) -> None:
+    """Atomically refresh one compact aggregate file for this process."""
+    if not _LEAPWASTE_DIR or not _LEAPWASTE_AGGREGATE:
+        return
+    now = time.monotonic()
+    if not force and now - _LEAPWASTE_AGG_STATE.get('last_flush', 0.0) < 30.0:
+        return
+    pid = os.getpid()
+    if _LEAPWASTE_AGG_STATE.get('pid') != pid:
+        _LEAPWASTE_AGG_STATE.clear()
+        _LEAPWASTE_AGG_STATE.update({
+            'pid': pid,
+            'last_flush': 0.0,
+            'iterations': 0,
+            'synth_calls': 0,
+            'prefix_formed': 0,
+            'terminated': 0,
+            'sum_n_after_win': 0,
+            'n_after_win_count': 0,
+            'sum_n_cleared': 0,
+            'n_cleared_count': 0,
+            'frontier_len_hist': {},
+            'n_successors_hist': {},
+            'layer_hist': {},
+            'max_layer_per_synth_hist': {},
+            'active_synth_max_layer': None,
+        })
+    summary = {
+        key: value for key, value in _LEAPWASTE_AGG_STATE.items()
+        if key != 'last_flush'
+    }
+    path = os.path.join(_LEAPWASTE_DIR, f'leapagg_{pid}.json')
+    temporary = f'{path}.tmp'
+    try:
+        os.makedirs(_LEAPWASTE_DIR, exist_ok=True)
+        with open(temporary, 'w', encoding='utf-8') as handle:
+            json.dump(summary, handle, separators=(',', ':'))
+        os.replace(temporary, path)
+        _LEAPWASTE_AGG_STATE['last_flush'] = now
+    except Exception:
+        pass
+
+
+def _leapwaste_aggregate_record(
+    frontier_len: int,
+    n_successors: int,
+    layer: int,
+    prefix_formed: bool,
+    terminated: bool,
+    n_after_win: int | None,
+    n_cleared: int | None,
+) -> None:
+    """Count one iteration without writing a per-iteration record."""
+    if not _LEAPWASTE_DIR or not _LEAPWASTE_AGGREGATE:
+        return
+    _leapwaste_aggregate_flush()
+    hist_frontier = _LEAPWASTE_AGG_STATE['frontier_len_hist']
+    hist_successors = _LEAPWASTE_AGG_STATE['n_successors_hist']
+    hist_layers = _LEAPWASTE_AGG_STATE['layer_hist']
+    frontier_key = str(frontier_len)
+    successor_key = str(n_successors)
+    layer_key = str(layer)
+    hist_frontier[frontier_key] = hist_frontier.get(frontier_key, 0) + 1
+    hist_successors[successor_key] = hist_successors.get(successor_key, 0) + 1
+    hist_layers[layer_key] = hist_layers.get(layer_key, 0) + 1
+    _LEAPWASTE_AGG_STATE['active_synth_max_layer'] = max(
+        _LEAPWASTE_AGG_STATE['active_synth_max_layer'] or layer,
+        layer,
+    )
+    _LEAPWASTE_AGG_STATE['iterations'] += 1
+    if prefix_formed:
+        _LEAPWASTE_AGG_STATE['prefix_formed'] += 1
+    if terminated:
+        _LEAPWASTE_AGG_STATE['terminated'] += 1
+    if n_after_win is not None:
+        _LEAPWASTE_AGG_STATE['sum_n_after_win'] += n_after_win
+        _LEAPWASTE_AGG_STATE['n_after_win_count'] += 1
+    if n_cleared is not None:
+        _LEAPWASTE_AGG_STATE['sum_n_cleared'] += n_cleared
+        _LEAPWASTE_AGG_STATE['n_cleared_count'] += 1
+    _leapwaste_aggregate_flush()
+
+
+def _leapwaste_aggregate_start() -> None:
+    """Start one aggregate process state and count its synthesize call."""
+    if not _LEAPWASTE_DIR or not _LEAPWASTE_AGGREGATE:
+        return
+    _leapwaste_aggregate_flush(force=True)
+    _LEAPWASTE_AGG_STATE['synth_calls'] += 1
+    _LEAPWASTE_AGG_STATE['active_synth_max_layer'] = 0
+
+
+def _leapwaste_aggregate_finish() -> None:
+    """Persist the latest aggregate state at a synthesize boundary."""
+    if _LEAPWASTE_AGG_STATE.get('active_synth_max_layer') is not None:
+        max_layer = _LEAPWASTE_AGG_STATE['active_synth_max_layer']
+        hist = _LEAPWASTE_AGG_STATE['max_layer_per_synth_hist']
+        max_layer_key = str(max_layer)
+        hist[max_layer_key] = hist.get(max_layer_key, 0) + 1
+        _LEAPWASTE_AGG_STATE['active_synth_max_layer'] = None
+    _leapwaste_aggregate_flush(force=True)
 
 
 class LEAPSynthesisPass(SynthesisPass):
@@ -99,6 +246,9 @@ class LEAPSynthesisPass(SynthesisPass):
         Raises:
             ValueError: If `max_depth` or `min_prefix_size` is nonpositive.
         """
+        if _MIN_PREFIX_SIZE_OVERRIDE is not None:
+            min_prefix_size = int(_MIN_PREFIX_SIZE_OVERRIDE)
+
         if not isinstance(heuristic_function, HeuristicFunction):
             raise TypeError(
                 'Expected HeursiticFunction, got %s.'
@@ -171,6 +321,13 @@ class LEAPSynthesisPass(SynthesisPass):
         data: PassData,
     ) -> Circuit:
         """Synthesize `utry`, see :class:`SynthesisPass` for more."""
+        leapwaste_enabled = bool(_LEAPWASTE_DIR)
+        aggregate_enabled = leapwaste_enabled and _LEAPWASTE_AGGREGATE
+        synth_id = _leapwaste_new_synth_id() if leapwaste_enabled else None
+        iteration = 0
+        if aggregate_enabled:
+            _leapwaste_aggregate_start()
+
         # Initialize run-dependent options
         instantiate_options = self.instantiate_options.copy()
 
@@ -203,6 +360,8 @@ class LEAPSynthesisPass(SynthesisPass):
         # Evalute initial layer
         if best_dist < self.success_threshold:
             _logger.debug('Successful synthesis with 0 layers.')
+            if aggregate_enabled:
+                _leapwaste_aggregate_finish()
             return initial_layer
 
         # Record layers that have been warned about
@@ -211,24 +370,71 @@ class LEAPSynthesisPass(SynthesisPass):
 
         # Main loop
         while not frontier.empty():
+            if leapwaste_enabled:
+                frontier_len_before_pop = len(frontier)
+                n_added_this_iter = 0
+                prefix_formed = False
+                n_cleared = None
             top_circuit, layer = frontier.pop()
+            current_iteration = iteration
+            iteration += 1
 
             # Generate successors
             successors = layer_gen.gen_successors(top_circuit, data)
 
             if len(successors) == 0:
+                if leapwaste_enabled:
+                    _leapwaste_emit({
+                        'synth_id': synth_id,
+                        'iteration': current_iteration,
+                        'layer': layer,
+                        'n_successors': 0,
+                        'map_id': None,
+                        't_map_start': None,
+                        't_map_end': None,
+                        'terminated': False,
+                        'win_index': None,
+                        'n_after_win': None,
+                        'frontier_len_before_pop': frontier_len_before_pop,
+                        'frontier_len_after_adds': len(frontier),
+                        'n_added_this_iter': n_added_this_iter,
+                        'prefix_formed': prefix_formed,
+                        'n_cleared': n_cleared,
+                    })
+                if aggregate_enabled:
+                    _leapwaste_aggregate_record(
+                        frontier_len_before_pop,
+                        0,
+                        layer,
+                        prefix_formed,
+                        False,
+                        None,
+                        n_cleared,
+                    )
                 continue
 
             # Instantiate successors
-            circuits = await get_runtime().map(
-                Circuit.instantiate,
-                successors,
-                target=utry,
-                **instantiate_options,
-            )
+            if leapwaste_enabled:
+                t_map_start = time.time()
+                map_future = get_runtime().map(
+                    Circuit.instantiate,
+                    successors,
+                    target=utry,
+                    **instantiate_options,
+                )
+                map_id = getattr(map_future, '_bqprof_leapwaste_map_id', None)
+                circuits = await map_future
+                t_map_end = time.time()
+            else:
+                circuits = await get_runtime().map(
+                    Circuit.instantiate,
+                    successors,
+                    target=utry,
+                    **instantiate_options,
+                )
 
             # Evaluate successors
-            for circuit in circuits:
+            for win_index, circuit in enumerate(circuits):
                 dist = self.cost.calc_cost(circuit, utry)
 
                 if dist < self.success_threshold:
@@ -237,6 +443,35 @@ class LEAPSynthesisPass(SynthesisPass):
                     )
                     if self.store_partial_solutions:
                         data['psols'] = psols
+                    if leapwaste_enabled:
+                        _leapwaste_emit({
+                            'synth_id': synth_id,
+                            'iteration': current_iteration,
+                            'layer': layer,
+                            'n_successors': len(successors),
+                            'map_id': map_id,
+                            't_map_start': t_map_start,
+                            't_map_end': t_map_end,
+                            'terminated': True,
+                            'win_index': win_index,
+                            'n_after_win': len(circuits) - win_index - 1,
+                            'frontier_len_before_pop': frontier_len_before_pop,
+                            'frontier_len_after_adds': len(frontier),
+                            'n_added_this_iter': n_added_this_iter,
+                            'prefix_formed': prefix_formed,
+                            'n_cleared': n_cleared,
+                        })
+                    if aggregate_enabled:
+                        _leapwaste_aggregate_record(
+                            frontier_len_before_pop,
+                            len(successors),
+                            layer,
+                            prefix_formed,
+                            True,
+                            len(circuits) - win_index - 1,
+                            n_cleared,
+                        )
+                        _leapwaste_aggregate_finish()
                     return circuit
 
                 if self.check_new_best(layer + 1, dist, best_layer, best_dist):
@@ -258,9 +493,14 @@ class LEAPSynthesisPass(SynthesisPass):
                     ):
                         _logger.debug(f'Prefix formed at {layer + 1} layers.')
                         last_prefix_layer = layer + 1
+                        if leapwaste_enabled:
+                            prefix_formed = True
+                            n_cleared = len(frontier)
                         frontier.clear()
                         if self.max_layer is None or layer + 1 < self.max_layer:
                             frontier.add(circuit, layer + 1)
+                            if leapwaste_enabled:
+                                n_added_this_iter += 1
 
                 if self.store_partial_solutions:
                     if layer not in psols:
@@ -274,6 +514,37 @@ class LEAPSynthesisPass(SynthesisPass):
 
                 if self.max_layer is None or layer + 1 < self.max_layer:
                     frontier.add(circuit, layer + 1)
+                    if leapwaste_enabled:
+                        n_added_this_iter += 1
+
+            if leapwaste_enabled:
+                _leapwaste_emit({
+                    'synth_id': synth_id,
+                    'iteration': current_iteration,
+                    'layer': layer,
+                    'n_successors': len(successors),
+                    'map_id': map_id,
+                    't_map_start': t_map_start,
+                    't_map_end': t_map_end,
+                    'terminated': False,
+                    'win_index': None,
+                    'n_after_win': None,
+                    'frontier_len_before_pop': frontier_len_before_pop,
+                    'frontier_len_after_adds': len(frontier),
+                    'n_added_this_iter': n_added_this_iter,
+                    'prefix_formed': prefix_formed,
+                    'n_cleared': n_cleared,
+                })
+            if aggregate_enabled:
+                _leapwaste_aggregate_record(
+                    frontier_len_before_pop,
+                    len(successors),
+                    layer,
+                    prefix_formed,
+                    False,
+                    None,
+                    n_cleared,
+                )
 
             layer_diff = abs(best_layer - layer)
             if (
@@ -295,6 +566,8 @@ class LEAPSynthesisPass(SynthesisPass):
         if self.store_partial_solutions:
             data['psols'] = psols
 
+        if aggregate_enabled:
+            _leapwaste_aggregate_finish()
         return best_circ
 
     def check_new_best(

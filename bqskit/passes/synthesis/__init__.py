@@ -5,6 +5,7 @@ from bqskit.passes.synthesis.bzxz import BlockZXZPass
 from bqskit.passes.synthesis.bzxz import FullBlockZXZPass
 from bqskit.passes.synthesis.diagonal import WalshDiagonalSynthesisPass
 from bqskit.passes.synthesis.leap import LEAPSynthesisPass
+from bqskit.passes.synthesis.rectangle import RectangleSynthesisPass
 from bqskit.passes.synthesis.pas import PermutationAwareSynthesisPass
 from bqskit.passes.synthesis.qfast import QFASTDecompositionPass
 from bqskit.passes.synthesis.qpredict import QPredictDecompositionPass
@@ -17,6 +18,7 @@ from bqskit.passes.synthesis.target import SetTargetPass
 
 __all__ = [
     'LEAPSynthesisPass',
+    'RectangleSynthesisPass',
     'QFASTDecompositionPass',
     'QPredictDecompositionPass',
     'QSearchSynthesisPass',
