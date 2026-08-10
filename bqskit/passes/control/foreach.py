@@ -291,6 +291,27 @@ class ForEachBlockPass(BasePass):
         )
 
         _t_dispatch_end = time.perf_counter()
+
+        # Emit the coordinator's own cost as soon as it is paid, not at the
+        # end of the pass. Everything above this line -- collect, the
+        # per-block deep copy / submodel / PassData loop, and the map()
+        # serialisation -- is finished and measured here, while the drain
+        # below may never finish at all: at max_synthesis_size 4 and 5 the
+        # synthesis pass routinely exceeds any budget we can give it, and a
+        # record written only at pass end is then never written.
+        #
+        # That would make the coordinator cost unmeasurable in exactly the
+        # regime the question is about, since the whole point of the msz
+        # sweep is that per-block marshalling grows with block width.
+        # 'phase' separates the two records; reducers must select one.
+        _foreach_emit({
+            'phase': 'dispatch',
+            'n_blocks': len(subcircuits),
+            't_collect': round(_t_collect_end - _t_pass_start, 6),
+            't_preprocess': round(_t_preprocess_end - _t_collect_end, 6),
+            't_dispatch': round(_t_dispatch_end - _t_preprocess_end, 6),
+        })
+
         _postprocess_cpu = 0.0
 
         num_blocks = len(subcircuits)
@@ -349,6 +370,7 @@ class ForEachBlockPass(BasePass):
         _t_replace_end = time.perf_counter()
 
         _foreach_emit({
+            'phase': 'complete',
             'n_blocks': num_blocks,
             'n_replaced': len(points),
             'wall': round(_t_replace_end - _t_pass_start, 6),

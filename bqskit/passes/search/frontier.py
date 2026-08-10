@@ -85,6 +85,28 @@ class Frontier:
             e.element_id for e in heapq.nsmallest(k, self._frontier)
         ]
 
+    def topk_costs(self, k: int) -> list[float]:
+        """Return the heuristic costs of the k cheapest entries, in order.
+
+        Also read-only. Used by the prefix-diversity probe to record what
+        LEAP is about to throw away when a formed prefix clears the
+        frontier: if those costs sit within noise of the candidate being
+        kept, the choice of prefix is close to a coin flip and keeping
+        several is worth something.
+        """
+        if k <= 0 or not self._frontier:
+            return []
+        return [e.cost for e in heapq.nsmallest(k, self._frontier)]
+
+    def score(self, circuit: Circuit) -> float:
+        """Return the heuristic cost `circuit` would get in this frontier.
+
+        Evaluated against the same target and heuristic the frontier sorts
+        by, so the result is directly comparable with `topk_costs`. Does not
+        insert anything.
+        """
+        return self.heuristic_function(circuit, self.target)
+
     def empty(self) -> bool:
         """Return true if the frontier is empty."""
         return len(self._frontier) == 0

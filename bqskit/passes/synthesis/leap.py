@@ -64,12 +64,26 @@ _SPEC_PROBE_K = int(os.environ.get('BQPROF_SPEC_K', '32'))
 # How many pops one snapshot must serve. A speculator of width K dispatches
 # once and hopes the next several commits all come from that dispatch, so the
 # snapshot has to be held across them rather than refreshed each pop.
-_SPEC_WINDOW = int(os.environ.get('BQPROF_SPEC_WINDOW', '8'))
+#
+# The window must default to K, not to a constant. A dispatch of width K can
+# only be repaid by the next K commits, so a window of 8 observes at most 8
+# of the 128 results a K=128 dispatch produced -- and the marginal rank
+# histogram then reports a near-perfect hit rate for wide K purely because
+# top-128 almost certainly contains the next 8 pops. That curve recommends a
+# large K while never having measured what a large K costs.
+_SPEC_WINDOW = int(os.environ.get('BQPROF_SPEC_WINDOW', str(_SPEC_PROBE_K)))
 _SPEC_STATE: dict[str, Any] = {}
 
 
-def _spec_probe_record(rank: int | None) -> None:
-    """Count one pop by the rank it held at the previous pop."""
+def _spec_probe_record(depth: int, rank: int | None) -> None:
+    """Count one pop by its position and rank relative to the snapshot.
+
+    ``depth`` is 0-based: 0 is the first commit after the dispatch, which a
+    speculator gets for free because it is the node that triggered it. The
+    JOINT distribution of (depth, rank) is what the design question needs --
+    coverage of a width-w dispatch is how many of the next w commits held
+    rank < w, and no marginal over either axis can reconstruct that.
+    """
     if not _SPEC_PROBE_DIR:
         return
     if _SPEC_STATE.get('pid') != os.getpid():
@@ -77,16 +91,23 @@ def _spec_probe_record(rank: int | None) -> None:
         _SPEC_STATE.update({
             'pid': os.getpid(), 'k': _SPEC_PROBE_K, 'window': _SPEC_WINDOW,
             'n_pops': 0, 'n_hits': 0, 'n_misses': 0,
-            'rank_hist': {}, 'last_flush': 0.0,
+            'rank_hist': {}, 'depth_rank_hist': {}, 'depth_miss_hist': {},
+            'last_flush': 0.0,
         })
     _SPEC_STATE['n_pops'] += 1
     if rank is None:
         _SPEC_STATE['n_misses'] += 1
+        misses = _SPEC_STATE['depth_miss_hist']
+        dkey = str(depth)
+        misses[dkey] = misses.get(dkey, 0) + 1
     else:
         _SPEC_STATE['n_hits'] += 1
         key = str(rank)
         hist = _SPEC_STATE['rank_hist']
         hist[key] = hist.get(key, 0) + 1
+        jkey = f'{depth}:{rank}'
+        joint = _SPEC_STATE['depth_rank_hist']
+        joint[jkey] = joint.get(jkey, 0) + 1
 
     now = time.monotonic()
     if now - _SPEC_STATE['last_flush'] < 20.0:
@@ -102,6 +123,64 @@ def _spec_probe_record(rank: int | None) -> None:
         _SPEC_STATE['last_flush'] = now
     except Exception:
         pass
+# P0-d: the gate on multi-prefix LEAP.
+#
+# When check_leap_condition fires, LEAP does frontier.clear() and re-seeds
+# with the single new best. That is a destructive commit: every alternative
+# continuation is discarded with no way back. The measured trigger rate at
+# msz=4 is 0.043%, so it almost never happens there -- but docs/19 showed
+# that lowering min_prefix_size makes it happen 13.65% of the time and buys
+# 3.5x, short of the >5.3x needed. The suspicion is that the shortfall is
+# quality being paid for those discarded alternatives.
+#
+# Multi-prefix LEAP keeps K of them and searches them in parallel. Whether
+# that is worth anything is one number: how close the discarded candidates
+# were to the one kept. Close => the choice is near a coin flip and keeping
+# several recovers what the aggressive threshold costs. Far => the kept one
+# was genuinely better and multi-prefix only burns workers.
+#
+# Measurable with no implementation, on an ordinary run.
+_PREFIX_PROBE_DIR = os.environ.get('BQPROF_PREFIX_DIR')
+_PREFIX_PROBE_K = int(os.environ.get('BQPROF_PREFIX_K', '16'))
+_PREFIX_FH_STATE: dict[str, Any] = {'pid': None, 'fh': None}
+
+
+def _prefix_probe_record(
+    layer: int,
+    frontier: Any,
+    kept: Any,
+    n_frontier: int,
+) -> None:
+    """Record the cost of the kept continuation against the discarded ones."""
+    if not _PREFIX_PROBE_DIR:
+        return
+    try:
+        discarded = frontier.topk_costs(_PREFIX_PROBE_K)
+        if not discarded:
+            return
+        record = {
+            'layer': layer,
+            'n_frontier': n_frontier,
+            # Scored in the same frontier, so it is directly comparable with
+            # the discarded costs rather than being a different quantity
+            # that happens to be a float.
+            'kept_cost': frontier.score(kept),
+            'discarded_costs': [round(c, 9) for c in discarded],
+        }
+        pid = os.getpid()
+        if _PREFIX_FH_STATE['pid'] != pid:
+            os.makedirs(_PREFIX_PROBE_DIR, exist_ok=True)
+            _PREFIX_FH_STATE['fh'] = open(
+                os.path.join(_PREFIX_PROBE_DIR, f'prefix_{pid}.jsonl'),
+                'a',
+                buffering=1,
+            )
+            _PREFIX_FH_STATE['pid'] = pid
+        _PREFIX_FH_STATE['fh'].write(json.dumps(record) + '\n')
+    except Exception:
+        pass
+
+
 _LEAPWASTE_COUNTER = 0
 _LEAPWASTE_FH_STATE = {'pid': None, 'fh': None}
 _LEAPWASTE_AGG_STATE: dict[str, Any] = {}
@@ -665,13 +744,16 @@ class LEAPSynthesisPass(SynthesisPass):
                     prev = _SPEC_STATE.get('topk')
                     popped_id = frontier._last_popped_id
                     if prev is not None:
-                        _spec_probe_record(
-                            prev.index(popped_id)
-                            if popped_id in prev else None,
-                        )
-                        _SPEC_STATE['age'] = _SPEC_STATE.get('age', 0) + 1
-                    if prev is None or _SPEC_STATE['age'] >= _SPEC_WINDOW:
-                        _SPEC_STATE['topk'] = frontier.topk_ids(_SPEC_PROBE_K)
+                        age = _SPEC_STATE.get('age', 0)
+                        _spec_probe_record(age, prev.get(popped_id))
+                        _SPEC_STATE['age'] = age + 1
+                    if prev is None or _SPEC_STATE.get('age', 0) >= _SPEC_WINDOW:
+                        # id -> rank, so scoring a pop is a dict hit rather
+                        # than a scan of a 128-long list once per pop.
+                        _SPEC_STATE['topk'] = {
+                            eid: rank for rank, eid
+                            in enumerate(frontier.topk_ids(_SPEC_PROBE_K))
+                        }
                         _SPEC_STATE['age'] = 0
 
                 popped.append((top_circuit, top_layer))
@@ -910,6 +992,18 @@ class LEAPSynthesisPass(SynthesisPass):
                         if leapwaste_enabled:
                             prefix_formed = True
                             n_cleared = len(frontier)
+                        # P0-d: what is being thrown away, and was it worth
+                        # keeping? This is the gate on multi-prefix LEAP.
+                        # frontier.clear() is a destructive commit -- one
+                        # greedy, unbacktrackable choice of continuation --
+                        # and lowering min_prefix_size makes that choice more
+                        # often, which is the likely reason docs/19's
+                        # intervention stalled at 3.5x. Recorded HERE, before
+                        # the clear, because afterwards the alternatives are
+                        # gone and no later analysis can reconstruct them.
+                        _prefix_probe_record(
+                            layer + 1, frontier, circuit, len(frontier),
+                        )
                         frontier.clear()
                         if self.max_layer is None or layer + 1 < self.max_layer:
                             frontier.add(circuit, layer + 1)
