@@ -534,9 +534,22 @@ class LEAPSynthesisPass(SynthesisPass):
             # actually been buying, not on a constant.
             #
             # rho = improvement in best_dist per task dispatched, over a
-            # window. Improving => narrow the beam and go deeper on what is
-            # working. Stalled => widen it, because a wider frontier is the
-            # only way out of a plateau and the workers are idle anyway.
+            # window.
+            #
+            # Polarity is deliberately the opposite of the single-machine
+            # intuition, and the first version had it backwards. Narrowing
+            # while a search is productive is right when width costs you
+            # something; on a machine measured at 21% occupancy it costs
+            # nothing, and the measurement was unambiguous -- beam 32
+            # completed ham15-med at msz=4 while beam 8 and a controller
+            # sitting at beam 4 for 60% of rounds both timed out, with prune
+            # rates of 71%, 89% and 95%. Aggressive pruning is what kills the
+            # search.
+            #
+            # So: productive => widen, and keep investing in a search that is
+            # paying. Stalled => narrow, because holding a large frontier that
+            # is not improving is the one case where the memory and the
+            # per-round evaluation cost buy nothing.
             #
             # Windowed rather than per-round on purpose. Instantiation is
             # stochastic -- this project measured a p90 spread of 28.6% on
@@ -557,9 +570,9 @@ class LEAPSynthesisPass(SynthesisPass):
                     spent = max(1, t1 - t0)
                     rho = (d0 - d1) / spent
                     if rho > 0.0:
-                        beam = max(self.beam_min, (beam or self.beam_max) // 2)
-                    else:
                         beam = min(self.beam_max, (beam or self.beam_min) * 2)
+                    else:
+                        beam = max(self.beam_min, (beam or self.beam_max) // 2)
                     greedy_beam_now = beam
                     greedy_rho_now = rho
                     _leapwaste_aggregate_greedy(beam, rho)
