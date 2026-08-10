@@ -40,6 +40,58 @@ _LEAPWASTE_DIR = os.environ.get('BQPROF_LEAPWASTE_DIR') or os.environ.get(
 _LEAPWASTE_AGGREGATE = os.environ.get('BQPROF_LEAPWASTE_AGGREGATE') == '1'
 # Optional benchmark-only override; unset preserves the normal LEAP defaults.
 _MIN_PREFIX_SIZE_OVERRIDE = os.environ.get('BQSKIT_MIN_PREFIX_SIZE')
+
+# P0-c: the gate on the ordered-speculative-frontier design (docs/04 5.6.4).
+#
+# Ordered speculation dispatches the top-K frontier nodes at once but may only
+# commit them in the baseline's order. After committing P0 its children go
+# back into the frontier, so the next node actually popped may be a child
+# rather than P1 -- and then the work spent on P1..P{K-1} is squashed.
+#
+# The whole approach therefore turns on one number: how often the next node
+# popped was already in the previous pop's top-K. That is measurable on an
+# ordinary run with a counter, before any speculation exists. Rank r means a
+# speculator of width r+1 would have had the result ready; "miss" means the
+# node did not exist yet at snapshot time.
+_SPEC_PROBE_DIR = os.environ.get('BQPROF_SPEC_DIR')
+_SPEC_PROBE_K = int(os.environ.get('BQPROF_SPEC_K', '32'))
+_SPEC_STATE: dict[str, Any] = {}
+
+
+def _spec_probe_record(rank: int | None) -> None:
+    """Count one pop by the rank it held at the previous pop."""
+    if not _SPEC_PROBE_DIR:
+        return
+    if _SPEC_STATE.get('pid') != os.getpid():
+        _SPEC_STATE.clear()
+        _SPEC_STATE.update({
+            'pid': os.getpid(), 'k': _SPEC_PROBE_K,
+            'n_pops': 0, 'n_hits': 0, 'n_misses': 0,
+            'rank_hist': {}, 'last_flush': 0.0,
+        })
+    _SPEC_STATE['n_pops'] += 1
+    if rank is None:
+        _SPEC_STATE['n_misses'] += 1
+    else:
+        _SPEC_STATE['n_hits'] += 1
+        key = str(rank)
+        hist = _SPEC_STATE['rank_hist']
+        hist[key] = hist.get(key, 0) + 1
+
+    now = time.monotonic()
+    if now - _SPEC_STATE['last_flush'] < 20.0:
+        return
+    try:
+        os.makedirs(_SPEC_PROBE_DIR, exist_ok=True)
+        path = os.path.join(_SPEC_PROBE_DIR, f'spec_{os.getpid()}.json')
+        tmp = f'{path}.tmp'
+        summary = {k: v for k, v in _SPEC_STATE.items() if k != 'last_flush'}
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(summary, fh, separators=(',', ':'))
+        os.replace(tmp, path)
+        _SPEC_STATE['last_flush'] = now
+    except Exception:
+        pass
 _LEAPWASTE_COUNTER = 0
 _LEAPWASTE_FH_STATE = {'pid': None, 'fh': None}
 _LEAPWASTE_AGG_STATE: dict[str, Any] = {}
@@ -583,6 +635,22 @@ class LEAPSynthesisPass(SynthesisPass):
             successor_layers = []
             while not frontier.empty():
                 top_circuit, top_layer = frontier.pop()
+
+                # P0-c. Score this pop against the snapshot taken at the
+                # previous pop, then re-snapshot. The snapshot is deliberately
+                # taken AFTER popping and BEFORE the children are added: that
+                # is exactly the set an ordered speculator would have
+                # dispatched alongside this node.
+                if _SPEC_PROBE_DIR:
+                    prev = _SPEC_STATE.get('topk')
+                    popped_id = frontier._last_popped_id
+                    if prev is not None:
+                        _spec_probe_record(
+                            prev.index(popped_id)
+                            if popped_id in prev else None,
+                        )
+                    _SPEC_STATE['topk'] = frontier.topk_ids(_SPEC_PROBE_K)
+
                 popped.append((top_circuit, top_layer))
                 # The parent's layer must travel with its successors: a
                 # shared loop variable would silently mis-record depth for

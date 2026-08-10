@@ -56,6 +56,8 @@ class Frontier:
         self.heuristic_function = heuristic_function
         self._frontier: list[FrontierElement] = []
         self._counter = itertools.count()
+        self._last_popped_id: int | None = None
+        """Identity of the most recent pop, for the speculation probe."""
 
     def add(self, circuit: Circuit, extra_data: Any = None) -> None:
         """Add `circuit` into the frontier."""
@@ -67,7 +69,21 @@ class Frontier:
     def pop(self) -> tuple[Circuit, Any]:
         """Pop the top circuit."""
         elem = heapq.heappop(self._frontier)
+        self._last_popped_id = elem.element_id
         return elem.circuit, elem.extra_data
+
+    def topk_ids(self, k: int) -> list[int]:
+        """Return the element ids of the k cheapest entries, in order.
+
+        Read-only: `heapq.nsmallest` does not disturb the heap. Used by the
+        speculation probe to record what a speculative expansion would have
+        dispatched, without dispatching anything.
+        """
+        if k <= 0 or not self._frontier:
+            return []
+        return [
+            e.element_id for e in heapq.nsmallest(k, self._frontier)
+        ]
 
     def empty(self) -> bool:
         """Return true if the frontier is empty."""
