@@ -188,6 +188,9 @@ class DetachedServer(ServerBase):
                 num_idle, read_receipt = p
                 self.handle_waiting(conn, num_idle, read_receipt)
 
+            elif msg == RuntimeMessage.BACKLOG:
+                self.handle_backlog(conn, cast(int, payload))
+
             elif msg == RuntimeMessage.UPDATE:
                 task_diff = cast(int, payload)
                 self.conn_to_employee_dict[conn].num_tasks += task_diff

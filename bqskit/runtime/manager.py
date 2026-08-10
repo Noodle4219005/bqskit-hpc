@@ -201,6 +201,11 @@ class Manager(ServerBase):
                 self.handle_waiting(conn, num_idle, read_receipt)
                 self.update_upstream_idle_workers()
 
+            elif msg == RuntimeMessage.BACKLOG:
+                # Recursive stealing through manager hierarchies is out of
+                # scope; consume worker backlog reports to avoid a crash.
+                pass
+
             elif msg == RuntimeMessage.UPDATE:
                 task_diff = cast(int, payload)
                 self.handle_update(conn, task_diff)

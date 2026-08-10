@@ -15,6 +15,7 @@ from multiprocessing.connection import Client
 from multiprocessing.connection import Connection
 from queue import Empty
 from queue import Queue
+from threading import local
 from threading import Lock
 from threading import Thread
 from typing import Any
@@ -49,6 +50,12 @@ _logger = logging.getLogger(__name__)
 # in-house runtime replaced Dask. This restores an equivalent using the UPDATE
 # message the runtime already has.
 _AWAIT_YIELDS_CREDIT = os.environ.get('BQSKIT_AWAIT_YIELDS_CREDIT') == '1'
+
+# When set, workers report unstarted delayed-task backlog and let the server
+# move part of it to workers with idle capacity. Delayed tasks have no active
+# coroutine or local mailbox, so their return addresses remain valid after
+# reassignment.
+_WORK_STEALING = os.environ.get('BQSKIT_WORK_STEALING') == '1'
 
 
 @dataclass
@@ -180,6 +187,19 @@ class Worker:
         self._tasks: dict[RuntimeAddress, RuntimeTask] = {}
         """Tracks all started, unfinished tasks on this worker."""
 
+        self._last_reported_backlog = -1
+        """Last delayed-task count actually sent upstream, for dedupe."""
+
+        self._n_tasks_pushed_back = 0
+        """
+        Count of unstarted tasks handed back in response to RECLAIM.
+
+        Exact by construction, unlike anything a probe can infer from the
+        outgoing message stream: the RECLAIM reply is an ordinary
+        SUBMIT_BATCH, indistinguishable from a `map()` dispatch that the work
+        thread happens to emit at the same moment.
+        """
+
         self._delayed_tasks: list[RuntimeTask] = []
         """
         Store all delayed tasks in LIFO order.
@@ -223,6 +243,26 @@ class Worker:
         idle status is always correct.
         """
 
+        self.conn_send_mutex = Lock()
+        """
+        A lock serializing all writes to `self._conn`.
+
+        The class docstring describes a design where only the work thread
+        sends. That has not been true for a while: the log record factory
+        sends LOG from whichever thread emitted the record, and the incoming
+        thread sends UPDATE from `_handle_result` and `_handle_cancel`.
+        `multiprocessing.Connection.send` is not thread-safe, and interleaved
+        writes corrupt the pickle stream on the pipe -- which surfaces as
+        `RuntimeError: Server connection unexpectedly closed` rather than as
+        anything that points at the real cause.
+
+        Acquire ordering is `read_receipt_mutex` then `conn_send_mutex`;
+        nothing acquires them the other way around.
+        """
+
+        self._send_reentry = local()
+        """Per-thread guard against the log factory re-entering `_send`."""
+
         # Send out every client emitted log message upstream
         old_factory = logging.getLogRecordFactory()
 
@@ -250,7 +290,7 @@ class Worker:
                                 record.levelno,
                                 record.getMessage(),
                             ))
-                        self._conn.send((RuntimeMessage.LOG, (tid, serial)))
+                        self._send((RuntimeMessage.LOG, (tid, serial)))
             return record
 
         logging.setLogRecordFactory(record_factory)
@@ -262,7 +302,7 @@ class Worker:
         _logger.debug('Started incoming thread.')
 
         # Communicate that this worker is ready
-        self._conn.send((RuntimeMessage.STARTED, self._id))
+        self._send((RuntimeMessage.STARTED, self._id))
 
     def _loop(self) -> None:
         """Main worker event loop."""
@@ -275,7 +315,7 @@ class Worker:
                 error_str = ''.join(traceback.format_exception(*exc_info))
                 _logger.error(error_str)
                 try:
-                    self._conn.send((RuntimeMessage.ERROR, error_str))
+                    self._send((RuntimeMessage.ERROR, error_str))
                 except Exception:
                     pass
 
@@ -317,6 +357,48 @@ class Worker:
                 self._add_task(tasks.pop())  # Submit one task
                 self._delayed_tasks.extend(tasks)  # Delay rest
                 self.read_receipt_mutex.release()
+                self._report_backlog()
+
+            elif msg == RuntimeMessage.RECLAIM:
+                # Hand back unstarted tasks so the server can re-place them.
+                # Only `_delayed_tasks` may be moved: they have never been
+                # through `_add_task`, so they own no coroutine state and no
+                # local mailbox, and their `return_address` points at the
+                # parent's mailbox on the parent's worker, which is unaffected
+                # by who ends up executing them.
+                self.read_receipt_mutex.acquire()
+                # Take from the front. `_get_next_ready_task` promotes with
+                # `.pop()` from the back, so taking from the front preserves
+                # its deliberate depth-first bias. Mutate the list in place --
+                # rebinding the attribute would silently drop a task that the
+                # work thread is concurrently popping off the old list object.
+                num_to_reclaim = min(cast(int, payload), len(self._delayed_tasks))
+                tasks = self._delayed_tasks[:num_to_reclaim]
+                del self._delayed_tasks[:num_to_reclaim]
+                self.read_receipt_mutex.release()
+
+                # Same predicate `_get_next_ready_task` applies before running
+                # a task: the address itself, or any ancestor, being cancelled.
+                # Filtering here only saves a round trip; the receiving worker
+                # checks again before execution.
+                tasks = [
+                    task for task in tasks
+                    if task.return_address not in self._cancelled_task_ids
+                    and not any(
+                        bcb in self._cancelled_task_ids
+                        for bcb in task.breadcrumbs
+                    )
+                ]
+                if tasks:
+                    # UPDATE first: the server increments num_tasks in
+                    # schedule_tasks and only decrements on completion, so
+                    # without this the returned tasks are counted twice and
+                    # assign_tasks' sort key is corrupted. Sending it before
+                    # the batch means the count is never transiently high.
+                    self._send((RuntimeMessage.UPDATE, -len(tasks)))
+                    self._send((RuntimeMessage.SUBMIT_BATCH, tasks))
+                    self._n_tasks_pushed_back += len(tasks)
+                self._report_backlog()
 
             elif msg == RuntimeMessage.RESULT:
                 result = cast(RuntimeResult, payload)
@@ -337,11 +419,55 @@ class Worker:
                     if path not in sys.path:
                         sys.path.append(path)
 
+    def _send(self, message: tuple[RuntimeMessage, Any]) -> None:
+        """Send `message` upstream, serialized against other threads."""
+        if getattr(self._send_reentry, 'active', False):
+            # Re-entered on this thread from the log record factory, which
+            # calls _send for every emitted record: pickling a RuntimeTask
+            # inside self._conn.send can itself log. Neither alternative is
+            # acceptable -- recursing deadlocks on the non-reentrant lock,
+            # and sending anyway interleaves bytes into a half-written
+            # message on the pipe, which is the corruption this lock exists
+            # to prevent. Dropping the log line is the only safe option.
+            return
+
+        self._send_reentry.active = True
+        try:
+            with self.conn_send_mutex:
+                self._conn.send(message)
+        finally:
+            self._send_reentry.active = False
+
     def _add_task(self, task: RuntimeTask) -> None:
         """Start a task and add it to the loop."""
         self._tasks[task.return_address] = task
         task.start()
         self._ready_task_ids.put(task.return_address)
+
+    def _report_backlog(self) -> None:
+        """Report this worker's unstarted delayed-task backlog.
+
+        Deduplicated against the last value actually sent. The first version
+        of this reported only at three edges -- batch arrival, drain-to-empty,
+        and after a reclaim -- which left the server's view stale for the
+        whole span in between. Since a batch of size 1 delays nothing and
+        drain-to-empty reports zero by construction, 78% of what the server
+        received was `0` while periodic sampling showed workers holding two
+        or more delayed tasks 76% of the time they were active. The server
+        cannot steal from a worker it believes is empty.
+
+        Reporting on every change instead, deduplicated, keeps the view
+        accurate. The dedupe matters: without it this fires once per promotion
+        and adds ~10^5 messages to the server loop, and server-loop overload
+        is what killed job 1017452.
+        """
+        if not _WORK_STEALING:
+            return
+
+        n = len(self._delayed_tasks)
+        if n != self._last_reported_backlog:
+            self._last_reported_backlog = n
+            self._send((RuntimeMessage.BACKLOG, n))
 
     def _handle_result(self, result: RuntimeResult) -> None:
         """Insert result into appropriate mailbox and wake waiting task."""
@@ -372,7 +498,7 @@ class Worker:
                     # one-for-one with the yield in _process_await, so the
                     # server's count returns to what it would have been.
                     task._yielded_credit = False  # type: ignore[attr-defined]
-                    self._conn.send((RuntimeMessage.UPDATE, 1))
+                    self._send((RuntimeMessage.UPDATE, 1))
 
     def _handle_cancel(self, addr: RuntimeAddress) -> None:
         """
@@ -410,7 +536,7 @@ class Worker:
                 for mailbox_id in self._tasks[key].owned_mailboxes:
                     self._mailboxes.pop(mailbox_id)
         if yielded_and_cancelled:
-            self._conn.send((RuntimeMessage.UPDATE, yielded_and_cancelled))
+            self._send((RuntimeMessage.UPDATE, yielded_and_cancelled))
         self._tasks = {
             a: t for a, t in self._tasks.items()
             if not t.is_descendant_of(addr)
@@ -437,7 +563,22 @@ class Worker:
         """Return the next ready task if one exists, otherwise block."""
         while True:
             if self._ready_task_ids.empty() and len(self._delayed_tasks) > 0:
-                self._add_task(self._delayed_tasks.pop())
+                # Held against the incoming thread, which also mutates
+                # `_delayed_tasks` (SUBMIT_BATCH extends it, RECLAIM takes
+                # from its front). Without this, the check and the pop are
+                # not atomic and a reclaim can race the promotion.
+                self.read_receipt_mutex.acquire()
+                promoted = (
+                    self._delayed_tasks.pop() if self._delayed_tasks else None
+                )
+                if promoted is not None:
+                    self._add_task(promoted)
+                self.read_receipt_mutex.release()
+
+                # Every promotion, not just the drop to zero. The dedupe in
+                # _report_backlog keeps the message volume proportional to
+                # actual changes.
+                self._report_backlog()
                 continue
 
             # Critical section
@@ -452,7 +593,7 @@ class Worker:
 
             except Empty:
                 payload = (1, self.most_recent_read_submit)
-                self._conn.send((RuntimeMessage.WAITING, payload))
+                self._send((RuntimeMessage.WAITING, payload))
                 self.read_receipt_mutex.release()
                 # Block for new message. Can release lock here since the
                 # the `self.most_recent_read_submit` has been used.
@@ -508,7 +649,7 @@ class Worker:
             exc_info = sys.exc_info()
             error_str = ''.join(traceback.format_exception(*exc_info))
             error_payload = (self._active_task.comp_task_id, error_str)
-            self._conn.send((RuntimeMessage.ERROR, error_payload))
+            self._send((RuntimeMessage.ERROR, error_payload))
 
         finally:
             self._active_task = None
@@ -545,7 +686,7 @@ class Worker:
             # Blocked with nothing to deliver yet: stop advertising this task
             # as load until its result arrives.
             task._yielded_credit = True  # type: ignore[attr-defined]
-            self._conn.send((RuntimeMessage.UPDATE, -1))
+            self._send((RuntimeMessage.UPDATE, -1))
 
     def _process_task_completion(self, task: RuntimeTask, result: Any) -> None:
         """Package and send out task result."""
@@ -559,11 +700,11 @@ class Worker:
 
         if task.return_address.worker_id == self._id:
             self._handle_result(packaged_result)
-            self._conn.send((RuntimeMessage.UPDATE, -1))
+            self._send((RuntimeMessage.UPDATE, -1))
             # Let manager know this worker has one less task
             # without sending a result
         else:
-            self._conn.send((RuntimeMessage.RESULT, packaged_result))
+            self._send((RuntimeMessage.RESULT, packaged_result))
 
         # Remove task
         self._tasks.pop(task.return_address, None)
@@ -646,7 +787,7 @@ class Worker:
         )
 
         # Submit the task (on the next cycle)
-        self._conn.send((RuntimeMessage.SUBMIT, task))
+        self._send((RuntimeMessage.SUBMIT, task))
 
         # Return future pointing to the mailbox
         return RuntimeFuture(mailbox_id)
@@ -723,7 +864,7 @@ class Worker:
         ]
 
         # Submit the tasks
-        self._conn.send((RuntimeMessage.SUBMIT_BATCH, tasks))
+        self._send((RuntimeMessage.SUBMIT_BATCH, tasks))
 
         # Return future pointing to the mailbox
         return RuntimeFuture(mailbox_id)
@@ -738,7 +879,7 @@ class Worker:
             RuntimeAddress(self._id, future.mailbox_id, slot_id)
             for slot_id in range(num_slots)
         ]
-        self._conn.send((RuntimeMessage.COMMUNICATE, (addrs, msg)))
+        self._send((RuntimeMessage.COMMUNICATE, (addrs, msg)))
 
     def get_messages(self) -> list[Any]:
         """Return all messages received by the worker for this task."""
@@ -758,7 +899,7 @@ class Worker:
             for slot_id in range(num_slots)
         ]
         for addr in addrs:
-            self._conn.send((RuntimeMessage.CANCEL, addr))
+            self._send((RuntimeMessage.CANCEL, addr))
 
     def get_cache(self) -> dict[str, Any]:
         """

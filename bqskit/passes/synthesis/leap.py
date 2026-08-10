@@ -505,14 +505,14 @@ class LEAPSynthesisPass(SynthesisPass):
 
             # Layer of the first popped node, for logging and probe records
             # that assume a single value per round.
-            layer = popped[0][1]
+            round_layer = popped[0][1]
 
             if len(successors) == 0:
                 if leapwaste_enabled:
                     _leapwaste_emit({
                         'synth_id': synth_id,
                         'iteration': current_iteration,
-                        'layer': layer,
+                        'layer': round_layer,
                         'n_successors': 0,
                         'map_id': None,
                         't_map_start': None,
@@ -530,7 +530,7 @@ class LEAPSynthesisPass(SynthesisPass):
                     _leapwaste_aggregate_record(
                         frontier_len_before_pop,
                         0,
-                        layer,
+                        round_layer,
                         prefix_formed,
                         False,
                         None,
@@ -738,7 +738,7 @@ class LEAPSynthesisPass(SynthesisPass):
                 _leapwaste_emit({
                     'synth_id': synth_id,
                     'iteration': current_iteration,
-                    'layer': layer,
+                    'layer': round_layer,
                     'n_successors': len(successors),
                     'map_id': map_id,
                     't_map_start': t_map_start,
@@ -751,12 +751,21 @@ class LEAPSynthesisPass(SynthesisPass):
                     'n_added_this_iter': n_added_this_iter,
                     'prefix_formed': prefix_formed,
                     'n_cleared': n_cleared,
+                    # Quality trajectory. Without this the probe records what
+                    # each round COST but never what it BOUGHT, so a per-block
+                    # marginal return -- improvement in best cost per unit of
+                    # compute -- cannot be reconstructed offline at any price.
+                    # That is the quantity a budget-allocation policy would
+                    # have to rank blocks by, and the reason such a policy
+                    # cannot be evaluated against the data already on disk.
+                    'best_dist': best_dist,
+                    'best_layer': best_layer,
                 })
             if aggregate_enabled:
                 _leapwaste_aggregate_record(
                     frontier_len_before_pop,
                     len(successors),
-                    layer,
+                    round_layer,
                     prefix_formed,
                     False,
                     None,
@@ -780,17 +789,17 @@ class LEAPSynthesisPass(SynthesisPass):
                 _LEAPWASTE_AGG_STATE['sum_popped_per_round'] += len(popped)
                 _LEAPWASTE_AGG_STATE['n_rounds'] += 1
 
-            layer_diff = abs(best_layer - layer)
+            layer_diff = abs(best_layer - round_layer)
             if (
                 layer_diff % self.no_progress_layers_allowed == 0
                 and layer_diff > 0
-                and layer not in warned_layers
+                and round_layer not in warned_layers
             ):
                 _logger.warning(
                     'No improvement after '
                     f'{self.no_progress_layers_allowed} layers.',
                 )
-                warned_layers.append(layer)
+                warned_layers.append(round_layer)
 
         _logger.warning('Frontier emptied.')
         _logger.warning(

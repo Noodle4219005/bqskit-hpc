@@ -36,6 +36,15 @@ from bqskit.runtime.worker import start_worker
 
 _logger = logging.getLogger(__name__)
 
+# When set, the server tracks worker delayed-task backlog and asks a busy
+# worker to return half its unstarted tasks when capacity becomes available.
+_WORK_STEALING = os.environ.get('BQSKIT_WORK_STEALING') == '1'
+
+# Steal policy, tunable so "the policy was too timid" can be separated from
+# "this path is inherently small" without editing code between runs.
+_STEAL_THRESHOLD = int(os.environ.get('BQSKIT_STEAL_THRESHOLD', '1'))
+_STEAL_LEAVE_BEHIND = int(os.environ.get('BQSKIT_STEAL_LEAVE_BEHIND', '1'))
+
 
 class RuntimeEmployee:
     """Data structure for a boss's view of an employee."""
@@ -62,6 +71,7 @@ class RuntimeEmployee:
         self.total_workers = total_workers
         self.process = process
         self.num_tasks = 0
+        self.num_delayed = 0
         self.num_idle_workers = total_workers
         self.is_manager = is_manager
 
@@ -157,6 +167,10 @@ class ServerBase:
 
         self.employees: list[RuntimeEmployee] = []
         """Tracks this node's employees, which are managers or workers."""
+
+        self.n_reclaims_issued = 0
+        self.n_tasks_requested_back = 0
+        """Steal-policy uptake, counted rather than inferred from traffic."""
 
         self.conn_to_employee_dict: dict[Connection, RuntimeEmployee] = {}
         """Used to find the employee associated with a message."""
@@ -684,6 +698,60 @@ class ServerBase:
         employee.num_idle_workers = adjusted_idle_count
         self.num_idle_workers += (adjusted_idle_count - old_count)
         assert 0 <= self.num_idle_workers <= self.total_workers
+
+        if _WORK_STEALING and employee.has_idle_resources:
+            self.try_reclaim(exclude=employee)
+
+    def handle_backlog(self, conn: Connection, num_delayed: int) -> None:
+        """Record an employee's unstarted delayed-task backlog."""
+        employee = self.conn_to_employee_dict[conn]
+        employee.num_delayed = num_delayed
+
+        # Rebalance proactively, not only when somebody happens to go idle.
+        #
+        # Reclaims used to fire only from handle_waiting, and the measured
+        # consequence was that the mechanism went dormant for 65% of the run:
+        # backlog arrives in bursts at ForEachBlockPass phase boundaries, but
+        # the long LEAP-dominated middle dispatches about two tasks at a time,
+        # so no worker accumulated a backlog at the moment some other worker
+        # happened to report idle. Acting when the imbalance is reported
+        # catches the bursts instead of waiting to collide with them.
+        if _WORK_STEALING and num_delayed >= _STEAL_THRESHOLD:
+            self.try_reclaim(exclude=None)
+
+    def try_reclaim(self, exclude: RuntimeEmployee | None) -> None:
+        """Ask the most backed-up employee to hand back unstarted tasks."""
+        if not self.num_idle_workers:
+            return
+
+        victim = max(self.employees, key=lambda e: e.num_delayed)
+        if victim is exclude or victim.num_delayed < _STEAL_THRESHOLD:
+            return
+
+        # Deliberately NOT capped by self.num_idle_workers.
+        #
+        # That cap is what pinned rounds 1 and 2 to ~1.7 tasks per reclaim
+        # regardless of threshold or steal-half, because this project has
+        # already measured the server's idle count at p10 = p50 = p90 = 0 --
+        # the count is maintained from WAITING messages, and a worker holding
+        # ten tasks that are all awaiting children never sends one. Returned
+        # tasks go back through schedule_tasks, which fills genuinely idle
+        # workers first and then the least loaded, so over-returning is
+        # corrected by the existing placement policy rather than by starving
+        # the reclaim.
+        num_to_reclaim = victim.num_delayed - _STEAL_LEAVE_BEHIND
+        if num_to_reclaim < 1:
+            return
+
+        self.outgoing.put(
+            (victim.conn, RuntimeMessage.RECLAIM, num_to_reclaim),
+        )
+        # Optimistic: assume it is granted, so repeated triggers before the
+        # victim replies do not request the same tasks several times. The
+        # victim's next BACKLOG report corrects the estimate either way.
+        victim.num_delayed -= num_to_reclaim
+        self.n_reclaims_issued += 1
+        self.n_tasks_requested_back += num_to_reclaim
 
 
 def parse_ipports(ipports_str: Sequence[str]) -> list[tuple[str, int]]:

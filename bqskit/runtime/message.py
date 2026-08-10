@@ -23,3 +23,5 @@ class RuntimeMessage(IntEnum):
     IMPORTPATH = 14
     READY = 15
     COMMUNICATE = 16
+    BACKLOG = 17
+    RECLAIM = 18
