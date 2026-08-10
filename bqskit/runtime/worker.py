@@ -521,8 +521,17 @@ class Worker:
         self._cancelled_task_ids.add(addr)
 
         # Remove all tasks that are children of `addr` from initialized tasks
+        #
+        # Iterate a snapshot, and pop in place rather than rebuilding the dict.
+        # This runs on the incoming thread while the work thread is adding and
+        # completing tasks, so iterating `self._tasks.items()` directly raises
+        # "dictionary changed size during iteration" -- and an unhandled
+        # RuntimeError in recv_incoming kills the worker, which the client
+        # then reports as "Server connection unexpectedly closed". Taken from
+        # upstream 0cb5566f; our tree predates it, and the RECLAIM handler
+        # added here gives the incoming thread one more way to hit it.
         yielded_and_cancelled = 0
-        for key, task in self._tasks.items():
+        for key, task in list(self._tasks.items()):
             if task.is_descendant_of(addr):
                 # A task cancelled while blocked never reaches the wake path
                 # that would restore its yielded credit, so the server's count
@@ -533,14 +542,11 @@ class Worker:
                     task._yielded_credit = False  # type: ignore[attr-defined]
                     yielded_and_cancelled += 1
                 task.cancel()
-                for mailbox_id in self._tasks[key].owned_mailboxes:
-                    self._mailboxes.pop(mailbox_id)
+                for mailbox_id in task.owned_mailboxes:
+                    self._mailboxes.pop(mailbox_id, None)
+                self._tasks.pop(key, None)
         if yielded_and_cancelled:
             self._send((RuntimeMessage.UPDATE, yielded_and_cancelled))
-        self._tasks = {
-            a: t for a, t in self._tasks.items()
-            if not t.is_descendant_of(addr)
-        }
 
         # Remove all tasks that are children of `addr` from delayed tasks
         self._delayed_tasks = [
@@ -642,7 +648,17 @@ class Worker:
         except StopIteration as e:
             self._process_task_completion(task, e.value)
 
-        except Exception:
+        except Exception as e:
+            if type(e) is RuntimeError:
+                # A task cancelled mid-step can raise from step or
+                # _process_await. Swallow it only for tasks that are actually
+                # descendants of something cancelled -- otherwise the error
+                # bubbles up and takes the whole compilation down. Upstream
+                # eb632819; our tree predates it.
+                for addr in self._cancelled_task_ids:
+                    if task.is_descendant_of(addr):
+                        return
+
             assert self._active_task is not None  # for type checker
 
             # Bubble up errors
