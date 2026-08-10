@@ -97,6 +97,10 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'layer_hist': {},
             'max_layer_per_synth_hist': {},
             'active_synth_max_layer': None,
+            'sum_n_pruned': 0,
+            'rounds_where_prune_fired': 0,
+            'sum_popped_per_round': 0,
+            'n_rounds': 0,
         })
     summary = {
         key: value for key, value in _LEAPWASTE_AGG_STATE.items()
@@ -174,6 +178,30 @@ def _leapwaste_aggregate_finish() -> None:
     _leapwaste_aggregate_flush(force=True)
 
 
+def _instantiate_single_start(
+    circuit: Circuit,
+    target: Any,
+    seed: int,
+    **kwargs: Any,
+) -> Circuit:
+    """
+    Instantiate `circuit` once from one explicitly seeded starting point.
+
+    ``Circuit.instantiate`` with ``multistarts=M`` runs its M starts through
+    ``Instantiater.multi_start_instantiate_inplace``, which is a sequential
+    list comprehension. Every one of those starts therefore executes inside a
+    single worker, so a level-4 compile hides an 8x serial section inside each
+    task the search dispatched. This helper is the unit that lets LEAP hand the
+    starts to separate workers instead.
+
+    The seed is explicit and per-start rather than inherited from the process.
+    ``seed_random_sources`` seeds libc's ``srand``, which Ceres consumes, and
+    that state is per-process; running starts on different workers would
+    otherwise draw from unrelated streams and make runs irreproducible.
+    """
+    return circuit.instantiate(target, seed=seed, multistarts=1, **kwargs)
+
+
 class LEAPSynthesisPass(SynthesisPass):
     """
     A pass implementing the LEAP search synthesis algorithm.
@@ -197,6 +225,10 @@ class LEAPSynthesisPass(SynthesisPass):
         store_partial_solutions: bool = False,
         partials_per_depth: int = 25,
         min_prefix_size: int = 3,
+        beam_width: int | None = None,
+        task_budget: int | None = None,
+        async_drain: bool = False,
+        parallel_multistart: bool = False,
         instantiate_options: dict[str, Any] = {},
     ) -> None:
         """
@@ -295,12 +327,51 @@ class LEAPSynthesisPass(SynthesisPass):
                 % int(min_prefix_size),
             )
 
+        if beam_width is not None and not is_integer(beam_width):
+            raise TypeError(
+                'Expected beam_width to be an integer, got %s'
+                % type(beam_width),
+            )
+
+        if beam_width is not None and beam_width <= 0:
+            raise ValueError(
+                'Expected beam_width to be positive, got %d.'
+                % int(beam_width),
+            )
+
+        if task_budget is not None and not is_integer(task_budget):
+            raise TypeError(
+                'Expected task_budget to be an integer, got %s'
+                % type(task_budget),
+            )
+
+        if task_budget is not None and task_budget <= 0:
+            raise ValueError(
+                'Expected task_budget to be positive, got %d.'
+                % int(task_budget),
+            )
+
         if not isinstance(instantiate_options, dict):
             raise TypeError(
                 'Expected dictionary for instantiate_options, got %s.'
                 % type(instantiate_options),
             )
 
+        if not isinstance(async_drain, bool):
+            raise TypeError(
+                'Expected bool for async_drain, got %s.' % type(async_drain),
+            )
+
+        if not isinstance(parallel_multistart, bool):
+            raise TypeError(
+                'Expected bool for parallel_multistart, got %s.'
+                % type(parallel_multistart),
+            )
+
+        self.beam_width = beam_width
+        self.task_budget = task_budget
+        self.async_drain = async_drain
+        self.parallel_multistart = parallel_multistart
         self.heuristic_function = heuristic_function
         self.layer_gen = layer_generator
         self.success_threshold = success_threshold
@@ -375,12 +446,66 @@ class LEAPSynthesisPass(SynthesisPass):
                 n_added_this_iter = 0
                 prefix_formed = False
                 n_cleared = None
-            top_circuit, layer = frontier.pop()
+            # Expand enough nodes to fill the task budget, not a fixed count.
+            #
+            # LEAP pops one node and dispatches its successors, so tasks in
+            # flight equal the block's coupling-graph edge count -- measured
+            # at 2.07 on sparse devices. That caps how much of a machine one
+            # block's search can use, independently of how many workers
+            # exist.
+            #
+            # Two separate budgets control this:
+            #
+            #   beam_width (B)     how many nodes the frontier may keep.
+            #                      A search-quality and memory bound.
+            #   task_budget (T)    how many instantiations may be in flight.
+            #                      A hardware-capacity bound.
+            #
+            # They are deliberately not the same number. Moving from 96 to
+            # 512 workers should raise T and leave search semantics alone; a
+            # single knob would force the search to change shape whenever the
+            # machine did. Popping until T is filled also adapts to the
+            # block's degree automatically -- at degree 2 that is ~T/2
+            # parents, at degree 6 ~T/6 -- so no per-topology tuning is
+            # needed.
+            #
+            # With both unset this pops exactly one node, as before.
+            beam = self.beam_width
+            budget = self.task_budget
+
+            popped = []
+            successors = []
+            successor_layers = []
+            while not frontier.empty():
+                top_circuit, top_layer = frontier.pop()
+                popped.append((top_circuit, top_layer))
+                # The parent's layer must travel with its successors: a
+                # shared loop variable would silently mis-record depth for
+                # every node after the first, and the search would still
+                # look healthy.
+                for successor in layer_gen.gen_successors(top_circuit, data):
+                    successors.append(successor)
+                    successor_layers.append(top_layer)
+
+                if budget is None and beam is None:
+                    # Original behaviour: one node per round.
+                    break
+                if budget is not None and len(successors) >= budget:
+                    # Hardware budget reached.
+                    break
+                if beam is not None and len(popped) >= beam:
+                    # Never speculate on more nodes than the frontier is
+                    # allowed to keep. With `task_budget` unset this is the
+                    # fixed-K expansion of KBFS (Felner, Kraus & Korf 2003),
+                    # kept as the ablation baseline for the decoupled form.
+                    break
+
             current_iteration = iteration
             iteration += 1
 
-            # Generate successors
-            successors = layer_gen.gen_successors(top_circuit, data)
+            # Layer of the first popped node, for logging and probe records
+            # that assume a single value per round.
+            layer = popped[0][1]
 
             if len(successors) == 0:
                 if leapwaste_enabled:
@@ -425,6 +550,96 @@ class LEAPSynthesisPass(SynthesisPass):
                 map_id = getattr(map_future, '_bqprof_leapwaste_map_id', None)
                 circuits = await map_future
                 t_map_end = time.time()
+            elif self.async_drain:
+                # Consume results as they arrive instead of at a barrier.
+                #
+                # A barrier makes every round cost the slowest of its tasks.
+                # Measured within-batch max/median instantiate duration is
+                # 1.31 at the median and 2.94 at p90, so that tail is real,
+                # and LEAP pays it once per ~2 tasks. Draining with `next`
+                # pays it once per round instead.
+                #
+                # Results are stored by their index in `successors`, so the
+                # evaluation below sees them in the same order a barrier
+                # would have produced. Only the waiting changes.
+                #
+                # Note: the runtime has no wait-any across futures and
+                # `RuntimeFuture._done` documents that polling can deadlock,
+                # so overlapping the next round's dispatch with this round's
+                # tail is not expressible here. Rounds are sized by
+                # `task_budget` instead, which amortises the tail over T
+                # tasks rather than over the block's degree.
+                drain_future = get_runtime().map(
+                    Circuit.instantiate,
+                    successors,
+                    target=utry,
+                    **instantiate_options,
+                )
+                circuits = [None] * len(successors)  # type: ignore
+                num_outstanding = len(successors)
+                while num_outstanding > 0:
+                    for index, result in await get_runtime().next(
+                        drain_future,
+                    ):
+                        circuits[index] = result
+                        num_outstanding -= 1
+            elif self.parallel_multistart and int(
+                instantiate_options.get('multistarts', 1),
+            ) > 1:
+                # Dispatch every (successor, starting point) pair separately.
+                #
+                # Otherwise each successor is one task that runs its M starts
+                # sequentially inside a single worker. With M=8 at level 4
+                # that is an 8x serial section hidden inside every task the
+                # search dispatched, and it sits on the cost centre:
+                # instantiation is 93.7% of measured instantiate CPU.
+                #
+                # Starts are independent, so this changes no search semantics
+                # and still selects by the same cost function. It does change
+                # results: sequentially the starts share one process's random
+                # stream, and here each is seeded explicitly instead. Both are
+                # deterministic, but they are not the same stream, so this is
+                # not the byte-identical change that pipelining assembly was.
+                num_starts = int(instantiate_options['multistarts'])
+                single_options = dict(instantiate_options)
+                single_options.pop('multistarts', None)
+                single_options.pop('seed', None)
+                base_seed = int(instantiate_options.get('seed', 0) or 0)
+
+                flat_circuits = []
+                flat_seeds = []
+                owner_of_task = []
+                for successor_index, successor in enumerate(successors):
+                    for start_index in range(num_starts):
+                        flat_circuits.append(successor)
+                        flat_seeds.append(
+                            base_seed * num_starts
+                            + successor_index * num_starts
+                            + start_index,
+                        )
+                        owner_of_task.append(successor_index)
+
+                flat_results = await get_runtime().map(
+                    _instantiate_single_start,
+                    flat_circuits,
+                    [utry] * len(flat_circuits),
+                    flat_seeds,
+                    **single_options,
+                )
+
+                # Keep the best start per successor, by the same cost the
+                # sequential path sorts on.
+                circuits = [None] * len(successors)  # type: ignore
+                best_costs: list[float | None] = [None] * len(successors)
+                for task_index, candidate in enumerate(flat_results):
+                    owner = owner_of_task[task_index]
+                    candidate_cost = self.cost.calc_cost(candidate, utry)
+                    if (
+                        best_costs[owner] is None
+                        or candidate_cost < best_costs[owner]  # type: ignore
+                    ):
+                        best_costs[owner] = candidate_cost
+                        circuits[owner] = candidate
             else:
                 circuits = await get_runtime().map(
                     Circuit.instantiate,
@@ -435,6 +650,8 @@ class LEAPSynthesisPass(SynthesisPass):
 
             # Evaluate successors
             for win_index, circuit in enumerate(circuits):
+                # Depth of *this* successor's parent, not the round's first.
+                layer = successor_layers[win_index]
                 dist = self.cost.calc_cost(circuit, utry)
 
                 if dist < self.success_threshold:
@@ -545,6 +762,23 @@ class LEAPSynthesisPass(SynthesisPass):
                     None,
                     n_cleared,
                 )
+
+            # Bound the frontier by width.
+            #
+            # LEAP's own bound is `frontier.clear()` on a formed prefix, which
+            # fires on an absolute layer threshold (min_prefix_size). Measured
+            # at max_synthesis_size 4 that condition fires in 0.04-0.16% of
+            # rounds while the frontier reaches a p90 of 3,676, because the
+            # depth a generic w-qubit unitary needs grows with 4^w while the
+            # threshold does not. A width bound does not depend on depth.
+            # No-op when `beam_width` is unset.
+            n_pruned_this_round = frontier.prune(beam)
+            if aggregate_enabled and _LEAPWASTE_AGG_STATE:
+                _LEAPWASTE_AGG_STATE['sum_n_pruned'] += n_pruned_this_round
+                if n_pruned_this_round > 0:
+                    _LEAPWASTE_AGG_STATE['rounds_where_prune_fired'] += 1
+                _LEAPWASTE_AGG_STATE['sum_popped_per_round'] += len(popped)
+                _LEAPWASTE_AGG_STATE['n_rounds'] += 1
 
             layer_diff = abs(best_layer - layer)
             if (

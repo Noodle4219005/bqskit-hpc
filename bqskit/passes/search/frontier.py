@@ -11,6 +11,7 @@ from bqskit.passes.search.heuristic import HeuristicFunction
 from bqskit.qis.state.state import StateVector
 from bqskit.qis.state.system import StateSystem
 from bqskit.qis.unitary.unitarymatrix import UnitaryMatrix
+from bqskit.utils.typing import is_integer
 
 
 class FrontierElement(NamedTuple):
@@ -79,3 +80,37 @@ class Frontier:
     def clear(self) -> None:
         """Remove all elements from the frontier."""
         self._frontier.clear()
+
+    def prune(self, k: int | None) -> int:
+        """
+        Keep only the `k` best nodes, discarding the rest.
+
+        This bounds the frontier directly, by width, rather than indirectly
+        through LEAP's prefix condition. Returns the number of nodes
+        discarded, so callers can record how much was pruned.
+
+        Args:
+            k (int | None): The number of nodes to keep. `None` is a no-op,
+                preserving the unbounded behaviour.
+
+        Raises:
+            ValueError: If `k` is not positive.
+        """
+        if k is None:
+            return 0
+
+        if not is_integer(k):
+            raise TypeError(f'Expected integer for k, got {type(k)}.')
+
+        if k <= 0:
+            raise ValueError(f'Expected positive k, got {k}.')
+
+        if len(self._frontier) <= k:
+            return 0
+
+        discarded = len(self._frontier) - k
+        # FrontierElement orders by (heuristic, counter), so nsmallest
+        # selects exactly the k the heap would have popped first.
+        self._frontier = heapq.nsmallest(k, self._frontier)
+        heapq.heapify(self._frontier)
+        return discarded

@@ -225,41 +225,69 @@ class ForEachBlockPass(BasePass):
             block_datas.append(block_data)
 
         # Do the work
-        results = await get_runtime().map(
+        #
+        # Results are consumed incrementally rather than with a single
+        # `await map(...)` barrier. Per-block postprocessing -- the
+        # replace_filter call and building the replacement Operation -- is
+        # pure Python running in this one worker, while the other workers are
+        # still synthesising later blocks. Draining with `next` lets that
+        # bookkeeping overlap the synthesis instead of queueing behind it.
+        #
+        # This is a scheduling change only: every block is still
+        # postprocessed exactly once, results are stored by their original
+        # index, and `batch_replace` still receives points and ops in block
+        # order below. The output is unchanged.
+        future = get_runtime().map(
             _sub_do_work,
             [self.workflow] * len(subcircuits),
             subcircuits,
             block_datas,
         )
 
-        # Unpack results
-        completed_subcircuits, completed_block_datas = zip(*results)
+        num_blocks = len(subcircuits)
+        completed_subcircuits: list[Circuit] = [None] * num_blocks  # type: ignore
+        completed_block_datas: list[PassData] = [None] * num_blocks  # type: ignore
+        # Postprocessed replacement for each block, or None if the block is
+        # not being replaced. Indexed by block so order is independent of
+        # the order results happen to arrive in.
+        replacements: list[tuple[CircuitPoint, Operation] | None]
+        replacements = [None] * num_blocks
+        error_sum = 0.0
+        num_remaining = num_blocks
 
-        # Postprocess blocks
+        while num_remaining > 0:
+            for index, result in await get_runtime().next(future):
+                subcircuit, block_data = result
+                completed_subcircuits[index] = subcircuit
+                completed_block_datas[index] = block_data
+                num_remaining -= 1
+
+                cycle, op = blocks[index]
+
+                # Mark Blocks to be Replaced
+                if replace_filter(subcircuit, op):
+                    _logger.debug(f'Replacing block {index}.')
+                    replacements[index] = (
+                        CircuitPoint(cycle, op.location[0]),
+                        Operation(
+                            CircuitGate(subcircuit, True),
+                            op.location,
+                            subcircuit.params,
+                        ),
+                    )
+                    block_data['replaced'] = True
+
+                    # Calculate Error
+                    error_sum += block_data.error
+                else:
+                    block_data['replaced'] = False
+
         points: list[CircuitPoint] = []
         ops: list[Operation] = []
-        error_sum = 0.0
-        for i, (cycle, op) in enumerate(blocks):
-            subcircuit = completed_subcircuits[i]
-            block_data = completed_block_datas[i]
-
-            # Mark Blocks to be Replaced
-            if replace_filter(subcircuit, op):
-                _logger.debug(f'Replacing block {i}.')
-                points.append(CircuitPoint(cycle, op.location[0]))
-                ops.append(
-                    Operation(
-                        CircuitGate(subcircuit, True),
-                        op.location,
-                        subcircuit.params,
-                    ),
-                )
-                block_data['replaced'] = True
-
-                # Calculate Error
-                error_sum += block_data.error
-            else:
-                block_data['replaced'] = False
+        for replacement in replacements:
+            if replacement is not None:
+                points.append(replacement[0])
+                ops.append(replacement[1])
 
         # Replace blocks
         circuit.batch_replace(points, ops)

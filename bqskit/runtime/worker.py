@@ -34,6 +34,22 @@ from bqskit.runtime.task import RuntimeTask
 
 _logger = logging.getLogger(__name__)
 
+# When set, a task that blocks on a future stops counting toward this worker's
+# advertised load, and counts again once its result arrives.
+#
+# The server sorts placement on RuntimeEmployee.num_tasks (base.py:587), which
+# only decrements when a task completes (detached.py:363). A coordination task
+# that spends its life awaiting descendants therefore inflates the load signal
+# for its whole lifetime. Measured: depth 1 and 2 tasks await 98.4-98.8% of
+# their lifetime, the server reports zero idle workers, and physical CPU sits
+# at 21%. See docs/08.
+#
+# The Dask-era code did this explicitly with secede()/rejoin() in foreach.py,
+# leap.py and qsearch.py (commit b3ab4161); the semantics were lost when the
+# in-house runtime replaced Dask. This restores an equivalent using the UPDATE
+# message the runtime already has.
+_AWAIT_YIELDS_CREDIT = os.environ.get('BQSKIT_AWAIT_YIELDS_CREDIT') == '1'
+
 
 @dataclass
 class WorkerMailbox:
@@ -349,6 +365,14 @@ class Worker:
                 # {box.ready=}')
                 self._ready_task_ids.put(box.dest_addr)  # Wake it
                 box.dest_addr = None  # Prevent double wake
+                if _AWAIT_YIELDS_CREDIT and getattr(
+                    task, '_yielded_credit', False,
+                ):
+                    # Runnable again: resume advertising it as load. Paired
+                    # one-for-one with the yield in _process_await, so the
+                    # server's count returns to what it would have been.
+                    task._yielded_credit = False  # type: ignore[attr-defined]
+                    self._conn.send((RuntimeMessage.UPDATE, 1))
 
     def _handle_cancel(self, addr: RuntimeAddress) -> None:
         """
@@ -371,11 +395,22 @@ class Worker:
         self._cancelled_task_ids.add(addr)
 
         # Remove all tasks that are children of `addr` from initialized tasks
+        yielded_and_cancelled = 0
         for key, task in self._tasks.items():
             if task.is_descendant_of(addr):
+                # A task cancelled while blocked never reaches the wake path
+                # that would restore its yielded credit, so the server's count
+                # would drift down permanently. Give it back here.
+                if _AWAIT_YIELDS_CREDIT and getattr(
+                    task, '_yielded_credit', False,
+                ):
+                    task._yielded_credit = False  # type: ignore[attr-defined]
+                    yielded_and_cancelled += 1
                 task.cancel()
                 for mailbox_id in self._tasks[key].owned_mailboxes:
                     self._mailboxes.pop(mailbox_id)
+        if yielded_and_cancelled:
+            self._conn.send((RuntimeMessage.UPDATE, yielded_and_cancelled))
         self._tasks = {
             a: t for a, t in self._tasks.items()
             if not t.is_descendant_of(addr)
@@ -504,6 +539,13 @@ class Worker:
 
         if box.ready:
             self._ready_task_ids.put(task.return_address)
+        elif _AWAIT_YIELDS_CREDIT and not getattr(
+            task, '_yielded_credit', False,
+        ):
+            # Blocked with nothing to deliver yet: stop advertising this task
+            # as load until its result arrives.
+            task._yielded_credit = True  # type: ignore[attr-defined]
+            self._conn.send((RuntimeMessage.UPDATE, -1))
 
     def _process_task_completion(self, task: RuntimeTask, result: Any) -> None:
         """Package and send out task result."""
