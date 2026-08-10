@@ -227,6 +227,10 @@ class LEAPSynthesisPass(SynthesisPass):
         min_prefix_size: int = 3,
         beam_width: int | None = None,
         task_budget: int | None = None,
+        greedy_beam: bool = False,
+        beam_min: int = 4,
+        beam_max: int = 64,
+        greedy_window: int = 4,
         async_drain: bool = False,
         parallel_multistart: bool = False,
         instantiate_options: dict[str, Any] = {},
@@ -368,8 +372,24 @@ class LEAPSynthesisPass(SynthesisPass):
                 % type(parallel_multistart),
             )
 
+        if greedy_beam and not (0 < beam_min <= beam_max):
+            raise ValueError(
+                'Expected 0 < beam_min <= beam_max, got %d and %d.'
+                % (int(beam_min), int(beam_max)),
+            )
+
+        if greedy_beam and greedy_window < 2:
+            raise ValueError(
+                'greedy_window must be at least 2 to measure a rate, got %d.'
+                % int(greedy_window),
+            )
+
         self.beam_width = beam_width
         self.task_budget = task_budget
+        self.greedy_beam = greedy_beam
+        self.beam_min = beam_min
+        self.beam_max = beam_max
+        self.greedy_window = greedy_window
         self.async_drain = async_drain
         self.parallel_multistart = parallel_multistart
         self.heuristic_function = heuristic_function
@@ -420,6 +440,16 @@ class LEAPSynthesisPass(SynthesisPass):
         best_circ = initial_layer
         best_layer = 0
         best_dists = [best_dist]
+
+        # Greedy-beam controller state. Local, never on self: the pass object
+        # is shared across every block ForEachBlockPass dispatches, so writing
+        # the adapted width back to self.beam_width would leak one block's
+        # trajectory into the next one's starting point.
+        greedy_hist: list[tuple[float, int]] = []
+        tasks_dispatched = 0
+        current_beam = self.beam_width
+        greedy_beam_now: int | None = None
+        greedy_rho_now: float | None = None
         best_layers = [0]
         last_prefix_layer = 0
 
@@ -470,8 +500,42 @@ class LEAPSynthesisPass(SynthesisPass):
             # needed.
             #
             # With both unset this pops exactly one node, as before.
-            beam = self.beam_width
+            beam = current_beam
             budget = self.task_budget
+
+            # Greedy beam: spend the round's width on what the search has
+            # actually been buying, not on a constant.
+            #
+            # rho = improvement in best_dist per task dispatched, over a
+            # window. Improving => narrow the beam and go deeper on what is
+            # working. Stalled => widen it, because a wider frontier is the
+            # only way out of a plateau and the workers are idle anyway.
+            #
+            # Windowed rather than per-round on purpose. Instantiation is
+            # stochastic -- this project measured a p90 spread of 28.6% on
+            # repeated runs of one cell -- so a controller reacting to a
+            # single round would be chasing noise. The window is the cheap
+            # stand-in for a confidence bound; a real UCB form is the next
+            # step if this shows anything.
+            if self.greedy_beam:
+                greedy_hist.append((best_dist, tasks_dispatched))
+                if len(greedy_hist) > self.greedy_window:
+                    greedy_hist.pop(0)
+
+                if len(greedy_hist) < self.greedy_window:
+                    beam = self.beam_width or self.beam_min
+                else:
+                    d0, t0 = greedy_hist[0]
+                    d1, t1 = greedy_hist[-1]
+                    spent = max(1, t1 - t0)
+                    rho = (d0 - d1) / spent
+                    if rho > 0.0:
+                        beam = max(self.beam_min, (beam or self.beam_max) // 2)
+                    else:
+                        beam = min(self.beam_max, (beam or self.beam_min) * 2)
+                    greedy_beam_now = beam
+                    greedy_rho_now = rho
+                current_beam = beam
 
             popped = []
             successors = []
@@ -500,6 +564,7 @@ class LEAPSynthesisPass(SynthesisPass):
                     # kept as the ablation baseline for the decoupled form.
                     break
 
+            tasks_dispatched += len(successors)
             current_iteration = iteration
             iteration += 1
 
@@ -760,6 +825,12 @@ class LEAPSynthesisPass(SynthesisPass):
                     # cannot be evaluated against the data already on disk.
                     'best_dist': best_dist,
                     'best_layer': best_layer,
+                    # Without these a flat result cannot be told apart from a
+                    # controller that never moved -- the exact ambiguity that
+                    # cost beam ablation round 1.
+                    'greedy_beam': greedy_beam_now,
+                    'greedy_rho': greedy_rho_now,
+                    'tasks_dispatched': tasks_dispatched,
                 })
             if aggregate_enabled:
                 _leapwaste_aggregate_record(
