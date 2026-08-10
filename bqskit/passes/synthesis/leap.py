@@ -48,13 +48,23 @@ _MIN_PREFIX_SIZE_OVERRIDE = os.environ.get('BQSKIT_MIN_PREFIX_SIZE')
 # back into the frontier, so the next node actually popped may be a child
 # rather than P1 -- and then the work spent on P1..P{K-1} is squashed.
 #
-# The whole approach therefore turns on one number: how often the next node
-# popped was already in the previous pop's top-K. That is measurable on an
-# ordinary run with a counter, before any speculation exists. Rank r means a
-# speculator of width r+1 would have had the result ready; "miss" means the
-# node did not exist yet at snapshot time.
+# The whole approach therefore turns on one number: how many of the next
+# several commits come from ONE dispatch. That is measurable on an ordinary
+# run with a counter, before any speculation exists. Rank r means a speculator
+# of width r+1 had that result ready; "miss" means the node did not exist at
+# snapshot time and no width could have covered it.
+#
+# The snapshot is held for BQPROF_SPEC_WINDOW pops. The first version
+# refreshed it every pop, which only asked "was the frontier minimum popped"
+# -- true unless a fresh child displaced it -- and gave a curve flat at 87.2%
+# from width 1 to 128. That is the depth-1 prefetch rate, worth taking
+# in-flight from 1 to 2, and says nothing about whether width K pays.
 _SPEC_PROBE_DIR = os.environ.get('BQPROF_SPEC_DIR')
 _SPEC_PROBE_K = int(os.environ.get('BQPROF_SPEC_K', '32'))
+# How many pops one snapshot must serve. A speculator of width K dispatches
+# once and hopes the next several commits all come from that dispatch, so the
+# snapshot has to be held across them rather than refreshed each pop.
+_SPEC_WINDOW = int(os.environ.get('BQPROF_SPEC_WINDOW', '8'))
 _SPEC_STATE: dict[str, Any] = {}
 
 
@@ -65,7 +75,7 @@ def _spec_probe_record(rank: int | None) -> None:
     if _SPEC_STATE.get('pid') != os.getpid():
         _SPEC_STATE.clear()
         _SPEC_STATE.update({
-            'pid': os.getpid(), 'k': _SPEC_PROBE_K,
+            'pid': os.getpid(), 'k': _SPEC_PROBE_K, 'window': _SPEC_WINDOW,
             'n_pops': 0, 'n_hits': 0, 'n_misses': 0,
             'rank_hist': {}, 'last_flush': 0.0,
         })
@@ -642,6 +652,16 @@ class LEAPSynthesisPass(SynthesisPass):
                 # is exactly the set an ordered speculator would have
                 # dispatched alongside this node.
                 if _SPEC_PROBE_DIR:
+                    # Hold the snapshot for a WINDOW of pops rather than
+                    # refreshing every pop. Refreshing made rank 0 almost
+                    # tautological -- it only asked "was the frontier minimum
+                    # popped", which is true unless a fresh child displaced
+                    # it, and produced a curve flat at 87.2% from width 1 to
+                    # 128. That measures depth-1 prefetch (in-flight 1 -> 2),
+                    # not width-K speculation.
+                    #
+                    # Width K pays only if several CONSECUTIVE commits come
+                    # from ONE dispatch, so the snapshot has to survive them.
                     prev = _SPEC_STATE.get('topk')
                     popped_id = frontier._last_popped_id
                     if prev is not None:
@@ -649,7 +669,10 @@ class LEAPSynthesisPass(SynthesisPass):
                             prev.index(popped_id)
                             if popped_id in prev else None,
                         )
-                    _SPEC_STATE['topk'] = frontier.topk_ids(_SPEC_PROBE_K)
+                        _SPEC_STATE['age'] = _SPEC_STATE.get('age', 0) + 1
+                    if prev is None or _SPEC_STATE['age'] >= _SPEC_WINDOW:
+                        _SPEC_STATE['topk'] = frontier.topk_ids(_SPEC_PROBE_K)
+                        _SPEC_STATE['age'] = 0
 
                 popped.append((top_circuit, top_layer))
                 # The parent's layer must travel with its successors: a
