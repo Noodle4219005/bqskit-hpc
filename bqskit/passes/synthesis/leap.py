@@ -101,6 +101,17 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'rounds_where_prune_fired': 0,
             'sum_popped_per_round': 0,
             'n_rounds': 0,
+            # Greedy-controller trajectory. Without this the aggregate probe
+            # cannot tell an adaptive run from one where the controller
+            # pinned itself to beam_min (rho always positive) or beam_max
+            # (rho never positive) and became a constant beam with extra
+            # machinery. That distinction is the gate on the whole idea, and
+            # it cannot be recovered from the per-iteration records because
+            # aggregate mode suppresses them.
+            'greedy_rounds': 0,
+            'greedy_beam_hist': {},
+            'greedy_rho_positive': 0,
+            'greedy_rho_nonpositive': 0,
         })
     summary = {
         key: value for key, value in _LEAPWASTE_AGG_STATE.items()
@@ -156,6 +167,22 @@ def _leapwaste_aggregate_record(
         _LEAPWASTE_AGG_STATE['sum_n_cleared'] += n_cleared
         _LEAPWASTE_AGG_STATE['n_cleared_count'] += 1
     _leapwaste_aggregate_flush()
+
+
+def _leapwaste_aggregate_greedy(beam: int, rho: float) -> None:
+    """Record one greedy-beam decision so the controller can be audited."""
+    if not _LEAPWASTE_DIR or not _LEAPWASTE_AGGREGATE:
+        return
+    if 'greedy_beam_hist' not in _LEAPWASTE_AGG_STATE:
+        return
+    hist = _LEAPWASTE_AGG_STATE['greedy_beam_hist']
+    key = str(beam)
+    hist[key] = hist.get(key, 0) + 1
+    _LEAPWASTE_AGG_STATE['greedy_rounds'] += 1
+    if rho > 0.0:
+        _LEAPWASTE_AGG_STATE['greedy_rho_positive'] += 1
+    else:
+        _LEAPWASTE_AGG_STATE['greedy_rho_nonpositive'] += 1
 
 
 def _leapwaste_aggregate_start() -> None:
@@ -535,6 +562,7 @@ class LEAPSynthesisPass(SynthesisPass):
                         beam = min(self.beam_max, (beam or self.beam_min) * 2)
                     greedy_beam_now = beam
                     greedy_rho_now = rho
+                    _leapwaste_aggregate_greedy(beam, rho)
                 current_beam = beam
 
             popped = []
