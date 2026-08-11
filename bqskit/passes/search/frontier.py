@@ -129,6 +129,19 @@ class Frontier:
             return []
         return [e.element_id for e in heapq.nsmallest(k, self._frontier)]
 
+    def peek(self, k: int) -> list[tuple[int, Circuit, Any]]:
+        """Return the k cheapest entries without mutating the heap.
+
+        Each entry is returned as ``(element_id, circuit, extra_data)`` in the
+        same order that repeated calls to :meth:`pop` would return them.
+        """
+        if k <= 0 or not self._frontier:
+            return []
+        return [
+            (elem.element_id, elem.circuit, elem.extra_data)
+            for elem in heapq.nsmallest(k, self._frontier)
+        ]
+
     def topk_costs(self, k: int) -> list[float]:
         """Return the heuristic costs of the k cheapest entries, in order.
 

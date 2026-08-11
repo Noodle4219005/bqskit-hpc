@@ -256,6 +256,9 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'rounds_where_prune_fired': 0,
             'sum_popped_per_round': 0,
             'n_rounds': 0,
+            'spec_hits': 0,
+            'spec_misses': 0,
+            'spec_wasted': 0,
             'gdfs_descent_hist': {},
             'gdfs_backtrack_jump_hist': {},
             'gdfs_post_commit_depth_hist': {},
@@ -447,6 +450,10 @@ class LEAPSynthesisPass(SynthesisPass):
         Environment:
             BQSKIT_MAX_ROLLBACKS controls the per-synthesis rollback budget.
             It defaults to BQSKIT_MAX_COMMITTED.
+            BQSKIT_SPECULATE_WIDTH controls ordered speculative expansion.
+            It is read when the pass is constructed and defaults to 1.
+            BQSKIT_SPECULATE_MEMO caps the expansion memo and defaults to four
+            times BQSKIT_SPECULATE_WIDTH.
 
         Raises:
             ValueError: If `max_depth` or `min_prefix_size` is nonpositive.
@@ -529,6 +536,32 @@ class LEAPSynthesisPass(SynthesisPass):
                 % type(parallel_multistart),
             )
 
+        try:
+            speculate_width = int(os.environ.get('BQSKIT_SPECULATE_WIDTH', '1'))
+        except ValueError as err:
+            raise ValueError(
+                'BQSKIT_SPECULATE_WIDTH must be an integer.',
+            ) from err
+        if speculate_width < 1:
+            raise ValueError(
+                'BQSKIT_SPECULATE_WIDTH must be positive, got %d.'
+                % speculate_width,
+            )
+
+        try:
+            speculate_memo = int(os.environ.get(
+                'BQSKIT_SPECULATE_MEMO', str(4 * speculate_width),
+            ))
+        except ValueError as err:
+            raise ValueError(
+                'BQSKIT_SPECULATE_MEMO must be an integer.',
+            ) from err
+        if speculate_memo < 1:
+            raise ValueError(
+                'BQSKIT_SPECULATE_MEMO must be positive, got %d.'
+                % speculate_memo,
+            )
+
         if not is_integer(num_prefixes):
             raise TypeError(
                 'Expected num_prefixes to be an integer, got %s'
@@ -554,6 +587,8 @@ class LEAPSynthesisPass(SynthesisPass):
         self.beam_width = beam_width
         self.async_drain = async_drain
         self.parallel_multistart = parallel_multistart
+        self.speculate_width = speculate_width
+        self.speculate_memo = speculate_memo
         self.heuristic_function = heuristic_function
         self.layer_gen = layer_generator
         self.success_threshold = success_threshold
@@ -618,6 +653,114 @@ class LEAPSynthesisPass(SynthesisPass):
         # Seed the PRNG
         if 'seed' not in instantiate_options:
             instantiate_options['seed'] = data.seed
+
+        async def instantiate_batches(
+            batches: list[list[Circuit]],
+        ) -> list[list[Circuit]]:
+            """Instantiate several node expansions in one runtime map."""
+            flat_successors = [
+                successor
+                for batch in batches
+                for successor in batch
+            ]
+            if not flat_successors:
+                return [[] for _ in batches]
+
+            if (
+                not leapwaste_enabled
+                and not self.async_drain
+                and self.parallel_multistart
+                and int(instantiate_options.get('multistarts', 1)) > 1
+            ):
+                num_starts = int(instantiate_options['multistarts'])
+                single_options = dict(instantiate_options)
+                single_options.pop('multistarts', None)
+                single_options.pop('seed', None)
+                base_seed = int(instantiate_options.get('seed', 0) or 0)
+
+                flat_circuits = []
+                flat_seeds = []
+                owner_of_task: list[tuple[int, int]] = []
+                for batch_index, batch in enumerate(batches):
+                    for successor_index, successor in enumerate(batch):
+                        for start_index in range(num_starts):
+                            flat_circuits.append(successor)
+                            flat_seeds.append(
+                                base_seed * num_starts
+                                + successor_index * num_starts
+                                + start_index,
+                            )
+                            owner_of_task.append((batch_index, successor_index))
+
+                flat_results = await get_runtime().map(
+                    _instantiate_single_start,
+                    flat_circuits,
+                    [utry] * len(flat_circuits),
+                    flat_seeds,
+                    **single_options,
+                )
+
+                best_circuits: list[dict[int, Circuit]] = [
+                    {} for _ in batches
+                ]
+                best_costs: list[dict[int, float]] = [
+                    {} for _ in batches
+                ]
+                for task_index, candidate in enumerate(flat_results):
+                    batch_index, successor_index = owner_of_task[task_index]
+                    candidate_cost = self.cost.calc_cost(candidate, utry)
+                    if (
+                        successor_index not in best_costs[batch_index]
+                        or candidate_cost
+                        < best_costs[batch_index][successor_index]
+                    ):
+                        best_costs[batch_index][successor_index] = candidate_cost
+                        best_circuits[batch_index][successor_index] = candidate
+
+                return [
+                    [best_circuits[i][j] for j in range(len(batch))]
+                    for i, batch in enumerate(batches)
+                ]
+
+            flat_results = await get_runtime().map(
+                Circuit.instantiate,
+                flat_successors,
+                target=utry,
+                **instantiate_options,
+            )
+            results: list[list[Circuit]] = []
+            offset = 0
+            for batch in batches:
+                end = offset + len(batch)
+                results.append(flat_results[offset:end])
+                offset = end
+            return results
+
+        def record_spec_metric(metric: str, amount: int = 1) -> None:
+            """Record ordered-speculation accounting when aggregation is on."""
+            if aggregate_enabled:
+                _LEAPWASTE_AGG_STATE[metric] += amount
+
+        speculation_memo: dict[
+            int, tuple[list[Circuit], list[Circuit]],
+        ] = {}
+
+        def memoize_speculation(
+            element_id: int,
+            expansion: tuple[list[Circuit], list[Circuit]],
+        ) -> None:
+            """Insert one expansion, evicting the oldest memo entry first."""
+            while len(speculation_memo) >= self.speculate_memo:
+                oldest_id = next(iter(speculation_memo))
+                speculation_memo.pop(oldest_id)
+                record_spec_metric('spec_wasted')
+            speculation_memo[element_id] = expansion
+
+        def discard_speculation_memo() -> None:
+            """Drop expansions that will not reach a committed pop."""
+            if speculation_memo:
+                record_spec_metric('spec_wasted', len(speculation_memo))
+                speculation_memo.clear()
 
         # Get layer generator for search
         layer_gen = self._get_layer_gen(data)
@@ -745,32 +888,50 @@ class LEAPSynthesisPass(SynthesisPass):
                 n_added_this_iter = 0
                 prefix_formed = False
                 n_cleared = None
-            # Expand enough nodes to fill the task budget, not a fixed count.
-            #
-            # LEAP pops one node and dispatches its successors, so tasks in
-            # flight equal the block's coupling-graph edge count -- measured
-            # at 2.07 on sparse devices. That caps how much of a machine one
-            # block's search can use, independently of how many workers
-            # exist.
-            #
-            # Two separate budgets control this:
-            #
-            #   beam_width (B)     how many nodes the frontier may keep.
-            #                      A search-quality and memory bound.
-            #
-            # A resource-driven expansion budget (T) was tried here and
-            # removed: E2's bounded_32_96 arm timed out and dropped
-            # popped/round from 20.12 to 13.9, so the budget form of T binds
-            # earlier than B and costs throughput. T returns in the
-            # order-preserving speculation form instead (docs/04 6.1.1b).
-            #
-            # With beam_width unset this pops exactly one node, as before.
+            # `beam_width` controls how many nodes are committed per round.
+            # Ordered speculation separately fills the runtime with expansions
+            # of nodes that remain in the frontier, without changing this
+            # commit order.
             beam = self.beam_width
-
 
             popped = []
             successors = []
             successor_layers = []
+            popped_expansions: list[
+                tuple[list[Circuit], list[Circuit] | None],
+            ] = []
+
+            if self.speculate_width >= 2:
+                speculative_ids: list[int] = []
+                speculative_batches: list[list[Circuit]] = []
+                for element_id, circuit, _ in frontier.peek(
+                    self.speculate_width,
+                ):
+                    if element_id in speculation_memo:
+                        continue
+                    node_successors = list(
+                        layer_gen.gen_successors(circuit, data),
+                    )
+                    speculative_ids.append(element_id)
+                    speculative_batches.append(node_successors)
+
+                if speculative_batches:
+                    speculative_results = await instantiate_batches(
+                        speculative_batches,
+                    )
+                    tasks_dispatched += sum(
+                        len(batch) for batch in speculative_batches
+                    )
+                    for element_id, node_successors, node_results in zip(
+                        speculative_ids,
+                        speculative_batches,
+                        speculative_results,
+                    ):
+                        memoize_speculation(
+                            element_id,
+                            (node_successors, node_results),
+                        )
+
             while not frontier.empty():
                 top_circuit, top_layer = frontier.pop()
 
@@ -853,9 +1014,35 @@ class LEAPSynthesisPass(SynthesisPass):
                 # shared loop variable would silently mis-record depth for
                 # every node after the first, and the search would still
                 # look healthy.
-                for successor in layer_gen.gen_successors(top_circuit, data):
-                    successors.append(successor)
-                    successor_layers.append(top_layer)
+                if self.speculate_width >= 2:
+                    popped_id = frontier._last_popped_id
+                    memo_entry = (
+                        speculation_memo.pop(popped_id)
+                        if popped_id is not None
+                        and popped_id in speculation_memo
+                        else None
+                    )
+                    if memo_entry is not None:
+                        node_successors, node_results = memo_entry
+                        record_spec_metric('spec_hits')
+                    else:
+                        node_successors = list(
+                            layer_gen.gen_successors(top_circuit, data),
+                        )
+                        node_results = None
+                        if node_successors:
+                            record_spec_metric('spec_misses')
+                    popped_expansions.append((node_successors, node_results))
+                    successors.extend(node_successors)
+                    successor_layers.extend(
+                        [top_layer] * len(node_successors),
+                    )
+                else:
+                    for successor in layer_gen.gen_successors(
+                        top_circuit, data,
+                    ):
+                        successors.append(successor)
+                        successor_layers.append(top_layer)
 
                 if beam is None:
                     # Original behaviour: one node per round.
@@ -867,7 +1054,8 @@ class LEAPSynthesisPass(SynthesisPass):
                     # baseline for the order-preserving form.
                     break
 
-            tasks_dispatched += len(successors)
+            if self.speculate_width < 2:
+                tasks_dispatched += len(successors)
             current_iteration = iteration
             iteration += 1
 
@@ -906,8 +1094,36 @@ class LEAPSynthesisPass(SynthesisPass):
                     )
                 continue
 
+            map_id = None
+            t_map_start = None
+            t_map_end = None
+
             # Instantiate successors
-            if leapwaste_enabled:
+            if self.speculate_width >= 2:
+                pending_batches = [
+                    node_successors
+                    for node_successors, node_results in popped_expansions
+                    if node_results is None and node_successors
+                ]
+                pending_results = (
+                    await instantiate_batches(pending_batches)
+                    if pending_batches else []
+                )
+                tasks_dispatched += sum(
+                    len(batch) for batch in pending_batches
+                )
+
+                circuits = []
+                pending_index = 0
+                for node_successors, node_results in popped_expansions:
+                    if node_results is None:
+                        if node_successors:
+                            node_results = pending_results[pending_index]
+                            pending_index += 1
+                        else:
+                            node_results = []
+                    circuits.extend(node_results)
+            elif leapwaste_enabled:
                 t_map_start = time.time()
                 map_future = get_runtime().map(
                     Circuit.instantiate,
@@ -1069,6 +1285,7 @@ class LEAPSynthesisPass(SynthesisPass):
                             'prefix_formed': prefix_formed,
                             'n_cleared': n_cleared,
                         })
+                    discard_speculation_memo()
                     if aggregate_enabled:
                         if n_rollbacks > 0:
                             _LEAPWASTE_AGG_STATE['n_rollback_rescued'] += 1
@@ -1117,6 +1334,8 @@ class LEAPSynthesisPass(SynthesisPass):
                         _prefix_probe_record(
                             layer + 1, frontier, circuit, len(frontier),
                         )
+
+                        discard_speculation_memo()
 
                         # Multi-prefix: keep the best few continuations
                         # rather than only the one LEAP picked.
@@ -1254,6 +1473,19 @@ class LEAPSynthesisPass(SynthesisPass):
             # threshold does not. A width bound does not depend on depth.
             # No-op when `beam_width` is unset.
             n_pruned_this_round = frontier.prune(beam)
+            if self.speculate_width >= 2 and speculation_memo:
+                live_ids = {
+                    element_id for element_id, _, _ in frontier.peek(
+                        len(frontier),
+                    )
+                }
+                stale_ids = [
+                    element_id for element_id in speculation_memo
+                    if element_id not in live_ids
+                ]
+                for element_id in stale_ids:
+                    speculation_memo.pop(element_id)
+                record_spec_metric('spec_wasted', len(stale_ids))
             if aggregate_enabled and _LEAPWASTE_AGG_STATE:
                 _LEAPWASTE_AGG_STATE['sum_n_pruned'] += n_pruned_this_round
                 if n_pruned_this_round > 0:
@@ -1281,6 +1513,7 @@ class LEAPSynthesisPass(SynthesisPass):
         if self.store_partial_solutions:
             data['psols'] = psols
 
+        discard_speculation_memo()
         if aggregate_enabled:
             _LEAPWASTE_AGG_STATE['n_exhausted_unverified'] += 1
             _leapwaste_aggregate_finish()
