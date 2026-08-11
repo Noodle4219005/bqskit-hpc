@@ -12,6 +12,7 @@ from bqskit.compiler.basepass import BasePass
 from bqskit.compiler.passdata import PassData
 from bqskit.ir.circuit import Circuit
 from bqskit.ir.operation import Operation
+from bqskit.qis.unitary.unitarymatrix import UnitaryMatrix
 from bqskit.ir.opt.cost.functions import HilbertSchmidtResidualsGenerator
 from bqskit.ir.opt.cost.generator import CostFunctionGenerator
 from bqskit.utils.typing import is_real_number
@@ -175,6 +176,13 @@ class ScanningGateRemovalPass(BasePass):
                 % type(instantiate_options),
             )
 
+        # Opt-in, read at construction rather than module import: capturing
+        # an env var at import is what silently invalidated 38 cells of a
+        # sweep in this project once.
+        if collection_filter is None and os.environ.get(
+            'BQSKIT_SKIP_CONSTANT_SQ',
+        ) == '1':
+            collection_filter = skip_incompensable_collection_filter
         self.collection_filter = collection_filter or default_collection_filter
 
         if not callable(self.collection_filter):
@@ -281,6 +289,48 @@ class ScanningGateRemovalPass(BasePass):
                 _probe[f'inst_seconds_{_arity}'] += _inst_elapsed
                 if _removed:
                     _probe[f'removed_{_arity}'] += 1
+                # Is removability cheaply predictable?
+                #
+                # The LEAP paper's dimensionality reduction removes up to 40%
+                # of the U3 gates, and the implementation is this loop: try
+                # each gate in turn, pay one full-circuit instantiate, keep
+                # the removal if it worked. P0-g measured a 12.8% success rate
+                # on single-qudit gates, so 87% of those instantiates buy
+                # nothing.
+                #
+                # If a gate's distance from the identity predicted its
+                # removability, the loop could be ordered by it -- or stopped
+                # early -- and most of the removals would come for a fraction
+                # of the instantiates. Bucket the outcome by that distance so
+                # the separation, if any, is visible. The distance is a 2x2
+                # (or d x d) norm, free next to an instantiate.
+                try:
+                    _u = op.get_unitary()
+                    _d = float(
+                        _u.get_distance_from(
+                            UnitaryMatrix.identity(_u.dim, _u.radixes),
+                        ),
+                    )
+                except Exception:
+                    _d = -1.0
+                if _d >= 0.0:
+                    _b = min(int(_d * 20), 19)
+                    _hist = _probe.setdefault(
+                        f'idist_{_arity}_{"removed" if _removed else "kept"}',
+                        {},
+                    )
+                    _hist[str(_b)] = _hist.get(str(_b), 0) + 1
+                # By gate type as well, because one bucket held 87 attempts
+                # and zero successes and guessing which gate that was is
+                # exactly the kind of structural assumption that has been
+                # wrong three times in this project.
+                _by = _probe.setdefault(
+                    f'gate_{"removed" if _removed else "kept"}', {},
+                )
+                _name = type(op.gate).__name__
+                _by[_name] = _by.get(_name, 0) + 1
+                _sec = _probe.setdefault('gate_inst_seconds', {})
+                _sec[_name] = round(_sec.get(_name, 0.0) + _inst_elapsed, 6)
 
             if _removed:
                 _logger.debug('Successfully removed operation.')
@@ -293,6 +343,35 @@ class ScanningGateRemovalPass(BasePass):
             _scan_probe_emit(_probe)
 
         circuit.become(circuit_copy)
+
+
+def skip_incompensable_collection_filter(op: Operation) -> bool:
+    """
+    Skip gates whose removal the remaining free parameters cannot compensate.
+
+    The LEAP paper's dimensionality reduction removes up to 40% of the U3
+    gates, and this pass is the implementation: try each gate in turn, pay one
+    full-circuit instantiate, keep the removal if the result still meets the
+    threshold. Measured per gate type, that budget is badly spent:
+
+        gate        attempts  removed  success  share of instantiate time
+        RZGate            91       23    25.3%                      36.8%
+        SqrtXGate         76        0     0.0%                      44.4%
+        CZGate            27        3    11.1%                      18.8%
+
+    SqrtX never succeeds, and it is not bad luck. In the native set
+    {RZ, SX, X} the RZ gates are diagonal, so a maximal single-qudit run is
+    RZ-SX-RZ-SX-RZ with exactly two sources of off-diagonal structure. Drop
+    one and what is left is D1 * SX * D2, a two-parameter family; a general
+    SU(2) element needs three. The surviving RZ parameters cannot compensate,
+    whatever the optimiser does.
+
+    So skipping constant single-qudit gates removes 44% of this pass's
+    instantiate calls and none of its removals. CZ is constant too and is NOT
+    skipped -- it succeeds 11% of the time, because a two-qudit removal is
+    compensated by the single-qudit gates around it.
+    """
+    return not (op.num_qudits == 1 and op.gate.num_params == 0)
 
 
 def default_collection_filter(op: Operation) -> bool:
