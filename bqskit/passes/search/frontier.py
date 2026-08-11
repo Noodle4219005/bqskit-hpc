@@ -59,6 +59,10 @@ class Frontier:
         self.target = target
         self.heuristic_function = heuristic_function
         self._frontier: list[FrontierElement] = []
+        self._committed: list[list[FrontierElement]] = []
+        self._max_committed: int = int(
+            os.environ.get('BQSKIT_MAX_COMMITTED', '8'),
+        )
         self._counter = itertools.count()
         self._last_popped_id: int | None = None
         """Identity of the most recent pop, for the speculation probe."""
@@ -161,3 +165,58 @@ class Frontier:
     def clear(self) -> None:
         """Remove all elements from the frontier."""
         self._frontier.clear()
+
+    def commit(self) -> int:
+        """
+        Set the current frontier aside rather than destroying it.
+
+        LEAP's prefix commit was `clear()`, which is irreversible: once the
+        frontier is gone there is no way back to the branch point if the
+        committed path turns out to be wrong. Measured, that matters -- when
+        the search does climb back up the tree it climbs one level (p90 1, or
+        2 on a real device graph), so recovery is cheap if it is possible at
+        all.
+
+        Setting the list aside rather than tagging its elements is deliberate.
+        A per-element epoch would force `empty`, `__len__`, `prune`,
+        `topk_ids`, `topk_costs` and `score` to all learn to skip stale
+        entries, turning every read into a scan. Swapping the container leaves
+        each of them looking at exactly the live frontier, so equivalence with
+        `clear()` holds by construction rather than by argument.
+
+        Returns:
+            int: The number of elements set aside.
+        """
+        count = len(self._frontier)
+        self._committed.append(self._frontier)
+        self._frontier = []
+        # A cap is required, not tidiness. At min_prefix_size=3 one synthesis
+        # forms up to 712 prefixes, and holding every frontier of ~120
+        # circuits would be real memory. Past the cap the oldest is dropped
+        # and becomes exactly as unrecoverable as it was before this change.
+        while len(self._committed) > self._max_committed:
+            self._committed.pop(0)
+        return count
+
+    def rollback(self) -> int:
+        """
+        Restore the most recently committed frontier, merging it back in.
+
+        Callers must restore their own non-monotone state alongside this. In
+        LEAP that is `last_prefix_layer` and nothing else: `best_circ`,
+        `best_dist`, `best_layer` and `psols` all mean "best seen so far" and
+        must survive a rollback.
+
+        Returns:
+            int: The number of elements restored, 0 if nothing was committed.
+        """
+        if not self._committed:
+            return 0
+        prior = self._committed.pop()
+        self._frontier.extend(prior)
+        heapq.heapify(self._frontier)
+        return len(prior)
+
+    def committed_depth(self) -> int:
+        """Return how many committed frontiers are still recoverable."""
+        return len(self._committed)

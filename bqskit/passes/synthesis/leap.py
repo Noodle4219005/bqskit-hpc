@@ -1009,7 +1009,7 @@ class LEAPSynthesisPass(SynthesisPass):
                                 break
                             alternates.append(frontier.pop())
 
-                        frontier.clear()
+                        frontier.commit()
                         if self.max_layer is None or layer + 1 < self.max_layer:
                             frontier.add(circuit, layer + 1)
                             if leapwaste_enabled:
