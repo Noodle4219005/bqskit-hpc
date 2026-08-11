@@ -243,6 +243,8 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'n_cleared_count': 0,
             'n_rollbacks': 0,
             'sum_backjump_depth': 0,
+            'stack_depth_at_rollback': {},
+            'depth_burned_hist': {},
             'n_rollback_rescued': 0,
             'n_exhausted_unverified': 0,
             'frontier_len_hist': {},
@@ -684,6 +686,18 @@ class LEAPSynthesisPass(SynthesisPass):
                     # frontier's own ordering is. Jump there and let
                     # rollback_to invalidate everything below it.
                     _states = frontier.committed_states()
+                    if aggregate_enabled:
+                        # Is there a choice to make at all? 621 rollbacks
+                        # produced a total backjump depth of 23, i.e. 96%
+                        # chronological -- and that is consistent with two
+                        # very different worlds: regret is a poor criterion,
+                        # or the stack holds one entry and argmax has nothing
+                        # to pick between. Commits and rollbacks run nearly
+                        # 1:1 (348 against 336 at max_layer=4), which points
+                        # at the second. Measure it rather than argue it.
+                        _hist = _LEAPWASTE_AGG_STATE['stack_depth_at_rollback']
+                        _key = str(len(_states))
+                        _hist[_key] = _hist.get(_key, 0) + 1
                     _target = max(
                         range(len(_states)),
                         key=lambda i: (
@@ -701,6 +715,16 @@ class LEAPSynthesisPass(SynthesisPass):
                     )
                     n_rollbacks += 1
                     if aggregate_enabled:
+                        # What the depth-burned criterion WOULD have seen, so
+                        # the two can be compared without switching yet.
+                        _tl = restored_state.get('layer') if isinstance(
+                            restored_state, dict,
+                        ) else None
+                        if _tl is not None and previous_popped_layer is not None:
+                            _burn = max(0, previous_popped_layer - _tl)
+                            _bh = _LEAPWASTE_AGG_STATE['depth_burned_hist']
+                            _bk = str(_burn)
+                            _bh[_bk] = _bh.get(_bk, 0) + 1
                         _LEAPWASTE_AGG_STATE['sum_backjump_depth'] += (
                             len(_states) - 1 - _target
                         )
@@ -1139,6 +1163,14 @@ class LEAPSynthesisPass(SynthesisPass):
                             frontier.score(circuit) - _remaining[0]
                             if _remaining else 0.0
                         )
+                        # `layer` is stored so a rollback can price the
+                        # commit by what it COST -- the depth burned after it
+                        # -- rather than only by how arbitrary it looked at
+                        # the time. Conflict-directed backjumping wants the
+                        # decision the conflict depends on, and here the
+                        # conflict is depth exhaustion, so the decision that
+                        # burned the most budget is the candidate `regret`
+                        # does not measure.
                         frontier.commit({
                             'last_prefix_layer': last_prefix_layer,
                             'regret': _regret,
