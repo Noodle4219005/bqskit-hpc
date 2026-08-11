@@ -375,6 +375,18 @@ class ForEachBlockPass(BasePass):
                             block_data.error,
                             self.error_threshold,
                         )
+                        # Emitted per rejection, not only in the 'complete'
+                        # summary. The summary is written when the pass ends,
+                        # and the runs where this fires are exactly the ones
+                        # that time out inside the pass and never get there --
+                        # the first tokyo attempt recorded one 'dispatch' line
+                        # and nothing else.
+                        _foreach_emit({
+                            'phase': 'error_reject',
+                            'block': index,
+                            'error': block_data.error,
+                            'threshold': self.error_threshold,
+                        })
                         block_data['replaced'] = False
                         continue
 
