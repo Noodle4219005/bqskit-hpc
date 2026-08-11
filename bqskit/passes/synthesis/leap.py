@@ -370,6 +370,7 @@ class LEAPSynthesisPass(SynthesisPass):
         async_drain: bool = False,
         parallel_multistart: bool = False,
         instantiate_options: dict[str, Any] = {},
+        num_prefixes: int = 1,
     ) -> None:
         """
         Construct a search-based synthesis pass.
@@ -496,6 +497,19 @@ class LEAPSynthesisPass(SynthesisPass):
                 % type(parallel_multistart),
             )
 
+        if not is_integer(num_prefixes):
+            raise TypeError(
+                'Expected num_prefixes to be an integer, got %s'
+                % type(num_prefixes),
+            )
+
+        if num_prefixes < 1:
+            raise ValueError(
+                'Expected num_prefixes to be at least 1, got %d.'
+                % int(num_prefixes),
+            )
+
+        self.num_prefixes = num_prefixes
         self.beam_width = beam_width
         self.async_drain = async_drain
         self.parallel_multistart = parallel_multistart
@@ -884,11 +898,43 @@ class LEAPSynthesisPass(SynthesisPass):
                         _prefix_probe_record(
                             layer + 1, frontier, circuit, len(frontier),
                         )
+
+                        # Multi-prefix: keep the best few continuations
+                        # rather than only the one LEAP picked.
+                        #
+                        # P0-d measured that 85-93% of prefix formations
+                        # discard a candidate the frontier itself ranks
+                        # CHEAPER than the one kept. That is possible
+                        # because check_new_best keeps by depth progress
+                        # while the frontier orders by AStarHeuristic, so
+                        # the two criteria disagree -- and racing both is
+                        # how you avoid having to know which is right.
+                        #
+                        # Popped destructively, and BEFORE the clear:
+                        # Frontier exposes no way to read the circuits
+                        # behind topk_ids, so this is the only way to retain
+                        # them. At num_prefixes == 1 the loop body never
+                        # runs and what follows is exactly the original
+                        # clear-then-add.
+                        alternates = []
+                        for _ in range(self.num_prefixes - 1):
+                            if frontier.empty():
+                                break
+                            alternates.append(frontier.pop())
+
                         frontier.clear()
                         if self.max_layer is None or layer + 1 < self.max_layer:
                             frontier.add(circuit, layer + 1)
                             if leapwaste_enabled:
                                 n_added_this_iter += 1
+                            # Re-seeded at the LAYER THEY HELD, not at
+                            # layer + 1: an alternate is a sibling of the
+                            # kept node, not a child of it, and promoting it
+                            # would corrupt every depth statistic downstream.
+                            for alt_circuit, alt_layer in alternates:
+                                frontier.add(alt_circuit, alt_layer)
+                                if leapwaste_enabled:
+                                    n_added_this_iter += 1
 
                 if self.store_partial_solutions:
                     if layer not in psols:
