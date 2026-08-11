@@ -359,17 +359,40 @@ def skip_incompensable_collection_filter(op: Operation) -> bool:
         SqrtXGate         76        0     0.0%                      44.4%
         CZGate            27        3    11.1%                      18.8%
 
-    SqrtX never succeeds, and it is not bad luck. In the native set
+    CORRECTED 2026-08-12. On the three acceptance circuits SqrtX removal
+    succeeded 0 times in 76, and this docstring claimed it never succeeds and
+    that skipping it was free. On the P0-g circuits it succeeds 374 times in
+    17,664 -- 2.1%, not 0 -- so 76 attempts was too small a sample and the
+    structural argument below was drawn too strongly.
+
+    The argument still explains WHY the rate is low. In the native set
     {RZ, SX, X} the RZ gates are diagonal, so a maximal single-qudit run is
     RZ-SX-RZ-SX-RZ with exactly two sources of off-diagonal structure. Drop
-    one and what is left is D1 * SX * D2, a two-parameter family; a general
-    SU(2) element needs three. The surviving RZ parameters cannot compensate,
-    whatever the optimiser does.
+    one and what remains is D1 * SX * D2, a two-parameter family, while a
+    general SU(2) element needs three. Removal can only succeed when the run
+    happens to lie in that restricted family, which is rare -- but not never.
 
-    So skipping constant single-qudit gates removes 44% of this pass's
-    instantiate calls and none of its removals. CZ is constant too and is NOT
-    skipped -- it succeeds 11% of the time, because a two-qudit removal is
-    compensated by the single-qudit gates around it.
+    So this is a PRICED TRADE, not a free win. Measured on ham15-med,
+    ham15-low and adder_8 at 96 workers:
+
+        gate        attempts  removed  success  share of instantiate time
+        SqrtXGate     17,664      374     2.1%                     50.6%
+        RZGate        15,182    3,888    25.6%                     29.6%
+        CZGate         5,734       46     0.8%                     19.9%
+
+        skip off   wall 261.0 s   2Q 1038   depth 2948   removed 4,308
+        skip on    wall 209.6 s   2Q 1038   depth 3146   removed 3,604
+
+    1.25x wall for +6.7% depth, 2Q unchanged. Total removals fall by more
+    than SqrtX's own 374 because the scan is sequential and greedy, so
+    skipping a gate changes the trajectory for everything after it.
+
+    CZ is constant too and is deliberately NOT skipped, though at 0.8% its
+    case is now weaker than the 11% first measured locally.
+
+    Note this is the opposite trade to TreeScanningGateRemovalPass, which at
+    tree_depth=2 buys 2.0% of depth for 4% of wall. The two knobs move along
+    the same exchange rate in opposite directions.
     """
     return not (op.num_qudits == 1 and op.gate.num_params == 0)
 
