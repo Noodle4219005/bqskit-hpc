@@ -11,6 +11,8 @@ if TYPE_CHECKING:
     from bqskit.compiler.passdata import PassData
     from bqskit.compiler.workflow import Workflow
     from bqskit.ir.circuit import Circuit
+    from bqskit.ir.operation import Operation
+    from bqskit.ir.point import CircuitPoint
     from bqskit.qis.graph import CouplingGraph
     from bqskit.qis.state.system import StateSystem
     from bqskit.qis.state.state import StateVector
@@ -176,3 +178,37 @@ async def _sub_do_work(
         data.error = new_utry.get_distance_from(old_utry)
 
     return circuit, data
+
+
+async def _sub_do_work_with_op(
+    workflow: Workflow,
+    op: Operation,
+    submodel: MachineModel,
+    subnumbering: dict[int, int],
+    cycle: int,
+    calculate_error_bound: bool,
+    seed: int | None,
+    pass_down_data: dict[str, Any],
+) -> tuple[Circuit, PassData]:
+    """Build a ForEachBlockPass block and execute its workflow."""
+    from bqskit.compiler.passdata import PassData
+    from bqskit.ir.circuit import Circuit
+    from bqskit.ir.gates.circuitgate import CircuitGate
+    from bqskit.ir.point import CircuitPoint
+
+    if isinstance(op.gate, CircuitGate):
+        circuit = op.gate._circuit.copy()
+        circuit.set_params(op.params)
+    else:
+        circuit = Circuit.from_operation(op)
+
+    data = PassData(circuit)
+    data['subnumbering'] = subnumbering
+    data['model'] = submodel
+    data['point'] = CircuitPoint(cycle, op.location[0])
+    data['calculate_error_bound'] = calculate_error_bound
+    for key, value in pass_down_data.items():
+        data[key] = value
+    data.seed = seed
+
+    return await _sub_do_work(workflow, circuit, data)

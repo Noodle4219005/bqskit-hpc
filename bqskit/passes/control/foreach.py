@@ -9,7 +9,7 @@ import time
 from typing import Any
 from typing import Callable
 
-from bqskit.compiler.basepass import _sub_do_work
+from bqskit.compiler.basepass import _sub_do_work_with_op
 from bqskit.compiler.basepass import BasePass
 from bqskit.compiler.machine import MachineModel
 from bqskit.compiler.passdata import PassData
@@ -243,18 +243,18 @@ class ForEachBlockPass(BasePass):
         coupling_graph = data.connectivity
 
         # Preprocess blocks
-        subcircuits: list[Circuit] = []
-        block_datas: list[PassData] = []
+        submodels: list[MachineModel] = []
+        subnumberings: list[dict[int, int]] = []
+        pass_down_datas: list[dict[str, Any]] = []
+        cycles: list[int] = []
+        _t_preprocess_copy = 0.0
+        _t_preprocess_submodel = 0.0
+        _t_preprocess_passdata = 0.0
         for i, (cycle, op) in enumerate(blocks):
 
-            # Form Subcircuit
-            if isinstance(op.gate, CircuitGate):
-                subcircuit = op.gate._circuit.copy()
-                subcircuit.set_params(op.params)
-            else:
-                subcircuit = Circuit.from_operation(op)
-
             # Form Submodel
+            if _FOREACH_PROF_DIR:
+                _t0 = time.perf_counter()
             subradixes = [circuit.radixes[q] for q in op.location]
             subnumbering = {op.location[i]: i for i in range(len(op.location))}
             submodel = MachineModel(
@@ -263,24 +263,25 @@ class ForEachBlockPass(BasePass):
                 model.gate_set,
                 subradixes,
             )
+            if _FOREACH_PROF_DIR:
+                _t_preprocess_submodel += time.perf_counter() - _t0
 
-            # Form Subdata
-            block_data: PassData = PassData(subcircuit)
-            block_data['subnumbering'] = subnumbering
-            block_data['model'] = submodel
-            block_data['point'] = CircuitPoint(cycle, op.location[0])
-            block_data['calculate_error_bound'] = self.calculate_error_bound
+            # Pass down data that is indexed by block remains a per-task
+            # ingredient; the worker creates the PassData object.
+            pass_down_data: dict[str, Any] = {}
             for key in data:
                 if key.startswith(self.pass_down_key_prefix):
-                    block_data[key] = data[key]
-                elif key.startswith(
-                    self.pass_down_block_specific_key_prefix,
-                ) and i in data[key]:
-                    block_data[key] = data[key][i]
-            block_data.seed = data.seed
+                    pass_down_data[key] = data[key]
+                elif (
+                    key.startswith(self.pass_down_block_specific_key_prefix)
+                    and i in data[key]
+                ):
+                    pass_down_data[key] = data[key][i]
 
-            subcircuits.append(subcircuit)
-            block_datas.append(block_data)
+            submodels.append(submodel)
+            subnumberings.append(subnumbering)
+            pass_down_datas.append(pass_down_data)
+            cycles.append(cycle)
 
         # Do the work
         #
@@ -298,10 +299,15 @@ class ForEachBlockPass(BasePass):
         _t_preprocess_end = time.perf_counter()
 
         future = get_runtime().map(
-            _sub_do_work,
-            [self.workflow] * len(subcircuits),
-            subcircuits,
-            block_datas,
+            _sub_do_work_with_op,
+            [self.workflow] * len(blocks),
+            [op for _, op in blocks],
+            submodels,
+            subnumberings,
+            cycles,
+            [self.calculate_error_bound] * len(blocks),
+            [data.seed] * len(blocks),
+            pass_down_datas,
         )
 
         _t_dispatch_end = time.perf_counter()
@@ -320,7 +326,7 @@ class ForEachBlockPass(BasePass):
         # 'phase' separates the two records; reducers must select one.
         _foreach_emit({
             'phase': 'dispatch',
-            'n_blocks': len(subcircuits),
+            'n_blocks': len(blocks),
             't_collect': round(_t_collect_end - _t_pass_start, 6),
             't_preprocess': round(_t_preprocess_end - _t_collect_end, 6),
             't_dispatch': round(_t_dispatch_end - _t_preprocess_end, 6),
@@ -328,7 +334,7 @@ class ForEachBlockPass(BasePass):
 
         _postprocess_cpu = 0.0
 
-        num_blocks = len(subcircuits)
+        num_blocks = len(blocks)
         completed_subcircuits: list[Circuit] = [None] * num_blocks  # type: ignore
         completed_block_datas: list[PassData] = [None] * num_blocks  # type: ignore
         # Postprocessed replacement for each block, or None if the block is
@@ -433,6 +439,9 @@ class ForEachBlockPass(BasePass):
             't_collect': round(_t_collect_end - _t_pass_start, 6),
             # preprocess: per-block deep copy, submodel, PassData
             't_preprocess': round(_t_preprocess_end - _t_collect_end, 6),
+            't_preprocess_copy': round(_t_preprocess_copy, 6),
+            't_preprocess_submodel': round(_t_preprocess_submodel, 6),
+            't_preprocess_passdata': round(_t_preprocess_passdata, 6),
             # dispatch: the map() call itself, i.e. serialisation
             't_dispatch': round(_t_dispatch_end - _t_preprocess_end, 6),
             # drain wall INCLUDES waiting on workers ...
