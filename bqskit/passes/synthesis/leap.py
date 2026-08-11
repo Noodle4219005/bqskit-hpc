@@ -559,6 +559,37 @@ class LEAPSynthesisPass(SynthesisPass):
         self.max_layer = max_layer
         self.no_progress_layers_allowed = no_progress_layers_allowed
         self.min_prefix_size = min_prefix_size
+        # The brake's threshold is an absolute constant -- compile.py:1025
+        # passes [3, 4, 7, 9][level - 1] -- and nothing about it scales with
+        # how deep the search can actually go. Measured, that makes it
+        # unreachable: at msz=3 only 2.02% of synthesis calls ever reach layer
+        # 7, so prefix_formed is 0 across 15 stock runs and the brake is dead
+        # code. E7 then showed the consequence for anything built on top of
+        # it: with max_layer=4 (below the threshold) no prefix can form, so a
+        # rollback has nothing to return to and 309 of 325 syntheses ended in
+        # the unverified exit; with max_layer=8 (above it) prefixes formed and
+        # 2-3 rollbacks removed those exits entirely.
+        #
+        # So the threshold has to be relative to the depth that is available,
+        # not a constant. When a depth bound is in force the bound IS that
+        # depth, and the fraction below derives the threshold from it. Unset
+        # leaves the absolute constant exactly as it was.
+        _fraction = os.environ.get('BQSKIT_MIN_PREFIX_FRACTION')
+        if _fraction is None:
+            self.min_prefix_fraction: float | None = None
+        else:
+            try:
+                self.min_prefix_fraction = float(_fraction)
+            except ValueError as err:
+                raise ValueError(
+                    'BQSKIT_MIN_PREFIX_FRACTION must be a float, got '
+                    f'{_fraction!r}.',
+                ) from err
+            if not 0.0 < self.min_prefix_fraction <= 1.0:
+                raise ValueError(
+                    'BQSKIT_MIN_PREFIX_FRACTION must be in (0, 1], got '
+                    f'{self.min_prefix_fraction}.',
+                )
         self.instantiate_options: dict[str, Any] = {
             'cost_fn_gen': self.cost,
         }
@@ -1301,7 +1332,20 @@ class LEAPSynthesisPass(SynthesisPass):
         )
 
         layers_added = new_layer - last_prefix_layer
-        return delta < 0 and layers_added >= self.min_prefix_size
+        return delta < 0 and layers_added >= self.effective_min_prefix_size
+
+    @property
+    def effective_min_prefix_size(self) -> int:
+        """
+        The prefix threshold actually in force.
+
+        A fraction of the depth bound when both are set, otherwise the
+        absolute constant. At least 1, because a threshold of 0 would form a
+        prefix on every new best and commit the search to its first guess.
+        """
+        if self.max_layer is None or self.min_prefix_fraction is None:
+            return self.min_prefix_size
+        return max(1, int(self.max_layer * self.min_prefix_fraction))
 
     def _get_layer_gen(self, data: PassData) -> LayerGenerator:
         """
