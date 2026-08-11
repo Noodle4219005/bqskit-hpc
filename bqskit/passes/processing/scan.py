@@ -68,15 +68,22 @@ def _scan_probe_emit(record: dict[str, Any]) -> None:
         pass
 
 
-def _mergeable_single_qudit_runs(circuit: Circuit) -> tuple[int, int]:
+def _mergeable_single_qudit_runs(
+    circuit: Circuit,
+) -> tuple[int, int, dict[int, int]]:
     """
     Count runs of consecutive single-qudit operations on one qudit.
 
     Returns:
-        tuple[int, int]: How many runs of length >= 2 exist, and how many
-            operations would disappear if each run collapsed to one gate.
-            The second number is the size of the prize for II-1; the first
-            says whether it is concentrated or spread thin.
+        tuple[int, int, dict[int, int]]: How many runs of length >= 2 exist,
+            how many operations would disappear if each run collapsed to ONE
+            gate, and the full run-length histogram.
+
+            The second number is NOT an achievable gain and must not be read
+            as one. A single-qubit unitary in a native gate set costs up to
+            five operations (ZXZXZ), so a run only shrinks if it is LONGER
+            than five. The histogram is what answers that; collapse-to-one is
+            an upper bound nothing can reach.
     """
     per_qudit: dict[int, list[tuple[int, int]]] = {}
     for cycle, op in circuit.operations_with_cycles():
@@ -84,20 +91,26 @@ def _mergeable_single_qudit_runs(circuit: Circuit) -> tuple[int, int]:
             per_qudit.setdefault(qudit, []).append((cycle, op.num_qudits))
 
     runs = saved = 0
+    lengths: dict[int, int] = {}
+
+    def close(streak: int) -> None:
+        nonlocal runs, saved
+        if streak >= 1:
+            lengths[streak] = lengths.get(streak, 0) + 1
+        if streak >= 2:
+            runs += 1
+            saved += streak - 1
+
     for ops in per_qudit.values():
         streak = 0
         for _, num_qudits in sorted(ops):
             if num_qudits == 1:
                 streak += 1
                 continue
-            if streak >= 2:
-                runs += 1
-                saved += streak - 1
+            close(streak)
             streak = 0
-        if streak >= 2:
-            runs += 1
-            saved += streak - 1
-    return runs, saved
+        close(streak)
+    return runs, saved, lengths
 
 
 class ScanningGateRemovalPass(BasePass):
@@ -214,9 +227,16 @@ class ScanningGateRemovalPass(BasePass):
             # compiled output has plenty to merge, but only because the rebase
             # to {CZ, RZ, SX, X} expands each U3 into RZ-SX-RZ-SX-RZ, and that
             # happens after this pass.
-            _runs, _saved = _mergeable_single_qudit_runs(circuit)
+            _runs, _saved, _lengths = _mergeable_single_qudit_runs(circuit)
             _probe['mergeable_runs'] = _runs
             _probe['mergeable_ops_saved'] = _saved
+            _probe['run_length_hist'] = {str(k): v for k, v in _lengths.items()}
+            # What a merge can ACTUALLY remove: only the operations a run
+            # carries beyond the five of a canonical ZXZXZ.
+            _probe['ops_removable_vs_zxzxz'] = sum(
+                count * (length - 5)
+                for length, count in _lengths.items() if length > 5
+            )
         _t_pass = time.perf_counter()
         for cycle, op in circuit.operations_with_cycles(reverse=reverse_iter):
 

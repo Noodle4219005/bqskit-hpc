@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import warnings
 from typing import Any
 from typing import Literal
@@ -1350,20 +1351,52 @@ def build_gate_deletion_optimization_workflow(
     iterative: bool = False,
 ) -> Workflow:
     """Build standard workflow for circuit gate deletion optimization."""
-    core_workflow = Workflow(
-        [
-            LogPass('Attempting to delete gates.'),
-            build_partitioning_workflow(
-                ScanningGateRemovalPass(
-                    success_threshold=synthesis_epsilon,
-                    instantiate_options=get_instantiate_options(
-                        optimization_level,
-                    ),
-                ),
-                max_synthesis_size,
-                None if error_threshold is None else error_sim_size,
+    workflow: list[BasePass] = [LogPass('Attempting to delete gates.')]
+
+    # MEASURED AND REFUTED 2026-08-11. Kept, off by default, because the
+    # proposal is an obvious one and someone will make it again.
+    #
+    # The idea was that 62% of the operations this scan iterates over sit in a
+    # run of >=2 consecutive single-qudit gates, so merging each run would cut
+    # the same fraction of its one-instantiate-per-operation loop. That 62%
+    # was an upper bound nobody can reach: it counted `run_length - 1`, which
+    # assumes a run collapses to ONE gate, and a single-qubit unitary in a
+    # native gate set costs up to five (ZXZXZ).
+    #
+    # The run-length histogram at the scan input is {1:17, 2:4, 3:4, 4:23,
+    # 5:20} -- nothing exceeds five, because these runs ARE the ZXZXZ
+    # expansions the rebase emitted. Merging five into five saves nothing, the
+    # less-than filter below correctly rejects every replacement, and an A/B
+    # over the acceptance circuits is byte-identical with the switch on.
+    #
+    # The filter is what kept this from being a regression rather than a
+    # no-op: GroupSingleQuditGatePass folds runs of length 1 too, and ZXZXZ on
+    # a lone SX emits five gates.
+    if os.environ.get('BQSKIT_MERGE_BEFORE_SCAN') == '1':
+        workflow += [
+            GroupSingleQuditGatePass(),
+            ForEachBlockPass(
+                [ZXZXZDecomposition()],
+                replace_filter='less-than',
             ),
-        ],
+            UnfoldPass(),
+        ]
+
+    workflow.append(
+        build_partitioning_workflow(
+            ScanningGateRemovalPass(
+                success_threshold=synthesis_epsilon,
+                instantiate_options=get_instantiate_options(
+                    optimization_level,
+                ),
+            ),
+            max_synthesis_size,
+            None if error_threshold is None else error_sim_size,
+        ),
+    )
+
+    core_workflow = Workflow(
+        workflow,
         name='Gate Deletion Optimization',
     )
 
