@@ -175,7 +175,21 @@ class ForEachBlockPass(BasePass):
                 DeprecationWarning,
             )
 
+        threshold_text = os.environ.get('BQSKIT_BLOCK_ERROR_THRESHOLD')
+        if threshold_text is None:
+            self.error_threshold = None
+        else:
+            try:
+                self.error_threshold = float(threshold_text)
+            except ValueError as err:
+                raise ValueError(
+                    'BQSKIT_BLOCK_ERROR_THRESHOLD must be a float, got '
+                    f'{threshold_text!r}.',
+                ) from err
+
         self.calculate_error_bound = calculate_error_bound
+        if self.error_threshold is not None:
+            self.calculate_error_bound = True
         self.collection_filter = collection_filter or default_collection_filter
         self.replace_filter = replace_filter or default_replace_filter
         self.workflow = Workflow(loop_body)
@@ -323,6 +337,8 @@ class ForEachBlockPass(BasePass):
         replacements: list[tuple[CircuitPoint, Operation] | None]
         replacements = [None] * num_blocks
         error_sum = 0.0
+        n_error_rejected = 0
+        max_block_error = 0.0
         num_remaining = num_blocks
 
         while num_remaining > 0:
@@ -334,10 +350,34 @@ class ForEachBlockPass(BasePass):
                 completed_block_datas[index] = block_data
                 num_remaining -= 1
 
+                if self.calculate_error_bound:
+                    max_block_error = max(max_block_error, block_data.error)
+
                 cycle, op = blocks[index]
 
                 # Mark Blocks to be Replaced
                 if replace_filter(subcircuit, op):
+                    # `not error <= threshold` rather than `error > threshold`
+                    # so that a NaN error is REJECTED. Every comparison
+                    # against NaN is False, so the natural spelling would let
+                    # a block through precisely when its distance could not be
+                    # computed -- the one case where accepting it is least
+                    # defensible.
+                    if (
+                        self.error_threshold is not None
+                        and not block_data.error <= self.error_threshold
+                    ):
+                        n_error_rejected += 1
+                        _logger.warning(
+                            'Block %d rejected by error threshold: measured '
+                            'error %g exceeds threshold %g.',
+                            index,
+                            block_data.error,
+                            self.error_threshold,
+                        )
+                        block_data['replaced'] = False
+                        continue
+
                     _logger.debug(f'Replacing block {index}.')
                     replacements[index] = (
                         CircuitPoint(cycle, op.location[0]),
@@ -369,10 +409,12 @@ class ForEachBlockPass(BasePass):
         circuit.batch_replace(points, ops)
         _t_replace_end = time.perf_counter()
 
-        _foreach_emit({
+        complete_record: dict[str, Any] = {
             'phase': 'complete',
             'n_blocks': num_blocks,
             'n_replaced': len(points),
+            'n_error_rejected': n_error_rejected,
+            'error_threshold': self.error_threshold,
             'wall': round(_t_replace_end - _t_pass_start, 6),
             'cpu': round(time.process_time() - _c_pass_start, 6),
             # collect: scan the circuit and filter for blocks
@@ -387,7 +429,10 @@ class ForEachBlockPass(BasePass):
             't_postprocess': round(_postprocess_cpu, 6),
             # replace: surgery on the one shared circuit
             't_replace': round(_t_replace_end - _t_replace_start, 6),
-        })
+        }
+        if self.calculate_error_bound:
+            complete_record['max_block_error'] = max_block_error
+        _foreach_emit(complete_record)
 
         # Record block data into pass data
         data[self.key].append(completed_block_datas)
