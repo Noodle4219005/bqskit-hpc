@@ -242,6 +242,7 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'sum_n_cleared': 0,
             'n_cleared_count': 0,
             'n_rollbacks': 0,
+            'sum_backjump_depth': 0,
             'n_rollback_rescued': 0,
             'n_exhausted_unverified': 0,
             'frontier_len_hist': {},
@@ -646,9 +647,32 @@ class LEAPSynthesisPass(SynthesisPass):
                     frontier.committed_depth() > 0
                     and n_rollbacks < self.max_rollbacks
                 ):
-                    restored_count, restored_state = frontier.rollback()
-                    last_prefix_layer = restored_state
+                    # Backjump, not chronological backtracking. The most
+                    # recent commit is rarely the one that caused the
+                    # failure; the one that was forced hardest against the
+                    # frontier's own ordering is. Jump there and let
+                    # rollback_to invalidate everything below it.
+                    _states = frontier.committed_states()
+                    _target = max(
+                        range(len(_states)),
+                        key=lambda i: (
+                            _states[i].get('regret', 0.0)
+                            if isinstance(_states[i], dict) else 0.0
+                        ),
+                    )
+                    restored_count, restored_state = frontier.rollback_to(
+                        _target,
+                    )
+                    last_prefix_layer = (
+                        restored_state.get('last_prefix_layer', 0)
+                        if isinstance(restored_state, dict)
+                        else (restored_state or 0)
+                    )
                     n_rollbacks += 1
+                    if aggregate_enabled:
+                        _LEAPWASTE_AGG_STATE['sum_backjump_depth'] += (
+                            len(_states) - 1 - _target
+                        )
                     if aggregate_enabled:
                         _LEAPWASTE_AGG_STATE['n_rollbacks'] += 1
                     _logger.debug(
@@ -1062,12 +1086,33 @@ class LEAPSynthesisPass(SynthesisPass):
                                 break
                             alternates.append(frontier.pop())
 
-                        # Commit stores the value from BEFORE this prefix, so a
-                        # rollback lands at the branch point rather than at the
-                        # prefix that turned out to be wrong. Advance only
+                        # Commit stores the value from BEFORE this prefix, so
+                        # a rollback lands at the branch point rather than at
+                        # the prefix that turned out to be wrong. Advance only
                         # after it has been stored -- the order is the whole
                         # correctness of the rollback.
-                        frontier.commit(last_prefix_layer)
+                        #
+                        # `regret` rides along so a later rollback can choose
+                        # WHICH commit to return to instead of always the most
+                        # recent. It is how much cheaper the best candidate
+                        # being discarded was than the one being kept: P0-d
+                        # measured that 85-93% of prefix formations throw away
+                        # something the frontier itself ranks cheaper, median
+                        # gap 0.083-0.114. A large gap means the decision was
+                        # forced against the frontier's own ordering, which
+                        # makes it the likeliest mistake to undo. Unlike the
+                        # progress-rate signal that sank the adaptive beam,
+                        # this distribution is not saturated.
+                        _remaining = frontier.topk_costs(1)
+                        _regret = (
+                            frontier.score(circuit) - _remaining[0]
+                            if _remaining else 0.0
+                        )
+                        frontier.commit({
+                            'last_prefix_layer': last_prefix_layer,
+                            'regret': _regret,
+                            'layer': layer + 1,
+                        })
                         last_prefix_layer = layer + 1
                         if self.max_layer is None or layer + 1 < self.max_layer:
                             frontier.add(circuit, layer + 1)

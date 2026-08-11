@@ -297,3 +297,51 @@ class Frontier:
     def committed_depth(self) -> int:
         """Return how many committed frontiers are still recoverable."""
         return len(self._committed)
+
+    def committed_states(self) -> list[Any]:
+        """
+        Return the state saved with each retained commit, oldest first.
+
+        Exposed so a caller can choose WHICH commit to return to rather than
+        always the most recent. Chronological backtracking undoes the latest
+        decision, which is not usually the one that caused the failure.
+        """
+        return [state for _, state in self._committed]
+
+    def rollback_to(self, index: int) -> tuple[int, Any]:
+        """
+        Restore the commit at `index`, discarding every commit above it.
+
+        This is backjumping rather than chronological backtracking. The
+        commits above `index` are descendants of the decision being undone,
+        so they cannot survive it -- returning to an ancestor invalidates
+        them by construction.
+
+        `rollback()` is the special case `index = committed_depth() - 1`.
+
+        Args:
+            index (int): Position in the commit stack, oldest first, as
+                indexed by `committed_states`.
+
+        Returns:
+            tuple[int, Any]: Elements restored and the state saved with that
+                commit, or ``(0, None)`` if nothing was committed.
+
+        Raises:
+            IndexError: If `index` is out of range.
+        """
+        if not self._committed:
+            return 0, None
+
+        if not 0 <= index < len(self._committed):
+            raise IndexError(
+                f'commit index {index} out of range '
+                f'0..{len(self._committed) - 1}.',
+            )
+
+        # Everything above the target is a descendant of the decision being
+        # undone. Dropping it is not an optimisation -- keeping it would let
+        # a later rollback restore a frontier that depends on a choice this
+        # jump has just retracted.
+        del self._committed[index + 1:]
+        return self.rollback()
