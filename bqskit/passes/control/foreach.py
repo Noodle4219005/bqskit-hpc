@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import functools
+import json
 import logging
+import os
+import time
+from typing import Any
 from typing import Callable
 
 from bqskit.compiler.basepass import _sub_do_work
@@ -22,6 +26,41 @@ from bqskit.ir.point import CircuitPoint
 from bqskit.runtime import get_runtime
 
 _logger = logging.getLogger(__name__)
+
+# C0: subdivide ForEachBlockPass's coordinator cost.
+#
+# docs/16 attributes 23.1% of wall to this pass and has never split it, and
+# docs/04 section 9.7 lists that as a known gap. It matters because the four
+# candidate stages have four different fixes: serialisation cost wants fewer
+# round trips, the preprocessing loop wants offloading to the workers, the
+# postprocess loop wants per-block parallelism, and batch_replace is surgery
+# on one shared circuit and may simply be irreducible.
+#
+# Wall and CPU are both recorded for the drain, because the drain's wall time
+# includes waiting for workers while its CPU time is the coordinator's own
+# serial share -- confusing the two is what makes this stage look bigger than
+# it is.
+_FOREACH_PROF_DIR = os.environ.get('BQPROF_FOREACH_DIR')
+_FOREACH_FH_STATE: dict[str, Any] = {'pid': None, 'fh': None}
+
+
+def _foreach_emit(record: dict[str, Any]) -> None:
+    """Append one ForEachBlockPass phase breakdown."""
+    if not _FOREACH_PROF_DIR:
+        return
+    try:
+        pid = os.getpid()
+        if _FOREACH_FH_STATE['pid'] != pid:
+            os.makedirs(_FOREACH_PROF_DIR, exist_ok=True)
+            _FOREACH_FH_STATE['fh'] = open(
+                os.path.join(_FOREACH_PROF_DIR, f'foreach_{pid}.jsonl'),
+                'a',
+                buffering=1,
+            )
+            _FOREACH_FH_STATE['pid'] = pid
+        _FOREACH_FH_STATE['fh'].write(json.dumps(record) + '\n')
+    except Exception:
+        pass
 
 
 class ForEachBlockPass(BasePass):
@@ -169,6 +208,9 @@ class ForEachBlockPass(BasePass):
         if self.key not in data:
             data[self.key] = []
 
+        _t_pass_start = time.perf_counter()
+        _c_pass_start = time.process_time()
+
         # Collect blocks
         blocks: list[tuple[int, Operation]] = []
         for cycle, op in circuit.operations_with_cycles():
@@ -179,6 +221,8 @@ class ForEachBlockPass(BasePass):
         if len(blocks) == 0:
             data[self.key].append([])
             return
+
+        _t_collect_end = time.perf_counter()
 
         # Get the machine model
         model = data.model
@@ -225,44 +269,125 @@ class ForEachBlockPass(BasePass):
             block_datas.append(block_data)
 
         # Do the work
-        results = await get_runtime().map(
+        #
+        # Results are consumed incrementally rather than with a single
+        # `await map(...)` barrier. Per-block postprocessing -- the
+        # replace_filter call and building the replacement Operation -- is
+        # pure Python running in this one worker, while the other workers are
+        # still synthesising later blocks. Draining with `next` lets that
+        # bookkeeping overlap the synthesis instead of queueing behind it.
+        #
+        # This is a scheduling change only: every block is still
+        # postprocessed exactly once, results are stored by their original
+        # index, and `batch_replace` still receives points and ops in block
+        # order below. The output is unchanged.
+        _t_preprocess_end = time.perf_counter()
+
+        future = get_runtime().map(
             _sub_do_work,
             [self.workflow] * len(subcircuits),
             subcircuits,
             block_datas,
         )
 
-        # Unpack results
-        completed_subcircuits, completed_block_datas = zip(*results)
+        _t_dispatch_end = time.perf_counter()
 
-        # Postprocess blocks
+        # Emit the coordinator's own cost as soon as it is paid, not at the
+        # end of the pass. Everything above this line -- collect, the
+        # per-block deep copy / submodel / PassData loop, and the map()
+        # serialisation -- is finished and measured here, while the drain
+        # below may never finish at all: at max_synthesis_size 4 and 5 the
+        # synthesis pass routinely exceeds any budget we can give it, and a
+        # record written only at pass end is then never written.
+        #
+        # That would make the coordinator cost unmeasurable in exactly the
+        # regime the question is about, since the whole point of the msz
+        # sweep is that per-block marshalling grows with block width.
+        # 'phase' separates the two records; reducers must select one.
+        _foreach_emit({
+            'phase': 'dispatch',
+            'n_blocks': len(subcircuits),
+            't_collect': round(_t_collect_end - _t_pass_start, 6),
+            't_preprocess': round(_t_preprocess_end - _t_collect_end, 6),
+            't_dispatch': round(_t_dispatch_end - _t_preprocess_end, 6),
+        })
+
+        _postprocess_cpu = 0.0
+
+        num_blocks = len(subcircuits)
+        completed_subcircuits: list[Circuit] = [None] * num_blocks  # type: ignore
+        completed_block_datas: list[PassData] = [None] * num_blocks  # type: ignore
+        # Postprocessed replacement for each block, or None if the block is
+        # not being replaced. Indexed by block so order is independent of
+        # the order results happen to arrive in.
+        replacements: list[tuple[CircuitPoint, Operation] | None]
+        replacements = [None] * num_blocks
+        error_sum = 0.0
+        num_remaining = num_blocks
+
+        while num_remaining > 0:
+            _fetched = await get_runtime().next(future)
+            _t_chunk = time.perf_counter()
+            for index, result in _fetched:
+                subcircuit, block_data = result
+                completed_subcircuits[index] = subcircuit
+                completed_block_datas[index] = block_data
+                num_remaining -= 1
+
+                cycle, op = blocks[index]
+
+                # Mark Blocks to be Replaced
+                if replace_filter(subcircuit, op):
+                    _logger.debug(f'Replacing block {index}.')
+                    replacements[index] = (
+                        CircuitPoint(cycle, op.location[0]),
+                        Operation(
+                            CircuitGate(subcircuit, True),
+                            op.location,
+                            subcircuit.params,
+                        ),
+                    )
+                    block_data['replaced'] = True
+
+                    # Calculate Error
+                    error_sum += block_data.error
+                else:
+                    block_data['replaced'] = False
+            _postprocess_cpu += time.perf_counter() - _t_chunk
+
+        _t_drain_end = time.perf_counter()
+
         points: list[CircuitPoint] = []
         ops: list[Operation] = []
-        error_sum = 0.0
-        for i, (cycle, op) in enumerate(blocks):
-            subcircuit = completed_subcircuits[i]
-            block_data = completed_block_datas[i]
-
-            # Mark Blocks to be Replaced
-            if replace_filter(subcircuit, op):
-                _logger.debug(f'Replacing block {i}.')
-                points.append(CircuitPoint(cycle, op.location[0]))
-                ops.append(
-                    Operation(
-                        CircuitGate(subcircuit, True),
-                        op.location,
-                        subcircuit.params,
-                    ),
-                )
-                block_data['replaced'] = True
-
-                # Calculate Error
-                error_sum += block_data.error
-            else:
-                block_data['replaced'] = False
+        for replacement in replacements:
+            if replacement is not None:
+                points.append(replacement[0])
+                ops.append(replacement[1])
 
         # Replace blocks
+        _t_replace_start = time.perf_counter()
         circuit.batch_replace(points, ops)
+        _t_replace_end = time.perf_counter()
+
+        _foreach_emit({
+            'phase': 'complete',
+            'n_blocks': num_blocks,
+            'n_replaced': len(points),
+            'wall': round(_t_replace_end - _t_pass_start, 6),
+            'cpu': round(time.process_time() - _c_pass_start, 6),
+            # collect: scan the circuit and filter for blocks
+            't_collect': round(_t_collect_end - _t_pass_start, 6),
+            # preprocess: per-block deep copy, submodel, PassData
+            't_preprocess': round(_t_preprocess_end - _t_collect_end, 6),
+            # dispatch: the map() call itself, i.e. serialisation
+            't_dispatch': round(_t_dispatch_end - _t_preprocess_end, 6),
+            # drain wall INCLUDES waiting on workers ...
+            't_drain_wall': round(_t_drain_end - _t_dispatch_end, 6),
+            # ... while this is the coordinator's own share of it
+            't_postprocess': round(_postprocess_cpu, 6),
+            # replace: surgery on the one shared circuit
+            't_replace': round(_t_replace_end - _t_replace_start, 6),
+        })
 
         # Record block data into pass data
         data[self.key].append(completed_block_datas)

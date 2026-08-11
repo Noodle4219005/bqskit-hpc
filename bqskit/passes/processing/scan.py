@@ -1,7 +1,10 @@
 """This module implements the ScanningGateRemovalPass."""
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
 from typing import Any
 from typing import Callable
 
@@ -13,6 +16,56 @@ from bqskit.ir.opt.cost.functions import HilbertSchmidtResidualsGenerator
 from bqskit.ir.opt.cost.generator import CostFunctionGenerator
 from bqskit.utils.typing import is_real_number
 _logger = logging.getLogger(__name__)
+
+# Line II probe: what is this scan spending its instantiations on?
+#
+# The loop in `run` does ONE FULL CIRCUIT INSTANTIATE PER OPERATION,
+# serially, and `default_collection_filter` accepts every operation --
+# including every single-qudit gate. A synthesised 3-qubit block measured
+# here is 14 CNOTs and 31 single-qudit gates, so roughly 69% of those
+# instantiations are spent trying to delete gates that cannot change
+# `output_two_q_gates`, the metric V1 and V4 are written in, and that are
+# frequently virtual on superconducting hardware anyway.
+#
+# Two nearly-free interventions follow if that holds, and this probe decides
+# between them: pass a collection_filter that skips single-qudit gates, or
+# merge adjacent single-qudit gates before the scan so that both the loop
+# length and each instantiation's parameter vector shrink.
+#
+# Recorded by arity and split into attempts and successes, because those are
+# different questions: attempts say what filtering would SAVE, successes say
+# what it would COST.
+_SCAN_PROBE_DIR = os.environ.get('BQPROF_SCAN_DIR')
+_SCAN_FH_STATE: dict[str, Any] = {'pid': None, 'fh': None}
+
+
+def _scan_probe_emit(record: dict[str, Any]) -> None:
+    """Append one ScanningGateRemovalPass summary, fork-safe."""
+    if not _SCAN_PROBE_DIR:
+        return
+    try:
+        pid = os.getpid()
+        if _SCAN_FH_STATE['pid'] != pid:
+            # Close the handle inherited across the fork before replacing it.
+            # The other probes in this codebase (_foreach_emit,
+            # _leapwaste_emit) leak one descriptor per forked worker here;
+            # there is no reason to copy that.
+            stale = _SCAN_FH_STATE.get('fh')
+            if stale is not None:
+                try:
+                    stale.close()
+                except Exception:
+                    pass
+            os.makedirs(_SCAN_PROBE_DIR, exist_ok=True)
+            _SCAN_FH_STATE['fh'] = open(
+                os.path.join(_SCAN_PROBE_DIR, f'scan_{pid}.jsonl'),
+                'a',
+                buffering=1,
+            )
+            _SCAN_FH_STATE['pid'] = pid
+        _SCAN_FH_STATE['fh'].write(json.dumps(record) + '\n')
+    except Exception:
+        pass
 
 
 class ScanningGateRemovalPass(BasePass):
@@ -108,10 +161,28 @@ class ScanningGateRemovalPass(BasePass):
 
         circuit_copy = circuit.copy()
         reverse_iter = not self.start_from_left
+        _probe: dict[str, Any] = {
+            'n_ops': circuit.num_operations,
+            'n_ops_1q': 0, 'n_ops_multi': 0,
+            'attempts_1q': 0, 'attempts_multi': 0,
+            'removed_1q': 0, 'removed_multi': 0,
+            'inst_seconds_1q': 0.0, 'inst_seconds_multi': 0.0,
+            'skipped_by_filter': 0,
+        }
+        _probe_on = bool(_SCAN_PROBE_DIR)
+        _t_pass = time.perf_counter()
         for cycle, op in circuit.operations_with_cycles(reverse=reverse_iter):
+
+            if _probe_on:
+                if op.num_qudits >= 2:
+                    _probe['n_ops_multi'] += 1
+                else:
+                    _probe['n_ops_1q'] += 1
 
             if not self.collection_filter(op):
                 _logger.debug(f'Skipping operation {op} at cycle {cycle}.')
+                if _probe_on:
+                    _probe['skipped_by_filter'] += 1
                 continue
 
             _logger.debug(f'Attempting removal of operation at cycle {cycle}.')
@@ -126,11 +197,33 @@ class ScanningGateRemovalPass(BasePass):
                 cycle -= idx_shift
 
             working_copy.pop((cycle, op.location[0]))
+            # Guarded: these run once PER OPERATION, so with the probe off
+            # they would be the only cost this instrumentation still charges.
+            # The per-pass `_probe` dict and `_t_pass` above are once per
+            # invocation and left unguarded for readability.
+            _t_inst = time.perf_counter() if _probe_on else 0.0
             working_copy.instantiate(target, **instantiate_options)
+            _inst_elapsed = (
+                time.perf_counter() - _t_inst if _probe_on else 0.0
+            )
 
-            if self.cost(working_copy, target) < self.success_threshold:
+            _removed = self.cost(working_copy, target) < self.success_threshold
+            if _probe_on:
+                _arity = 'multi' if op.num_qudits >= 2 else '1q'
+                _probe[f'attempts_{_arity}'] += 1
+                _probe[f'inst_seconds_{_arity}'] += _inst_elapsed
+                if _removed:
+                    _probe[f'removed_{_arity}'] += 1
+
+            if _removed:
                 _logger.debug('Successfully removed operation.')
                 circuit_copy = working_copy
+
+        if _probe_on:
+            _probe['pass_seconds'] = round(time.perf_counter() - _t_pass, 6)
+            for _key in ('inst_seconds_1q', 'inst_seconds_multi'):
+                _probe[_key] = round(_probe[_key], 6)
+            _scan_probe_emit(_probe)
 
         circuit.become(circuit_copy)
 
