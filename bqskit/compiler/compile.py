@@ -67,6 +67,7 @@ from bqskit.passes.noop import NOOPPass
 from bqskit.passes.partitioning.quick import QuickPartitioner
 from bqskit.passes.partitioning.single import GroupSingleQuditGatePass
 from bqskit.passes.processing.scan import ScanningGateRemovalPass
+from bqskit.passes.processing.treescan import TreeScanningGateRemovalPass
 from bqskit.passes.retarget.auto import AutoRebase2QuditGatePass
 from bqskit.passes.retarget.general import GeneralSQDecomposition
 from bqskit.passes.rules.u3 import U3Decomposition
@@ -1382,14 +1383,42 @@ def build_gate_deletion_optimization_workflow(
             UnfoldPass(),
         ]
 
+    tree_scan_depth_text = os.environ.get('BQSKIT_TREE_SCAN_DEPTH')
+    if tree_scan_depth_text is None:
+        tree_scan_depth = 1
+    else:
+        try:
+            tree_scan_depth = int(tree_scan_depth_text)
+        except ValueError as err:
+            raise ValueError(
+                'BQSKIT_TREE_SCAN_DEPTH must be an integer, got '
+                f'{tree_scan_depth_text!r}.',
+            ) from err
+
+        if tree_scan_depth <= 0:
+            raise ValueError(
+                'BQSKIT_TREE_SCAN_DEPTH must be positive, got '
+                f'{tree_scan_depth}.',
+            )
+
+    instantiate_options = get_instantiate_options(optimization_level)
+    if tree_scan_depth >= 2:
+        # On this machine, tree scan trades sequential rounds for parallel
+        # width, and that width is idle.
+        scan_pass = TreeScanningGateRemovalPass(
+            tree_depth=tree_scan_depth,
+            success_threshold=synthesis_epsilon,
+            instantiate_options=instantiate_options,
+        )
+    else:
+        scan_pass = ScanningGateRemovalPass(
+            success_threshold=synthesis_epsilon,
+            instantiate_options=instantiate_options,
+        )
+
     workflow.append(
         build_partitioning_workflow(
-            ScanningGateRemovalPass(
-                success_threshold=synthesis_epsilon,
-                instantiate_options=get_instantiate_options(
-                    optimization_level,
-                ),
-            ),
+            scan_pass,
             max_synthesis_size,
             None if error_threshold is None else error_sim_size,
         ),
