@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import heapq
 import itertools
+import json
 import os
 from typing import Any
 from typing import NamedTuple
@@ -15,6 +16,32 @@ from bqskit.qis.unitary.unitarymatrix import UnitaryMatrix
 from bqskit.utils.typing import is_integer
 
 _GDFS = os.environ.get('BQPROF_GDFS') == '1'
+_BEAM_PROBE_DIR = os.environ.get('BQPROF_BEAM_DIR')
+_BEAM_FH: dict[str, Any] = {'pid': None, 'fh': None}
+
+
+def _beam_emit(record: dict[str, Any]) -> None:
+    """Append one prune record, fork-safe."""
+    if not _BEAM_PROBE_DIR:
+        return
+    try:
+        pid = os.getpid()
+        if _BEAM_FH['pid'] != pid:
+            stale = _BEAM_FH.get('fh')
+            if stale is not None:
+                try:
+                    stale.close()
+                except Exception:
+                    pass
+            os.makedirs(_BEAM_PROBE_DIR, exist_ok=True)
+            _BEAM_FH['fh'] = open(
+                os.path.join(_BEAM_PROBE_DIR, f'beam_{pid}.jsonl'),
+                'a', buffering=1,
+            )
+            _BEAM_FH['pid'] = pid
+        _BEAM_FH['fh'].write(json.dumps(record) + '\n')
+    except Exception:
+        pass
 
 
 class FrontierElement(NamedTuple):
@@ -152,6 +179,50 @@ class Frontier:
             return 0
 
         discarded = len(self._frontier) - k
+        if _BEAM_PROBE_DIR:
+            # Why does beam go deeper on a sparse graph (layer 9 -> 140)?
+            #
+            # AStarHeuristic is 10*distance + 1*two_qudit_count, and the count
+            # is constant within a layer, so ordering inside a layer is purely
+            # by distance -- and P0-d measured 95.3% of top candidates within
+            # 1% of each other. Beam may therefore be pruning on what is
+            # nearly noise, keeping an arbitrary K among near-ties. On
+            # all-to-all many paths reach a shallow solution so an arbitrary K
+            # still hits one; on a sparse graph there are few, and pruning
+            # loses them.
+            #
+            # Two fixes follow and this decides between them: if the kept K
+            # already spread across distinct final edges, the problem is the
+            # ties and the answer is to delay pruning until they separate; if
+            # the kept K crowd onto a few edges, the problem is lost diversity
+            # and the answer is to keep one representative per edge.
+            _kept = heapq.nsmallest(k, self._frontier)
+            _all = sorted(self._frontier)
+
+            def _edge(elem: FrontierElement) -> str:
+                for op in reversed(list(elem.circuit)):
+                    if op.num_qudits > 1:
+                        return str(tuple(sorted(op.location)))
+                return '-'
+
+            _kc = {_edge(e) for e in _kept}
+            _ac = {_edge(e) for e in _all}
+            _costs = [e.cost for e in _all]
+            _span = (max(_costs) - min(_costs)) if _costs else 0.0
+            _kspan = (
+                max(e.cost for e in _kept) - min(e.cost for e in _kept)
+            ) if _kept else 0.0
+            _beam_emit({
+                'n': len(self._frontier), 'k': k,
+                'edges_kept': len(_kc), 'edges_total': len(_ac),
+                'cost_span_all': _span, 'cost_span_kept': _kspan,
+                'cost_min': min(_costs) if _costs else 0.0,
+                # A tie is a relative span; an absolute one is meaningless
+                # when the distance term can be anywhere in [0, 10].
+                'rel_span_kept': (
+                    _kspan / abs(min(_costs)) if _costs and min(_costs) else 0.0
+                ),
+            })
         # FrontierElement orders by (heuristic, counter), so nsmallest
         # selects exactly the k the heap would have popped first.
         self._frontier = heapq.nsmallest(k, self._frontier)
