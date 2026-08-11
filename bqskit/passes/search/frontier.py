@@ -59,7 +59,7 @@ class Frontier:
         self.target = target
         self.heuristic_function = heuristic_function
         self._frontier: list[FrontierElement] = []
-        self._committed: list[list[FrontierElement]] = []
+        self._committed: list[tuple[list[FrontierElement], Any]] = []
         self._max_committed: int = int(
             os.environ.get('BQSKIT_MAX_COMMITTED', '8'),
         )
@@ -166,7 +166,7 @@ class Frontier:
         """Remove all elements from the frontier."""
         self._frontier.clear()
 
-    def commit(self) -> int:
+    def commit(self, state: Any = None) -> int:
         """
         Set the current frontier aside rather than destroying it.
 
@@ -184,11 +184,14 @@ class Frontier:
         each of them looking at exactly the live frontier, so equivalence with
         `clear()` holds by construction rather than by argument.
 
+        Args:
+            state (Any): Optional caller state to restore with the frontier.
+
         Returns:
             int: The number of elements set aside.
         """
         count = len(self._frontier)
-        self._committed.append(self._frontier)
+        self._committed.append((self._frontier, state))
         self._frontier = []
         # A cap is required, not tidiness. At min_prefix_size=3 one synthesis
         # forms up to 712 prefixes, and holding every frontier of ~120
@@ -198,24 +201,27 @@ class Frontier:
             self._committed.pop(0)
         return count
 
-    def rollback(self) -> int:
+    def rollback(self) -> tuple[int, Any]:
         """
         Restore the most recently committed frontier, merging it back in.
 
-        Callers must restore their own non-monotone state alongside this. In
-        LEAP that is `last_prefix_layer` and nothing else: `best_circ`,
-        `best_dist`, `best_layer` and `psols` all mean "best seen so far" and
-        must survive a rollback.
+        The state returned with the frontier lets callers restore any
+        non-monotone state that belongs to the committed branch. In LEAP that
+        is `last_prefix_layer` and nothing else: `best_circ`, `best_dist`,
+        `best_layer` and `psols` all mean "best seen so far" and must survive a
+        rollback.
 
         Returns:
-            int: The number of elements restored, 0 if nothing was committed.
+            tuple[int, Any]: The number of elements restored and the state
+                saved with the frontier, or ``(0, None)`` if nothing was
+                committed.
         """
         if not self._committed:
-            return 0
-        prior = self._committed.pop()
+            return 0, None
+        prior, state = self._committed.pop()
         self._frontier.extend(prior)
         heapq.heapify(self._frontier)
-        return len(prior)
+        return len(prior), state
 
     def committed_depth(self) -> int:
         """Return how many committed frontiers are still recoverable."""

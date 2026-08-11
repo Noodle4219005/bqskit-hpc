@@ -241,6 +241,9 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'n_after_win_count': 0,
             'sum_n_cleared': 0,
             'n_cleared_count': 0,
+            'n_rollbacks': 0,
+            'n_rollback_rescued': 0,
+            'n_exhausted_unverified': 0,
             'frontier_len_hist': {},
             'n_successors_hist': {},
             'layer_hist': {},
@@ -435,6 +438,13 @@ class LEAPSynthesisPass(SynthesisPass):
                 to circuit.instantiate when instantiating circuit
                 templates. (Default: {})
 
+            num_prefixes (int): The number of prefix continuations to keep.
+                (Default: 1)
+
+        Environment:
+            BQSKIT_MAX_ROLLBACKS controls the per-synthesis rollback budget.
+            It defaults to BQSKIT_MAX_COMMITTED.
+
         Raises:
             ValueError: If `max_depth` or `min_prefix_size` is nonpositive.
         """
@@ -529,6 +539,15 @@ class LEAPSynthesisPass(SynthesisPass):
             )
 
         self.num_prefixes = num_prefixes
+        self.max_rollbacks = int(os.environ.get(
+            'BQSKIT_MAX_ROLLBACKS',
+            os.environ.get('BQSKIT_MAX_COMMITTED', '8'),
+        ))
+        if self.max_rollbacks < 0:
+            raise ValueError(
+                'Expected BQSKIT_MAX_ROLLBACKS to be nonnegative, got %d.'
+                % self.max_rollbacks,
+            )
         self.beam_width = beam_width
         self.async_drain = async_drain
         self.parallel_multistart = parallel_multistart
@@ -588,6 +607,7 @@ class LEAPSynthesisPass(SynthesisPass):
         tasks_dispatched = 0
         best_layers = [0]
         last_prefix_layer = 0
+        n_rollbacks = 0
         previous_popped_id: int | None = None
         previous_popped_layer: int | None = None
 
@@ -607,8 +627,40 @@ class LEAPSynthesisPass(SynthesisPass):
         # to avoid duplicate warnings
         warned_layers: list[int] = []
 
-        # Main loop
-        while not frontier.empty():
+        # Main loop.
+        #
+        # An emptied frontier used to mean the search was over, and the exit
+        # below returns a circuit that is guaranteed to have failed
+        # success_threshold. Now it first tries going back: the committed
+        # prefixes are still there, and a prefix that led nowhere is exactly
+        # the branch worth reconsidering.
+        #
+        # KNOWN LIMIT: best_layers / best_dists are deliberately NOT rolled
+        # back, because they mean "best seen so far". They are also what
+        # check_leap_condition regresses on, so after a rollback the plateau
+        # heuristic sees history from the abandoned branch. Harmless while
+        # rollbacks are rare; revisit if n_rollbacks turns out to be large.
+        while True:
+            if frontier.empty():
+                if (
+                    frontier.committed_depth() > 0
+                    and n_rollbacks < self.max_rollbacks
+                ):
+                    restored_count, restored_state = frontier.rollback()
+                    last_prefix_layer = restored_state
+                    n_rollbacks += 1
+                    if aggregate_enabled:
+                        _LEAPWASTE_AGG_STATE['n_rollbacks'] += 1
+                    _logger.debug(
+                        'Frontier emptied; rolling back %d elements '
+                        '(rollback %d/%d).',
+                        restored_count,
+                        n_rollbacks,
+                        self.max_rollbacks,
+                    )
+                    continue
+                break
+
             if leapwaste_enabled:
                 frontier_len_before_pop = len(frontier)
                 n_added_this_iter = 0
@@ -939,6 +991,8 @@ class LEAPSynthesisPass(SynthesisPass):
                             'n_cleared': n_cleared,
                         })
                     if aggregate_enabled:
+                        if n_rollbacks > 0:
+                            _LEAPWASTE_AGG_STATE['n_rollback_rescued'] += 1
                         _leapwaste_aggregate_record(
                             frontier_len_before_pop,
                             len(successors),
@@ -969,7 +1023,6 @@ class LEAPSynthesisPass(SynthesisPass):
                         last_prefix_layer,
                     ):
                         _logger.debug(f'Prefix formed at {layer + 1} layers.')
-                        last_prefix_layer = layer + 1
                         if leapwaste_enabled:
                             prefix_formed = True
                             n_cleared = len(frontier)
@@ -1009,7 +1062,13 @@ class LEAPSynthesisPass(SynthesisPass):
                                 break
                             alternates.append(frontier.pop())
 
-                        frontier.commit()
+                        # Commit stores the value from BEFORE this prefix, so a
+                        # rollback lands at the branch point rather than at the
+                        # prefix that turned out to be wrong. Advance only
+                        # after it has been stored -- the order is the whole
+                        # correctness of the rollback.
+                        frontier.commit(last_prefix_layer)
+                        last_prefix_layer = layer + 1
                         if self.max_layer is None or layer + 1 < self.max_layer:
                             frontier.add(circuit, layer + 1)
                             if leapwaste_enabled:
@@ -1115,6 +1174,7 @@ class LEAPSynthesisPass(SynthesisPass):
             data['psols'] = psols
 
         if aggregate_enabled:
+            _LEAPWASTE_AGG_STATE['n_exhausted_unverified'] += 1
             _leapwaste_aggregate_finish()
         return best_circ
 
