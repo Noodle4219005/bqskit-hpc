@@ -68,6 +68,38 @@ def _scan_probe_emit(record: dict[str, Any]) -> None:
         pass
 
 
+def _mergeable_single_qudit_runs(circuit: Circuit) -> tuple[int, int]:
+    """
+    Count runs of consecutive single-qudit operations on one qudit.
+
+    Returns:
+        tuple[int, int]: How many runs of length >= 2 exist, and how many
+            operations would disappear if each run collapsed to one gate.
+            The second number is the size of the prize for II-1; the first
+            says whether it is concentrated or spread thin.
+    """
+    per_qudit: dict[int, list[tuple[int, int]]] = {}
+    for cycle, op in circuit.operations_with_cycles():
+        for qudit in op.location:
+            per_qudit.setdefault(qudit, []).append((cycle, op.num_qudits))
+
+    runs = saved = 0
+    for ops in per_qudit.values():
+        streak = 0
+        for _, num_qudits in sorted(ops):
+            if num_qudits == 1:
+                streak += 1
+                continue
+            if streak >= 2:
+                runs += 1
+                saved += streak - 1
+            streak = 0
+        if streak >= 2:
+            runs += 1
+            saved += streak - 1
+    return runs, saved
+
+
 class ScanningGateRemovalPass(BasePass):
     """
     The ScanningGateRemovalPass class.
@@ -170,6 +202,21 @@ class ScanningGateRemovalPass(BasePass):
             'skipped_by_filter': 0,
         }
         _probe_on = bool(_SCAN_PROBE_DIR)
+        if _probe_on:
+            # The II-1 gate. docs/04 6 proposes merging adjacent single-qubit
+            # runs before this loop, on the grounds that 69% of a block's
+            # operations are single-qubit and they eat 82-85% of the
+            # instantiate time. That only pays if consecutive 1Q gates on the
+            # SAME qubit actually occur -- and LEAP emits CNOT(a,b) then
+            # U3(a), U3(b), which puts a two-qudit gate between every
+            # consecutive pair. Whether the circuit reaching this pass still
+            # has that shape is a measurement, not an argument: the fully
+            # compiled output has plenty to merge, but only because the rebase
+            # to {CZ, RZ, SX, X} expands each U3 into RZ-SX-RZ-SX-RZ, and that
+            # happens after this pass.
+            _runs, _saved = _mergeable_single_qudit_runs(circuit)
+            _probe['mergeable_runs'] = _runs
+            _probe['mergeable_ops_saved'] = _saved
         _t_pass = time.perf_counter()
         for cycle, op in circuit.operations_with_cycles(reverse=reverse_iter):
 
