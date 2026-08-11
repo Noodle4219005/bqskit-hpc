@@ -38,6 +38,7 @@ _LEAPWASTE_DIR = os.environ.get('BQPROF_LEAPWASTE_DIR') or os.environ.get(
     'BQPROF_LEAPWASTE_AGG_DIR',
 )
 _LEAPWASTE_AGGREGATE = os.environ.get('BQPROF_LEAPWASTE_AGGREGATE') == '1'
+_GDFS = os.environ.get('BQPROF_GDFS') == '1'
 # Optional benchmark-only override; unset preserves the normal LEAP defaults.
 _MIN_PREFIX_SIZE_OVERRIDE = os.environ.get('BQSKIT_MIN_PREFIX_SIZE')
 
@@ -184,6 +185,13 @@ def _prefix_probe_record(
 _LEAPWASTE_COUNTER = 0
 _LEAPWASTE_FH_STATE = {'pid': None, 'fh': None}
 _LEAPWASTE_AGG_STATE: dict[str, Any] = {}
+_GDFS_HIST_KEYS = (
+    'gdfs_descent_hist',
+    'gdfs_backtrack_jump_hist',
+    'gdfs_post_commit_depth_hist',
+    'gdfs_solutions_in_round_hist',
+    'gdfs_win_index_hist',
+)
 
 
 def _leapwaste_new_synth_id() -> str:
@@ -242,11 +250,22 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'rounds_where_prune_fired': 0,
             'sum_popped_per_round': 0,
             'n_rounds': 0,
+            'gdfs_descent_hist': {},
+            'gdfs_backtrack_jump_hist': {},
+            'gdfs_post_commit_depth_hist': {},
+            'gdfs_solutions_in_round_hist': {},
+            'gdfs_win_index_hist': {},
         })
     summary = {
         key: value for key, value in _LEAPWASTE_AGG_STATE.items()
         if key != 'last_flush'
     }
+    if not _GDFS:
+        # Keep disabled sweeps byte-identical; the state keys are present so
+        # a pid reset always has one complete schema, but empty probe fields
+        # must not appear in old aggregate output.
+        for key in _GDFS_HIST_KEYS:
+            summary.pop(key, None)
     path = os.path.join(_LEAPWASTE_DIR, f'leapagg_{pid}.json')
     temporary = f'{path}.tmp'
     try:
@@ -569,6 +588,8 @@ class LEAPSynthesisPass(SynthesisPass):
         tasks_dispatched = 0
         best_layers = [0]
         last_prefix_layer = 0
+        previous_popped_id: int | None = None
+        previous_popped_layer: int | None = None
 
         # Track partial solutions
         psols: dict[int, list[tuple[Circuit, float]]] = {}
@@ -621,6 +642,49 @@ class LEAPSynthesisPass(SynthesisPass):
             successor_layers = []
             while not frontier.empty():
                 top_circuit, top_layer = frontier.pop()
+
+                if _GDFS:
+                    popped_id = frontier._last_popped_id
+                    descended = (
+                        previous_popped_id is not None
+                        and frontier._last_popped_parent_id
+                        == previous_popped_id
+                    )
+                    # The first pop of a synthesis has no predecessor, so it is
+                    # neither a descent nor a jump. Counting it as a non-descent
+                    # would put one spurious zero into every one of the ~29k
+                    # synthesis calls -- a systematic bias against the very
+                    # quantity this probe exists to measure.
+                    if aggregate_enabled and previous_popped_id is not None:
+                        descent_hist = _LEAPWASTE_AGG_STATE[
+                            'gdfs_descent_hist'
+                        ]
+                        descent_key = str(int(descended))
+                        descent_hist[descent_key] = (
+                            descent_hist.get(descent_key, 0) + 1
+                        )
+                        if (
+                            not descended
+                            and previous_popped_layer is not None
+                        ):
+                            jump = previous_popped_layer - top_layer
+                            jump_hist = _LEAPWASTE_AGG_STATE[
+                                'gdfs_backtrack_jump_hist'
+                            ]
+                            jump_key = str(jump)
+                            jump_hist[jump_key] = (
+                                jump_hist.get(jump_key, 0) + 1
+                            )
+                        post_commit_depth = top_layer - last_prefix_layer
+                        post_commit_hist = _LEAPWASTE_AGG_STATE[
+                            'gdfs_post_commit_depth_hist'
+                        ]
+                        post_commit_key = str(post_commit_depth)
+                        post_commit_hist[post_commit_key] = (
+                            post_commit_hist.get(post_commit_key, 0) + 1
+                        )
+                    previous_popped_id = popped_id
+                    previous_popped_layer = top_layer
 
                 # P0-c. Score this pop against the snapshot taken at the
                 # previous pop, then re-snapshot. The snapshot is deliberately
@@ -828,6 +892,29 @@ class LEAPSynthesisPass(SynthesisPass):
                 dist = self.cost.calc_cost(circuit, utry)
 
                 if dist < self.success_threshold:
+                    if _GDFS:
+                        solutions_in_round = 1
+                        for remaining in circuits[win_index + 1:]:
+                            if (
+                                self.cost.calc_cost(remaining, utry)
+                                < self.success_threshold
+                            ):
+                                solutions_in_round += 1
+                        if aggregate_enabled:
+                            solutions_hist = _LEAPWASTE_AGG_STATE[
+                                'gdfs_solutions_in_round_hist'
+                            ]
+                            solutions_key = str(solutions_in_round)
+                            solutions_hist[solutions_key] = (
+                                solutions_hist.get(solutions_key, 0) + 1
+                            )
+                            win_hist = _LEAPWASTE_AGG_STATE[
+                                'gdfs_win_index_hist'
+                            ]
+                            win_key = str(win_index)
+                            win_hist[win_key] = (
+                                win_hist.get(win_key, 0) + 1
+                            )
                     _logger.debug(
                         f'Successful synthesis with {layer + 1} layers.',
                     )

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import heapq
 import itertools
+import os
 from typing import Any
 from typing import NamedTuple
 
@@ -13,6 +14,8 @@ from bqskit.qis.state.system import StateSystem
 from bqskit.qis.unitary.unitarymatrix import UnitaryMatrix
 from bqskit.utils.typing import is_integer
 
+_GDFS = os.environ.get('BQPROF_GDFS') == '1'
+
 
 class FrontierElement(NamedTuple):
     """The Frontier contains FrontierElements."""
@@ -21,6 +24,7 @@ class FrontierElement(NamedTuple):
     element_id: int
     circuit: Circuit
     extra_data: Any
+    parent_id: int | None = None
 
 
 class Frontier:
@@ -58,18 +62,25 @@ class Frontier:
         self._counter = itertools.count()
         self._last_popped_id: int | None = None
         """Identity of the most recent pop, for the speculation probe."""
+        self._last_popped_parent_id: int | None = None
+        """Parent identity of the most recent pop, for the G-DFS probe."""
 
     def add(self, circuit: Circuit, extra_data: Any = None) -> None:
         """Add `circuit` into the frontier."""
         heuristic_value = self.heuristic_function(circuit, self.target)
         count = next(self._counter)
-        elem = FrontierElement(heuristic_value, count, circuit, extra_data)
+        parent_id = self._last_popped_id if _GDFS else None
+        elem = FrontierElement(
+            heuristic_value, count, circuit, extra_data, parent_id,
+        )
         heapq.heappush(self._frontier, elem)
 
     def pop(self) -> tuple[Circuit, Any]:
         """Pop the top circuit."""
         elem = heapq.heappop(self._frontier)
         self._last_popped_id = elem.element_id
+        if _GDFS:
+            self._last_popped_parent_id = elem.parent_id
         return elem.circuit, elem.extra_data
 
     def __len__(self) -> int:
