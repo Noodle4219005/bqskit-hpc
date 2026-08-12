@@ -6,6 +6,7 @@ import logging
 import os
 import time
 from typing import Any
+from typing import NamedTuple
 
 import numpy as np
 from scipy.stats import linregress
@@ -78,9 +79,6 @@ _SPEC_PROBE_K = int(os.environ.get('BQPROF_SPEC_K', '32'))
 _SPEC_WINDOW = int(os.environ.get('BQPROF_SPEC_WINDOW', str(_SPEC_PROBE_K)))
 _SPEC_STATE: dict[str, Any] = {}
 
-_CircuitStructureKey = tuple[tuple[Gate, CircuitLocation], ...]
-
-
 def _spec_probe_record(depth: int, rank: int | None) -> None:
     """Count one pop by its position and rank relative to the snapshot.
 
@@ -149,6 +147,33 @@ def _spec_probe_record(depth: int, rank: int | None) -> None:
 _PREFIX_PROBE_DIR = os.environ.get('BQPROF_PREFIX_DIR')
 _PREFIX_PROBE_K = int(os.environ.get('BQPROF_PREFIX_K', '16'))
 _PREFIX_FH_STATE: dict[str, Any] = {'pid': None, 'fh': None}
+_LTRACE_DIR = os.environ.get('BQPROF_LTRACE')
+
+
+_CircuitStructureKey = tuple[
+    tuple[Gate, CircuitLocation, tuple[float, ...]],
+    ...,
+]
+
+
+class _SpeculationMemoEntry(NamedTuple):
+    """One deferred expansion and the logical context that produced it."""
+
+    epoch: int
+    bound_generation: int | None
+    successors: list[Circuit]
+    results: list[Circuit]
+    used: bool
+
+
+def _logical_trace(record: dict[str, Any]) -> None:
+    """Append one logical-search event when the trace probe is enabled."""
+    if not _LTRACE_DIR:
+        return
+    os.makedirs(_LTRACE_DIR, exist_ok=True)
+    path = os.path.join(_LTRACE_DIR, f'ltrace_{os.getpid()}.jsonl')
+    with open(path, 'a', encoding='utf-8') as handle:
+        handle.write(json.dumps(record, separators=(',', ':')) + '\n')
 
 
 def _prefix_probe_record(
@@ -274,6 +299,10 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'spec_misses': 0,
             'spec_evicted': 0,
             'spec_unused': 0,
+            'spec_eventual_hits': 0,
+            'spec_timely_hits': 0,
+            'spec_late': 0,
+            'spec_stale_epoch': 0,
             'gdfs_descent_hist': {},
             'gdfs_backtrack_jump_hist': {},
             'gdfs_post_commit_depth_hist': {},
@@ -468,10 +497,10 @@ class LEAPSynthesisPass(SynthesisPass):
         Environment:
             BQSKIT_MAX_ROLLBACKS controls the per-synthesis rollback budget.
             It defaults to BQSKIT_MAX_COMMITTED.
-            BQSKIT_SPECULATE_WIDTH controls ordered speculative expansion.
-            It is read when the pass is constructed and defaults to 1.
+            BQSKIT_EXPAND_K controls ordered speculative expansion. It is
+            read when the pass is constructed; unset disables speculation.
             BQSKIT_SPECULATE_MEMO caps the expansion memo and defaults to four
-            times BQSKIT_SPECULATE_WIDTH.
+            times BQSKIT_EXPAND_K.
             BQSKIT_DEEPEN_TO sets the ceiling for continuing a bounded search
             after it exhausts its current frontier. The bound doubles up to
             this ceiling, retaining children truncated at the old bound.
@@ -574,21 +603,23 @@ class LEAPSynthesisPass(SynthesisPass):
                 % type(parallel_multistart),
             )
 
-        try:
-            speculate_width = int(os.environ.get('BQSKIT_SPECULATE_WIDTH', '1'))
-        except ValueError as err:
+        expand_k_value = os.environ.get('BQSKIT_EXPAND_K')
+        expand_k = 1
+        if expand_k_value is not None:
+            try:
+                expand_k = int(expand_k_value)
+            except ValueError as err:
+                raise ValueError(
+                    'BQSKIT_EXPAND_K must be an integer.',
+                ) from err
+        if expand_k < 1:
             raise ValueError(
-                'BQSKIT_SPECULATE_WIDTH must be an integer.',
-            ) from err
-        if speculate_width < 1:
-            raise ValueError(
-                'BQSKIT_SPECULATE_WIDTH must be positive, got %d.'
-                % speculate_width,
+                'BQSKIT_EXPAND_K must be positive, got %d.' % expand_k,
             )
 
         try:
             speculate_memo = int(os.environ.get(
-                'BQSKIT_SPECULATE_MEMO', str(4 * speculate_width),
+                'BQSKIT_SPECULATE_MEMO', str(4 * expand_k),
             ))
         except ValueError as err:
             raise ValueError(
@@ -625,7 +656,7 @@ class LEAPSynthesisPass(SynthesisPass):
         self.beam_width = beam_width
         self.async_drain = async_drain
         self.parallel_multistart = parallel_multistart
-        self.speculate_width = speculate_width
+        self.expand_k = expand_k
         self.speculate_memo = speculate_memo
         self.heuristic_function = heuristic_function
         self.layer_gen = layer_generator
@@ -790,12 +821,15 @@ class LEAPSynthesisPass(SynthesisPass):
 
         speculation_memo: dict[
             _CircuitStructureKey,
-            tuple[list[Circuit], list[Circuit], bool],
+            _SpeculationMemoEntry,
         ] = {}
         speculation_future: RuntimeFuture | None = None
         speculation_keys: list[_CircuitStructureKey] = []
         speculation_batches: list[list[Circuit]] = []
         speculation_owners: list[tuple[int, int]] | None = None
+        speculation_dispatch_epoch = 0
+        speculation_bound_generation: int | None = None
+        epoch = 0
 
         def circuit_structure_key(circuit: Circuit) -> _CircuitStructureKey:
             """Return an exact identity for one instantiation input.
@@ -832,21 +866,31 @@ class LEAPSynthesisPass(SynthesisPass):
 
         def memoize_speculation(
             structure_key: _CircuitStructureKey,
+            dispatch_epoch: int,
+            bound_generation: int | None,
             expansion: tuple[list[Circuit], list[Circuit]],
         ) -> None:
             """Insert one expansion, evicting the oldest memo entry first."""
-            while len(speculation_memo) >= self.speculate_memo:
+            while (
+                structure_key not in speculation_memo
+                and len(speculation_memo) >= self.speculate_memo
+            ):
                 oldest_key = next(iter(speculation_memo))
                 speculation_memo.pop(oldest_key)
                 record_spec_metric('spec_evicted')
-            speculation_memo[structure_key] = (*expansion, False)
+            speculation_memo[structure_key] = _SpeculationMemoEntry(
+                dispatch_epoch,
+                bound_generation,
+                *expansion,
+                False,
+            )
 
         def finish_speculation() -> None:
             """Account for and stop speculative work at synthesis exit."""
             nonlocal speculation_future
             record_spec_metric(
                 'spec_unused',
-                sum(not entry[2] for entry in speculation_memo.values())
+                sum(not entry.used for entry in speculation_memo.values())
                 + len(speculation_keys),
             )
             speculation_memo.clear()
@@ -911,6 +955,9 @@ class LEAPSynthesisPass(SynthesisPass):
         # Evalute initial layer
         if best_dist < self.success_threshold:
             _logger.debug('Successful synthesis with 0 layers.')
+            _logical_trace({
+                'event': 'success', 'layer': 0, 'distance': float(best_dist),
+            })
             if aggregate_enabled:
                 _leapwaste_aggregate_finish()
             return initial_layer
@@ -966,12 +1013,18 @@ class LEAPSynthesisPass(SynthesisPass):
                     restored_count, restored_state = frontier.rollback_to(
                         _target,
                     )
+                    epoch += 1
                     last_prefix_layer = (
                         restored_state.get('last_prefix_layer', 0)
                         if isinstance(restored_state, dict)
                         else (restored_state or 0)
                     )
                     n_rollbacks += 1
+                    _logical_trace({
+                        'event': 'rollback',
+                        'index': _target,
+                        'depth': frontier.committed_depth(),
+                    })
                     if aggregate_enabled:
                         # What the depth-burned criterion WOULD have seen, so
                         # the two can be compared without switching yet.
@@ -1004,10 +1057,16 @@ class LEAPSynthesisPass(SynthesisPass):
                 ):
                     # Rollback explores a cheaper different branch at this
                     # depth; only deepen after the rollback budget is spent.
+                    old_max_layer = current_max_layer
                     current_max_layer = min(
                         current_max_layer * 2,
                         self.deepen_to,
                     )
+                    _logical_trace({
+                        'event': 'deepen',
+                        'old_bound': old_max_layer,
+                        'new_bound': current_max_layer,
+                    })
                     for circuit, layer in overflow:
                         frontier.add(circuit, layer)
                     overflow.clear()
@@ -1041,8 +1100,13 @@ class LEAPSynthesisPass(SynthesisPass):
                     speculation_batches,
                     speculative_results,
                 ):
+                    if speculation_dispatch_epoch != epoch:
+                        record_spec_metric('spec_stale_epoch')
+                        continue
                     memoize_speculation(
                         structure_key,
+                        speculation_dispatch_epoch,
+                        speculation_bound_generation,
                         (node_successors, node_results),
                     )
                 speculation_future = None
@@ -1058,7 +1122,16 @@ class LEAPSynthesisPass(SynthesisPass):
             ] = []
 
             while not frontier.empty():
+                logical_pop_cost = (
+                    frontier.topk_costs(1)[0] if _LTRACE_DIR else 0.0
+                )
                 top_circuit, top_layer = frontier.pop()
+                if _LTRACE_DIR:
+                    _logical_trace({
+                        'event': 'pop',
+                        'cost': float(logical_pop_cost),
+                        'layer': top_layer,
+                    })
 
                 if _GDFS:
                     popped_id = frontier._last_popped_id
@@ -1139,24 +1212,62 @@ class LEAPSynthesisPass(SynthesisPass):
                 # shared loop variable would silently mis-record depth for
                 # every node after the first, and the search would still
                 # look healthy.
-                if self.speculate_width >= 2:
+                if self.expand_k >= 2:
                     structure_key = circuit_structure_key(top_circuit)
                     memo_entry = speculation_memo.get(structure_key)
-                    if memo_entry is not None:
-                        node_successors, node_results, _ = memo_entry
-                        speculation_memo[structure_key] = (
-                            node_successors,
-                            node_results,
-                            True,
+                    if memo_entry is not None and memo_entry.epoch != epoch:
+                        speculation_memo.pop(structure_key)
+                        record_spec_metric('spec_stale_epoch')
+                        memo_entry = None
+
+                    in_flight_index = (
+                        speculation_keys.index(structure_key)
+                        if (
+                            speculation_future is not None
+                            and speculation_dispatch_epoch == epoch
+                            and structure_key in speculation_keys
                         )
-                        record_spec_metric('spec_hits')
+                        else None
+                    )
+                    if memo_entry is not None:
+                        record_spec_metric('spec_eventual_hits')
+                        node_successors = memo_entry.successors
+                        # A boundary child is logically overflow until the
+                        # bound rises; publishing its speculative result now
+                        # would expose state the bounded serial search cannot.
+                        bound_is_eligible = (
+                            current_max_layer is None
+                            or (
+                                memo_entry.bound_generation is not None
+                                and memo_entry.bound_generation
+                                <= current_max_layer
+                                and top_layer + 1 < current_max_layer
+                            )
+                        )
+                        if bound_is_eligible:
+                            node_results = memo_entry.results
+                            speculation_memo[structure_key] = (
+                                memo_entry._replace(used=True)
+                            )
+                            record_spec_metric('spec_hits')
+                            record_spec_metric('spec_timely_hits')
+                        else:
+                            node_results = None
+                    elif in_flight_index is not None:
+                        record_spec_metric('spec_eventual_hits')
+                        record_spec_metric('spec_late')
+                        # Never await speculation for a logical pop. Reuse
+                        # only its immutable templates and submit fresh
+                        # critical instantiations below.
+                        node_successors = speculation_batches[in_flight_index]
+                        node_results = None
                     else:
                         node_successors = list(
                             layer_gen.gen_successors(top_circuit, data),
                         )
                         node_results = None
-                        if node_successors:
-                            record_spec_metric('spec_misses')
+                    if node_results is None and node_successors:
+                        record_spec_metric('spec_misses')
                     popped_expansions.append((node_successors, node_results))
                     successors.extend(node_successors)
                     successor_layers.extend(
@@ -1179,13 +1290,13 @@ class LEAPSynthesisPass(SynthesisPass):
                     # baseline for the order-preserving form.
                     break
 
-            if self.speculate_width < 2:
+            if self.expand_k < 2:
                 tasks_dispatched += len(successors)
 
             critical_future: RuntimeFuture | None = None
             critical_batches: list[list[Circuit]] = []
             critical_owners: list[tuple[int, int]] | None = None
-            if self.speculate_width >= 2:
+            if self.expand_k >= 2:
                 critical_batches = [
                     node_successors
                     for node_successors, node_results in popped_expansions
@@ -1205,10 +1316,14 @@ class LEAPSynthesisPass(SynthesisPass):
                     queued_keys: set[_CircuitStructureKey] = set()
                     next_keys: list[_CircuitStructureKey] = []
                     next_batches: list[list[Circuit]] = []
-                    for _, circuit, _ in frontier.peek(self.speculate_width):
+                    for _, circuit, _ in frontier.peek(self.expand_k - 1):
                         structure_key = circuit_structure_key(circuit)
+                        memo_entry = speculation_memo.get(structure_key)
                         if (
-                            structure_key in speculation_memo
+                            (
+                                memo_entry is not None
+                                and memo_entry.epoch == epoch
+                            )
                             or structure_key in queued_keys
                         ):
                             continue
@@ -1222,6 +1337,8 @@ class LEAPSynthesisPass(SynthesisPass):
                         next_batches.append(node_successors)
 
                     if next_batches:
+                        speculation_dispatch_epoch = epoch
+                        speculation_bound_generation = current_max_layer
                         speculation_future, speculation_owners = (
                             dispatch_batches(next_batches)
                         )
@@ -1273,7 +1390,7 @@ class LEAPSynthesisPass(SynthesisPass):
             t_map_end = None
 
             # Instantiate successors
-            if self.speculate_width >= 2:
+            if self.expand_k >= 2:
                 pending_results = (
                     await collect_batches(
                         critical_future,
@@ -1409,6 +1526,11 @@ class LEAPSynthesisPass(SynthesisPass):
                 dist = self.cost.calc_cost(circuit, utry)
 
                 if dist < self.success_threshold:
+                    _logical_trace({
+                        'event': 'success',
+                        'layer': layer + 1,
+                        'distance': float(dist),
+                    })
                     if _GDFS:
                         solutions_in_round = 1
                         for remaining in circuits[win_index + 1:]:
@@ -1476,6 +1598,11 @@ class LEAPSynthesisPass(SynthesisPass):
                     return circuit
 
                 if self.check_new_best(layer + 1, dist, best_layer, best_dist):
+                    _logical_trace({
+                        'event': 'new_best',
+                        'layer': layer + 1,
+                        'distance': float(dist),
+                    })
                     plural = '' if layer == 0 else 's'
                     _logger.debug(
                         f'New best circuit found with {layer + 1} layer{plural}'
@@ -1493,6 +1620,9 @@ class LEAPSynthesisPass(SynthesisPass):
                         last_prefix_layer,
                     ):
                         _logger.debug(f'Prefix formed at {layer + 1} layers.')
+                        _logical_trace({
+                            'event': 'prefix', 'layer': layer + 1,
+                        })
                         if leapwaste_enabled:
                             prefix_formed = True
                             n_cleared = len(frontier)
@@ -1566,6 +1696,10 @@ class LEAPSynthesisPass(SynthesisPass):
                             'last_prefix_layer': last_prefix_layer,
                             'regret': _regret,
                             'layer': layer + 1,
+                        })
+                        _logical_trace({
+                            'event': 'commit',
+                            'depth': frontier.committed_depth(),
                         })
                         last_prefix_layer = layer + 1
                         if add_child(circuit, layer + 1):
