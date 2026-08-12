@@ -194,6 +194,20 @@ _GDFS_HIST_KEYS = (
 )
 
 
+def _luby_value(index: int) -> int:
+    """Return the one-based value at ``index`` in the Luby sequence."""
+    power = 1
+    while (1 << power) - 1 < index:
+        power += 1
+    if index == (1 << power) - 1:
+        return 1 << (power - 1)
+    return _luby_value(index - (1 << (power - 1)) + 1)
+
+
+class _DeepeningConfigurationError(ValueError):
+    """Invalid environment configuration for iterative deepening."""
+
+
 def _leapwaste_new_synth_id() -> str:
     """Return a process-qualified identifier for one ``synthesize`` call."""
     global _LEAPWASTE_COUNTER
@@ -247,6 +261,9 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'depth_burned_hist': {},
             'n_rollback_rescued': 0,
             'n_exhausted_unverified': 0,
+            'deepen_attempts': 0,
+            'deepen_solved_at_hist': {},
+            'deepen_exhausted': 0,
             'frontier_len_hist': {},
             'n_successors_hist': {},
             'layer_hist': {},
@@ -454,6 +471,11 @@ class LEAPSynthesisPass(SynthesisPass):
             It is read when the pass is constructed and defaults to 1.
             BQSKIT_SPECULATE_MEMO caps the expansion memo and defaults to four
             times BQSKIT_SPECULATE_WIDTH.
+            BQSKIT_DEEPEN_SCHEDULE selects deterministic iterative deepening
+            ('double') or the opt-in Luby schedule ('luby'). Luby requires
+            BQSKIT_RANDOM_TIEBREAK=1 because deterministic retries are not
+            independent draws. BQSKIT_DEEPEN_MAX limits attempts and defaults
+            to 4.
 
         Raises:
             ValueError: If `max_depth` or `min_prefix_size` is nonpositive.
@@ -494,6 +516,57 @@ class LEAPSynthesisPass(SynthesisPass):
             raise ValueError(
                 'Expected max_layer to be positive, got %d.' % int(max_layer),
             )
+
+        # An unbounded search has no budget to deepen. Ignore the schedule in
+        # that case so enabling it does not change the existing max_layer path.
+        # For deterministic LEAP, monotone doubling is the justified schedule;
+        # Luby's independent-draw assumption is enforced as an explicit opt-in.
+        self.deepen_schedule: str | None = None
+        self.deepen_budgets: tuple[int | None, ...] = (max_layer,)
+        if max_layer is not None:
+            deepen_schedule = os.environ.get('BQSKIT_DEEPEN_SCHEDULE')
+            if deepen_schedule is not None:
+                if deepen_schedule not in ('double', 'luby'):
+                    raise _DeepeningConfigurationError(
+                        'BQSKIT_DEEPEN_SCHEDULE must be double or luby, got '
+                        f'{deepen_schedule!r}.',
+                    )
+                try:
+                    deepen_max = int(os.environ.get(
+                        'BQSKIT_DEEPEN_MAX',
+                        '4',
+                    ))
+                except ValueError as err:
+                    raise _DeepeningConfigurationError(
+                        'BQSKIT_DEEPEN_MAX must be an integer.',
+                    ) from err
+                if deepen_max < 1:
+                    raise _DeepeningConfigurationError(
+                        'BQSKIT_DEEPEN_MAX must be positive, got '
+                        f'{deepen_max}.',
+                    )
+                if (
+                    deepen_schedule == 'luby'
+                    and os.environ.get('BQSKIT_RANDOM_TIEBREAK') != '1'
+                ):
+                    raise _DeepeningConfigurationError(
+                        'BQSKIT_DEEPEN_SCHEDULE=luby requires '
+                        'BQSKIT_RANDOM_TIEBREAK=1 because LEAP search is '
+                        'deterministic and repeated budgets reproduce the '
+                        'same failure; the Luby restart guarantee needs '
+                        'randomised tie-breaking.',
+                    )
+                self.deepen_schedule = deepen_schedule
+                if deepen_schedule == 'double':
+                    self.deepen_budgets = tuple(
+                        int(max_layer) * (1 << index)
+                        for index in range(deepen_max)
+                    )
+                else:
+                    self.deepen_budgets = tuple(
+                        int(max_layer) * _luby_value(index + 1)
+                        for index in range(deepen_max)
+                    )
 
         if min_prefix_size is not None and not is_integer(min_prefix_size):
             raise TypeError(
@@ -765,6 +838,12 @@ class LEAPSynthesisPass(SynthesisPass):
         # Get layer generator for search
         layer_gen = self._get_layer_gen(data)
 
+        deepen_budgets = self.deepen_budgets
+        deepen_attempt = 1
+        current_max_layer = deepen_budgets[0]
+        if aggregate_enabled:
+            _LEAPWASTE_AGG_STATE['deepen_attempts'] += 1
+
         # Begin the search with an initial layer
         frontier = Frontier(utry, self.heuristic_function)
         initial_layer = layer_gen.gen_initial_layer(utry, data)
@@ -797,6 +876,9 @@ class LEAPSynthesisPass(SynthesisPass):
         if best_dist < self.success_threshold:
             _logger.debug('Successful synthesis with 0 layers.')
             if aggregate_enabled:
+                solved_hist = _LEAPWASTE_AGG_STATE['deepen_solved_at_hist']
+                solved_key = str(deepen_attempt)
+                solved_hist[solved_key] = solved_hist.get(solved_key, 0) + 1
                 _leapwaste_aggregate_finish()
             return initial_layer
 
@@ -880,6 +962,20 @@ class LEAPSynthesisPass(SynthesisPass):
                         n_rollbacks,
                         self.max_rollbacks,
                     )
+                    continue
+                if deepen_attempt < len(deepen_budgets):
+                    discard_speculation_memo()
+                    deepen_attempt += 1
+                    current_max_layer = deepen_budgets[deepen_attempt - 1]
+                    frontier = Frontier(utry, self.heuristic_function)
+                    frontier.add(initial_layer, 0)
+                    last_prefix_layer = 0
+                    n_rollbacks = 0
+                    previous_popped_id = None
+                    previous_popped_layer = None
+                    warned_layers.clear()
+                    if aggregate_enabled:
+                        _LEAPWASTE_AGG_STATE['deepen_attempts'] += 1
                     continue
                 break
 
@@ -1298,6 +1394,13 @@ class LEAPSynthesisPass(SynthesisPass):
                             len(circuits) - win_index - 1,
                             n_cleared,
                         )
+                        solved_hist = _LEAPWASTE_AGG_STATE[
+                            'deepen_solved_at_hist'
+                        ]
+                        solved_key = str(deepen_attempt)
+                        solved_hist[solved_key] = (
+                            solved_hist.get(solved_key, 0) + 1
+                        )
                         _leapwaste_aggregate_finish()
                     return circuit
 
@@ -1396,7 +1499,10 @@ class LEAPSynthesisPass(SynthesisPass):
                             'layer': layer + 1,
                         })
                         last_prefix_layer = layer + 1
-                        if self.max_layer is None or layer + 1 < self.max_layer:
+                        if (
+                            current_max_layer is None
+                            or layer + 1 < current_max_layer
+                        ):
                             frontier.add(circuit, layer + 1)
                             if leapwaste_enabled:
                                 n_added_this_iter += 1
@@ -1419,7 +1525,10 @@ class LEAPSynthesisPass(SynthesisPass):
                         psols[layer].sort(key=lambda x: x[1])
                         del psols[layer][-1]
 
-                if self.max_layer is None or layer + 1 < self.max_layer:
+                if (
+                    current_max_layer is None
+                    or layer + 1 < current_max_layer
+                ):
                     frontier.add(circuit, layer + 1)
                     if leapwaste_enabled:
                         n_added_this_iter += 1
@@ -1516,6 +1625,7 @@ class LEAPSynthesisPass(SynthesisPass):
         discard_speculation_memo()
         if aggregate_enabled:
             _LEAPWASTE_AGG_STATE['n_exhausted_unverified'] += 1
+            _LEAPWASTE_AGG_STATE['deepen_exhausted'] += 1
             _leapwaste_aggregate_finish()
         return best_circ
 
