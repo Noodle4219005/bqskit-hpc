@@ -17,6 +17,33 @@ from bqskit.utils.typing import is_integer
 
 _GDFS = os.environ.get('BQPROF_GDFS') == '1'
 _BEAM_PROBE_DIR = os.environ.get('BQPROF_BEAM_DIR')
+
+# Delayed pruning: do not prune while the heuristic cannot tell the kept
+# candidates apart.
+#
+# E9 measured the relative span of the kept costs -- (max-min)/|min| over the
+# k survivors -- and found it collapses on a sparse coupling graph:
+#
+#     tokyo      rel_span_kept  0.095 - 0.104
+#     all-to-all rel_span_kept  0.244 - 0.278
+#
+# AStarHeuristic is 10*distance + 1*two_qudit_count and the count is constant
+# within a layer, so ordering inside a layer is purely by distance. On tokyo
+# the top-k distances are near-ties, so the beam is choosing essentially at
+# random -- and beam width is measurably NOT monotone (2 of 4 width 32->64
+# pairs got worse on 2Q), so widening is not a safe answer.
+#
+# The hypothesis this implements: when the span is below tau the ranking
+# carries no information, so pruning should be POSTPONED rather than widened.
+# Once the span exceeds tau the heuristic discriminates again and the normal
+# width bound applies.
+#
+# BQSKIT_PRUNE_TAU     relative-span threshold below which pruning is skipped
+# BQSKIT_PRUNE_DELAY_K hard ceiling while delaying, so a delayed prune cannot
+#                      grow the frontier without bound (defaults to 8*k)
+_PRUNE_TAU = os.environ.get('BQSKIT_PRUNE_TAU')
+_PRUNE_DELAY_CAP = os.environ.get('BQSKIT_PRUNE_DELAY_K')
+_PRUNE_STATS: dict[str, int] = {'delayed': 0, 'pruned': 0, 'capped': 0}
 _BEAM_FH: dict[str, Any] = {'pid': None, 'fh': None}
 
 
@@ -236,6 +263,37 @@ class Frontier:
                     _kspan / abs(min(_costs)) if _costs and min(_costs) else 0.0
                 ),
             })
+        if _PRUNE_TAU is not None:
+            # Measure discrimination on the candidates the beam WOULD keep.
+            kept = heapq.nsmallest(k, self._frontier)
+            # FrontierElement's field is `cost`; there is no `heuristic`
+            # attribute. Getting this wrong raises inside the WORKER, which
+            # surfaces only as 'Server connection unexpectedly closed' -- the
+            # same message an unsatisfiable block produces, so it is easy to
+            # misread as a benchmark property rather than a crash.
+            costs = [element.cost for element in kept]
+            low = min(costs)
+            span = (max(costs) - low) / abs(low) if low else 0.0
+            if span < float(_PRUNE_TAU):
+                # The heuristic cannot separate the survivors. Keep them all,
+                # up to a cap, and let a later layer -- where the distances
+                # have spread -- make the decision instead.
+                # 2*k, not 8*k. Delaying is meant to hold the tie band until
+                # it separates, not to stop pruning: an 8*k cap with beam 32
+                # keeps 256 nodes, which measurably explodes the search
+                # instead of deferring one decision. Two beams' worth covers
+                # the ties and still bounds the width.
+                cap = int(_PRUNE_DELAY_CAP) if _PRUNE_DELAY_CAP else 2 * k
+                if len(self._frontier) <= cap:
+                    _PRUNE_STATS['delayed'] += 1
+                    return 0
+                _PRUNE_STATS['capped'] += 1
+                discarded = len(self._frontier) - cap
+                self._frontier = heapq.nsmallest(cap, self._frontier)
+                heapq.heapify(self._frontier)
+                return discarded
+            _PRUNE_STATS['pruned'] += 1
+
         # FrontierElement orders by (heuristic, counter), so nsmallest
         # selects exactly the k the heap would have popped first.
         self._frontier = heapq.nsmallest(k, self._frontier)

@@ -12,6 +12,8 @@ from scipy.stats import linregress
 
 from bqskit.compiler.passdata import PassData
 from bqskit.ir.circuit import Circuit
+from bqskit.ir.gate import Gate
+from bqskit.ir.location import CircuitLocation
 from bqskit.ir.opt.cost.functions import HilbertSchmidtResidualsGenerator
 from bqskit.ir.opt.cost.generator import CostFunctionGenerator
 from bqskit.passes.search.frontier import Frontier
@@ -24,6 +26,7 @@ from bqskit.qis.state.state import StateVector
 from bqskit.qis.state.system import StateSystem
 from bqskit.qis.unitary import UnitaryMatrix
 from bqskit.runtime import get_runtime
+from bqskit.runtime.future import RuntimeFuture
 from bqskit.utils.typing import is_integer
 from bqskit.utils.typing import is_real_number
 
@@ -74,6 +77,8 @@ _SPEC_PROBE_K = int(os.environ.get('BQPROF_SPEC_K', '32'))
 # large K while never having measured what a large K costs.
 _SPEC_WINDOW = int(os.environ.get('BQPROF_SPEC_WINDOW', str(_SPEC_PROBE_K)))
 _SPEC_STATE: dict[str, Any] = {}
+
+_CircuitStructureKey = tuple[tuple[Gate, CircuitLocation], ...]
 
 
 def _spec_probe_record(depth: int, rank: int | None) -> None:
@@ -227,6 +232,9 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
     now = time.monotonic()
     if not force and now - _LEAPWASTE_AGG_STATE.get('last_flush', 0.0) < 30.0:
         return
+    # Delayed pruning lives in Frontier, so its counters have to be folded
+    # in here rather than incremented at the LEAP call sites.
+    from bqskit.passes.search.frontier import _PRUNE_STATS
     pid = os.getpid()
     if _LEAPWASTE_AGG_STATE.get('pid') != pid:
         _LEAPWASTE_AGG_STATE.clear()
@@ -250,6 +258,9 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'deepen_raises': 0,
             'deepen_solved_after_raise': 0,
             'deepen_overflow_max': 0,
+            'prune_delayed': 0,
+            'prune_fired': 0,
+            'prune_capped': 0,
             'frontier_len_hist': {},
             'n_successors_hist': {},
             'layer_hist': {},
@@ -261,7 +272,8 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'n_rounds': 0,
             'spec_hits': 0,
             'spec_misses': 0,
-            'spec_wasted': 0,
+            'spec_evicted': 0,
+            'spec_unused': 0,
             'gdfs_descent_hist': {},
             'gdfs_backtrack_jump_hist': {},
             'gdfs_post_commit_depth_hist': {},
@@ -278,6 +290,9 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
         # must not appear in old aggregate output.
         for key in _GDFS_HIST_KEYS:
             summary.pop(key, None)
+    summary['prune_delayed'] = _PRUNE_STATS['delayed']
+    summary['prune_fired'] = _PRUNE_STATS['pruned']
+    summary['prune_capped'] = _PRUNE_STATS['capped']
     path = os.path.join(_LEAPWASTE_DIR, f'leapagg_{pid}.json')
     temporary = f'{path}.tmp'
     try:
@@ -677,17 +692,15 @@ class LEAPSynthesisPass(SynthesisPass):
         if 'seed' not in instantiate_options:
             instantiate_options['seed'] = data.seed
 
-        async def instantiate_batches(
+        def dispatch_batches(
             batches: list[list[Circuit]],
-        ) -> list[list[Circuit]]:
-            """Instantiate several node expansions in one runtime map."""
+        ) -> tuple[RuntimeFuture, list[tuple[int, int]] | None]:
+            """Dispatch several node expansions in one runtime map."""
             flat_successors = [
                 successor
                 for batch in batches
                 for successor in batch
             ]
-            if not flat_successors:
-                return [[] for _ in batches]
 
             if (
                 not leapwaste_enabled
@@ -715,14 +728,31 @@ class LEAPSynthesisPass(SynthesisPass):
                             )
                             owner_of_task.append((batch_index, successor_index))
 
-                flat_results = await get_runtime().map(
+                future = get_runtime().map(
                     _instantiate_single_start,
                     flat_circuits,
                     [utry] * len(flat_circuits),
                     flat_seeds,
                     **single_options,
                 )
+                return future, owner_of_task
 
+            future = get_runtime().map(
+                Circuit.instantiate,
+                flat_successors,
+                target=utry,
+                **instantiate_options,
+            )
+            return future, None
+
+        async def collect_batches(
+            future: RuntimeFuture,
+            batches: list[list[Circuit]],
+            owner_of_task: list[tuple[int, int]] | None,
+        ) -> list[list[Circuit]]:
+            """Collect a dispatched map and restore its batch structure."""
+            flat_results = await future
+            if owner_of_task is not None:
                 best_circuits: list[dict[int, Circuit]] = [
                     {} for _ in batches
                 ]
@@ -745,12 +775,6 @@ class LEAPSynthesisPass(SynthesisPass):
                     for i, batch in enumerate(batches)
                 ]
 
-            flat_results = await get_runtime().map(
-                Circuit.instantiate,
-                flat_successors,
-                target=utry,
-                **instantiate_options,
-            )
             results: list[list[Circuit]] = []
             offset = 0
             for batch in batches:
@@ -765,25 +789,71 @@ class LEAPSynthesisPass(SynthesisPass):
                 _LEAPWASTE_AGG_STATE[metric] += amount
 
         speculation_memo: dict[
-            int, tuple[list[Circuit], list[Circuit]],
+            _CircuitStructureKey,
+            tuple[list[Circuit], list[Circuit], bool],
         ] = {}
+        speculation_future: RuntimeFuture | None = None
+        speculation_keys: list[_CircuitStructureKey] = []
+        speculation_batches: list[list[Circuit]] = []
+        speculation_owners: list[tuple[int, int]] | None = None
+
+        def circuit_structure_key(circuit: Circuit) -> _CircuitStructureKey:
+            """Return an exact identity for one instantiation input.
+
+            The parameters are part of the key, not decoration. Successors are
+            built as `circuit.copy()` plus one appended layer, so a node
+            carries its parent's optimised parameters, and instantiate starts
+            from them. Two nodes reached by different paths can share a
+            gate/location sequence while holding different parameters -- and
+            they then settle into DIFFERENT local minima.
+
+            Measured on a structure that cannot represent its target (one CNOT
+            against a random SU(4), which needs three), four starting points
+            gave four distinct costs:
+
+                5.3206551509e-02  5.3206544435e-02
+                5.3206507129e-02  5.3206521624e-02
+
+            A structure-only key therefore lets a cache hit return a node with
+            a different cost, which reorders the frontier. That is speculation
+            changing commitment -- exactly what the design forbids. Note that
+            bit-identity checks pass with the unsound key whenever the run
+            happens not to collide, so they cannot be the guard here.
+
+            Keying on (gates, locations, parameters) loses nothing the cache
+            was for: a node before and after a commit is the SAME circuit with
+            the SAME parameters, so it still hits across commits and
+            rollbacks. What it stops sharing is two genuinely different
+            computations that merely look alike.
+            """
+            return tuple(
+                (op.gate, op.location, tuple(op.params)) for op in circuit
+            )
 
         def memoize_speculation(
-            element_id: int,
+            structure_key: _CircuitStructureKey,
             expansion: tuple[list[Circuit], list[Circuit]],
         ) -> None:
             """Insert one expansion, evicting the oldest memo entry first."""
             while len(speculation_memo) >= self.speculate_memo:
-                oldest_id = next(iter(speculation_memo))
-                speculation_memo.pop(oldest_id)
-                record_spec_metric('spec_wasted')
-            speculation_memo[element_id] = expansion
+                oldest_key = next(iter(speculation_memo))
+                speculation_memo.pop(oldest_key)
+                record_spec_metric('spec_evicted')
+            speculation_memo[structure_key] = (*expansion, False)
 
-        def discard_speculation_memo() -> None:
-            """Drop expansions that will not reach a committed pop."""
-            if speculation_memo:
-                record_spec_metric('spec_wasted', len(speculation_memo))
-                speculation_memo.clear()
+        def finish_speculation() -> None:
+            """Account for and stop speculative work at synthesis exit."""
+            nonlocal speculation_future
+            record_spec_metric(
+                'spec_unused',
+                sum(not entry[2] for entry in speculation_memo.values())
+                + len(speculation_keys),
+            )
+            speculation_memo.clear()
+            if speculation_future is not None:
+                # Unfinished speculation must not outlive the synthesis call.
+                get_runtime().cancel(speculation_future)
+                speculation_future = None
 
         # Get layer generator for search
         layer_gen = self._get_layer_gen(data)
@@ -934,7 +1004,6 @@ class LEAPSynthesisPass(SynthesisPass):
                 ):
                     # Rollback explores a cheaper different branch at this
                     # depth; only deepen after the rollback budget is spent.
-                    discard_speculation_memo()
                     current_max_layer = min(
                         current_max_layer * 2,
                         self.deepen_to,
@@ -959,43 +1028,34 @@ class LEAPSynthesisPass(SynthesisPass):
             # commit order.
             beam = self.beam_width
 
+            # Poll at most once per round: RuntimeFuture._done warns that
+            # busy-wait polling can deadlock the runtime task.
+            if speculation_future is not None and speculation_future._done:
+                speculative_results = await collect_batches(
+                    speculation_future,
+                    speculation_batches,
+                    speculation_owners,
+                )
+                for structure_key, node_successors, node_results in zip(
+                    speculation_keys,
+                    speculation_batches,
+                    speculative_results,
+                ):
+                    memoize_speculation(
+                        structure_key,
+                        (node_successors, node_results),
+                    )
+                speculation_future = None
+                speculation_keys = []
+                speculation_batches = []
+                speculation_owners = None
+
             popped = []
             successors = []
             successor_layers = []
             popped_expansions: list[
                 tuple[list[Circuit], list[Circuit] | None],
             ] = []
-
-            if self.speculate_width >= 2:
-                speculative_ids: list[int] = []
-                speculative_batches: list[list[Circuit]] = []
-                for element_id, circuit, _ in frontier.peek(
-                    self.speculate_width,
-                ):
-                    if element_id in speculation_memo:
-                        continue
-                    node_successors = list(
-                        layer_gen.gen_successors(circuit, data),
-                    )
-                    speculative_ids.append(element_id)
-                    speculative_batches.append(node_successors)
-
-                if speculative_batches:
-                    speculative_results = await instantiate_batches(
-                        speculative_batches,
-                    )
-                    tasks_dispatched += sum(
-                        len(batch) for batch in speculative_batches
-                    )
-                    for element_id, node_successors, node_results in zip(
-                        speculative_ids,
-                        speculative_batches,
-                        speculative_results,
-                    ):
-                        memoize_speculation(
-                            element_id,
-                            (node_successors, node_results),
-                        )
 
             while not frontier.empty():
                 top_circuit, top_layer = frontier.pop()
@@ -1080,15 +1140,15 @@ class LEAPSynthesisPass(SynthesisPass):
                 # every node after the first, and the search would still
                 # look healthy.
                 if self.speculate_width >= 2:
-                    popped_id = frontier._last_popped_id
-                    memo_entry = (
-                        speculation_memo.pop(popped_id)
-                        if popped_id is not None
-                        and popped_id in speculation_memo
-                        else None
-                    )
+                    structure_key = circuit_structure_key(top_circuit)
+                    memo_entry = speculation_memo.get(structure_key)
                     if memo_entry is not None:
-                        node_successors, node_results = memo_entry
+                        node_successors, node_results, _ = memo_entry
+                        speculation_memo[structure_key] = (
+                            node_successors,
+                            node_results,
+                            True,
+                        )
                         record_spec_metric('spec_hits')
                     else:
                         node_successors = list(
@@ -1121,6 +1181,55 @@ class LEAPSynthesisPass(SynthesisPass):
 
             if self.speculate_width < 2:
                 tasks_dispatched += len(successors)
+
+            critical_future: RuntimeFuture | None = None
+            critical_batches: list[list[Circuit]] = []
+            critical_owners: list[tuple[int, int]] | None = None
+            if self.speculate_width >= 2:
+                critical_batches = [
+                    node_successors
+                    for node_successors, node_results in popped_expansions
+                    if node_results is None and node_successors
+                ]
+                if critical_batches:
+                    # Queue critical work first so workers cannot choose newly
+                    # dispatched speculation ahead of the search path.
+                    critical_future, critical_owners = dispatch_batches(
+                        critical_batches,
+                    )
+                    tasks_dispatched += sum(
+                        len(batch) for batch in critical_batches
+                    )
+
+                if speculation_future is None:
+                    queued_keys: set[_CircuitStructureKey] = set()
+                    next_keys: list[_CircuitStructureKey] = []
+                    next_batches: list[list[Circuit]] = []
+                    for _, circuit, _ in frontier.peek(self.speculate_width):
+                        structure_key = circuit_structure_key(circuit)
+                        if (
+                            structure_key in speculation_memo
+                            or structure_key in queued_keys
+                        ):
+                            continue
+                        node_successors = list(
+                            layer_gen.gen_successors(circuit, data),
+                        )
+                        if not node_successors:
+                            continue
+                        queued_keys.add(structure_key)
+                        next_keys.append(structure_key)
+                        next_batches.append(node_successors)
+
+                    if next_batches:
+                        speculation_future, speculation_owners = (
+                            dispatch_batches(next_batches)
+                        )
+                        speculation_keys = next_keys
+                        speculation_batches = next_batches
+                        tasks_dispatched += sum(
+                            len(batch) for batch in next_batches
+                        )
             current_iteration = iteration
             iteration += 1
 
@@ -1165,17 +1274,13 @@ class LEAPSynthesisPass(SynthesisPass):
 
             # Instantiate successors
             if self.speculate_width >= 2:
-                pending_batches = [
-                    node_successors
-                    for node_successors, node_results in popped_expansions
-                    if node_results is None and node_successors
-                ]
                 pending_results = (
-                    await instantiate_batches(pending_batches)
-                    if pending_batches else []
-                )
-                tasks_dispatched += sum(
-                    len(batch) for batch in pending_batches
+                    await collect_batches(
+                        critical_future,
+                        critical_batches,
+                        critical_owners,
+                    )
+                    if critical_future is not None else []
                 )
 
                 circuits = []
@@ -1350,7 +1455,7 @@ class LEAPSynthesisPass(SynthesisPass):
                             'prefix_formed': prefix_formed,
                             'n_cleared': n_cleared,
                         })
-                    discard_speculation_memo()
+                    finish_speculation()
                     if aggregate_enabled:
                         if n_rollbacks > 0:
                             _LEAPWASTE_AGG_STATE['n_rollback_rescued'] += 1
@@ -1403,8 +1508,6 @@ class LEAPSynthesisPass(SynthesisPass):
                         _prefix_probe_record(
                             layer + 1, frontier, circuit, len(frontier),
                         )
-
-                        discard_speculation_memo()
 
                         # Multi-prefix: keep the best few continuations
                         # rather than only the one LEAP picked.
@@ -1540,19 +1643,6 @@ class LEAPSynthesisPass(SynthesisPass):
             # threshold does not. A width bound does not depend on depth.
             # No-op when `beam_width` is unset.
             n_pruned_this_round = frontier.prune(beam)
-            if self.speculate_width >= 2 and speculation_memo:
-                live_ids = {
-                    element_id for element_id, _, _ in frontier.peek(
-                        len(frontier),
-                    )
-                }
-                stale_ids = [
-                    element_id for element_id in speculation_memo
-                    if element_id not in live_ids
-                ]
-                for element_id in stale_ids:
-                    speculation_memo.pop(element_id)
-                record_spec_metric('spec_wasted', len(stale_ids))
             if aggregate_enabled and _LEAPWASTE_AGG_STATE:
                 _LEAPWASTE_AGG_STATE['sum_n_pruned'] += n_pruned_this_round
                 if n_pruned_this_round > 0:
@@ -1580,7 +1670,7 @@ class LEAPSynthesisPass(SynthesisPass):
         if self.store_partial_solutions:
             data['psols'] = psols
 
-        discard_speculation_memo()
+        finish_speculation()
         if aggregate_enabled:
             _LEAPWASTE_AGG_STATE['n_exhausted_unverified'] += 1
             _leapwaste_aggregate_finish()
