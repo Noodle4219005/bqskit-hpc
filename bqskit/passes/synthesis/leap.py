@@ -1612,6 +1612,15 @@ class LEAPSynthesisPass(SynthesisPass):
                         p = _spec_hits / _spec_issued
                         if p <= 0.0:
                             value_k = 2.0
+                        elif p >= 1.0:
+                            # Every speculative task has hit, so there is
+                            # nothing to discount and the cap must not bind.
+                            # log(1.0) is 0, which made this a
+                            # ZeroDivisionError -- and only on arms with
+                            # speculation enabled, so the control arm passed
+                            # and the crash surfaced as the runtime's generic
+                            # 'Server connection unexpectedly closed'.
+                            value_k = float(self.expand_k_max)
                         else:
                             # Largest d with p^d above the floor; the floor is
                             # the point below which a speculative task is worth
