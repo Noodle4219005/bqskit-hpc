@@ -14,6 +14,7 @@ from multiprocessing import Process
 from multiprocessing.connection import Client
 from multiprocessing.connection import Connection
 from queue import Empty
+from queue import PriorityQueue
 from queue import Queue
 from threading import Lock
 from threading import Thread
@@ -22,6 +23,7 @@ from typing import Callable
 from typing import cast
 from typing import List
 from typing import Sequence
+from typing import Tuple
 
 from bqskit.runtime import default_worker_port
 from bqskit.runtime import set_blas_thread_counts
@@ -29,10 +31,42 @@ from bqskit.runtime.address import RuntimeAddress
 from bqskit.runtime.future import RuntimeFuture
 from bqskit.runtime.message import RuntimeMessage
 from bqskit.runtime.result import RuntimeResult
+from bqskit.runtime.task import PRIORITY_CRITICAL
 from bqskit.runtime.task import RuntimeTask
 
 
 _logger = logging.getLogger(__name__)
+
+# Where a manager's occupancy broadcast is parked for the passes running on
+# this worker. Read it with:
+#
+#     idle, total, stamp = get_runtime().get_cache().get(
+#         '__bqskit_occupancy__', (None, None, 0.0))
+#
+# A missing key means "unknown", never "zero idle": the broadcast only exists
+# in the detached runtime, and a pass that read absent-as-zero would turn
+# itself off in every attached run.
+_OCCUPANCY_KEY = '__bqskit_occupancy__'
+
+# How many tasks a worker may have STARTED but not finished.
+#
+# A batch arriving at a worker starts exactly one task and delays the rest
+# (see the SUBMIT_BATCH handler), and a delayed task is promoted only once the
+# ready queue is completely empty. Those two rules together throttle the whole
+# cluster: ForEachBlockPass hands out ~17 block-synthesis tasks per worker, the
+# worker starts ONE, that block's instantiate children then keep the ready
+# queue permanently non-empty, and the other 16 blocks never start. The number
+# of blocks alive cluster-wide collapses from 1994 to roughly one per worker,
+# so the machine runs on a fraction of the parallelism the circuit contains.
+#
+# Measured: 112 processes each at 21-44% of a core, uniformly -- not one
+# saturated bottleneck but everybody starved.
+#
+# 1 reproduces the historical behaviour exactly, which is what keeps the digest
+# gate meaningful. Raising it starts more parents, and parents are what
+# GENERATE work for the rest of the cluster. The cost is memory, and in this
+# domain memory is the cheap resource: 1 GB of stored search nodes is worth 77
+# CPU-hours of recomputation.
 
 
 @dataclass
@@ -174,8 +208,21 @@ class Worker:
         (at no cost)
         """
 
-        self._ready_task_ids: Queue[RuntimeAddress] = Queue()
-        """Tasks queued up for execution."""
+        self._ready_task_ids: PriorityQueue[
+            tuple[int, int, RuntimeAddress]
+        ] = PriorityQueue()
+        """Tasks queued up for execution, ordered by service class.
+
+        Entries are (priority, arrival, address). The arrival counter is what
+        makes this a strict generalisation rather than a behaviour change: with
+        every task at the same class -- which is every caller that does not ask
+        for otherwise -- ordering by (class, arrival) IS the FIFO this replaces.
+        It also keeps the tuples totally ordered, so PriorityQueue never has to
+        compare two RuntimeAddress objects.
+        """
+
+        self._ready_seq = 0
+        """Monotonic arrival counter; see _ready_task_ids."""
 
         self._cancelled_task_ids: set[RuntimeAddress] = set()
         """To ensure newly-received cancelled tasks are never started."""
@@ -321,11 +368,37 @@ class Worker:
                     if path not in sys.path:
                         sys.path.append(path)
 
+            elif msg == RuntimeMessage.OCCUPANCY:
+                # This node's (idle, total) worker counts, throttled by the
+                # manager. Parked in the worker cache because that is the only
+                # channel a running pass can already read -- get_cache() is
+                # part of RuntimeHandle, the occupancy is not.
+                #
+                # A pass that finds no key must behave as it did before: absent
+                # is not "zero idle", it is "unknown", and treating unknown as
+                # zero would silently disable every mechanism that sizes itself
+                # from this number.
+                # (idle_workers, total_workers, free_cores). The third field
+                # is what a pass should size itself from: unassigned workers
+                # and un-busy cores differ threefold in practice. Older
+                # 2-tuples are accepted so a mixed-version node cannot crash a
+                # worker, falling back to the worker count.
+                if len(payload) >= 3:
+                    idle, total, free = cast(
+                        Tuple[int, int, int], payload[:3],
+                    )
+                else:
+                    idle, total = cast(Tuple[int, int], payload)
+                    free = idle
+                self._cache[_OCCUPANCY_KEY] = (
+                    idle, total, free, time.monotonic(),
+                )
+
     def _add_task(self, task: RuntimeTask) -> None:
         """Start a task and add it to the loop."""
         self._tasks[task.return_address] = task
         task.start()
-        self._ready_task_ids.put(task.return_address)
+        self._enqueue_ready(task.return_address, task.priority)
 
     def _handle_result(self, result: RuntimeResult) -> None:
         """Insert result into appropriate mailbox and wake waiting task."""
@@ -347,7 +420,15 @@ class Worker:
                 # print(f'Worker {self._id} is waking task
                 # {task.return_address}, with {task.wake_on_next=},
                 # {box.ready=}')
-                self._ready_task_ids.put(box.dest_addr)  # Wake it
+                # Wake it, at the priority the task itself carries: a
+                # speculative task that blocked and became runnable again is
+                # still speculative, and re-admitting it as critical would let
+                # it overtake the work it was meant to stay behind.
+                woken = self._tasks.get(box.dest_addr)
+                self._enqueue_ready(
+                    box.dest_addr,
+                    woken.priority if woken is not None else PRIORITY_CRITICAL,
+                )
                 box.dest_addr = None  # Prevent double wake
 
     def _handle_cancel(self, addr: RuntimeAddress) -> None:
@@ -398,11 +479,60 @@ class Worker:
 
             self._tasks[task_addr].msg_buffer.append(msg)
 
+    def _head_priority(self) -> int | None:
+        """Service class of the most urgent ready task, or None if empty."""
+        try:
+            return self._ready_task_ids.queue[0][0]
+        except IndexError:
+            return None
+
+    def _should_promote_delayed(self) -> bool:
+        """Whether a delayed task should be started now.
+
+        The original condition was `ready queue is empty`, which was correct
+        only while every task shared one service class: a FIFO drains, so the
+        queue does empty and delayed work does start.
+
+        With service classes it is a starvation bug, and one that inverts the
+        whole design. A batch puts ONE task in the ready queue and delays the
+        rest, so a batch of CRITICAL tasks leaves N-1 of them in
+        `_delayed_tasks` -- where, if speculation is sitting in the ready queue
+        keeping it non-empty, they never start. Speculation would then block
+        the critical path by OCCUPYING the queue rather than by being ahead of
+        it, which is the opposite of what the priority is for.
+
+        The condition that holds in both worlds: promote when the ready queue
+        has nothing at least as urgent as the most urgent delayed task.
+        """
+        head = self._head_priority()
+        if head is None:
+            return True
+        return head > min(t.priority for t in self._delayed_tasks)
+
+    def _pop_best_delayed(self) -> RuntimeTask:
+        """Take the most urgent delayed task, LIFO within its class.
+
+        LIFO is load-bearing and predates this change: it completes
+        deeply-nested tasks first, which keeps the number of STARTED tasks --
+        and therefore memory -- down. Priority orders the classes; LIFO still
+        orders within one.
+        """
+        best = min(t.priority for t in self._delayed_tasks)
+        for i in range(len(self._delayed_tasks) - 1, -1, -1):
+            if self._delayed_tasks[i].priority == best:
+                return self._delayed_tasks.pop(i)
+        raise AssertionError('non-empty delayed list has no minimum')
+
+    def _enqueue_ready(self, addr: RuntimeAddress, priority: int) -> None:
+        """Admit an address to the ready queue in its service class."""
+        self._ready_seq += 1
+        self._ready_task_ids.put((priority, self._ready_seq, addr))
+
     def _get_next_ready_task(self) -> RuntimeTask | None:
         """Return the next ready task if one exists, otherwise block."""
         while True:
-            if self._ready_task_ids.empty() and len(self._delayed_tasks) > 0:
-                self._add_task(self._delayed_tasks.pop())
+            if self._delayed_tasks and self._should_promote_delayed():
+                self._add_task(self._pop_best_delayed())
                 continue
 
             # Critical section
@@ -413,7 +543,7 @@ class Worker:
             # catching the Empty exception, but before forming the payload.
             self.read_receipt_mutex.acquire()
             try:
-                addr = self._ready_task_ids.get_nowait()
+                _prio, _seq, addr = self._ready_task_ids.get_nowait()
 
             except Empty:
                 payload = (1, self.most_recent_read_submit)
@@ -421,7 +551,7 @@ class Worker:
                 self.read_receipt_mutex.release()
                 # Block for new message. Can release lock here since the
                 # the `self.most_recent_read_submit` has been used.
-                addr = self._ready_task_ids.get()
+                _prio, _seq, addr = self._ready_task_ids.get()
 
             else:
                 self.read_receipt_mutex.release()
@@ -503,7 +633,7 @@ class Worker:
         # {task.return_address}, with {task.wake_on_next=}')
 
         if box.ready:
-            self._ready_task_ids.put(task.return_address)
+            self._enqueue_ready(task.return_address, task.priority)
 
     def _process_task_completion(self, task: RuntimeTask, result: Any) -> None:
         """Package and send out task result."""
@@ -565,9 +695,16 @@ class Worker:
         *args: Any,
         task_name: str | None = None,
         log_context: dict[str, str] = {},
+        task_priority: int = PRIORITY_CRITICAL,
         **kwargs: Any,
     ) -> RuntimeFuture:
-        """Submit `fn` as a task to the runtime."""
+        """Submit `fn` as a task to the runtime.
+
+        `task_priority` selects the worker's service class. Named with the
+        `task_` prefix because everything else in **kwargs is forwarded to
+        `fn`, and a bare `priority` would collide with any callee that happens
+        to take one.
+        """
         assert self._active_task is not None
 
         if task_name is not None and not isinstance(task_name, str):
@@ -601,6 +738,7 @@ class Worker:
             self._active_task.max_logging_depth,
             task_name,
             {**self._active_task.log_context, **log_context},
+            task_priority,
         )
 
         # Submit the task (on the next cycle)
@@ -615,9 +753,15 @@ class Worker:
         *args: Any,
         task_name: Sequence[str | None] | str | None = None,
         log_context: Sequence[dict[str, str]] | dict[str, str] = {},
+        task_priority: int = PRIORITY_CRITICAL,
         **kwargs: Any,
     ) -> RuntimeFuture:
-        """Map `fn` over the input arguments distributed across the runtime."""
+        """Map `fn` over the input arguments distributed across the runtime.
+
+        `task_priority` selects the worker's service class for every task in
+        the batch. See `RuntimeTask.priority`; the `task_` prefix keeps it out
+        of the **kwargs that are forwarded to `fn`.
+        """
         assert self._active_task is not None
 
         if task_name is None or isinstance(task_name, str):
@@ -676,6 +820,7 @@ class Worker:
                 self._active_task.max_logging_depth,
                 task_name[i],
                 {**self._active_task.log_context, **log_context[i]},
+                task_priority,
             )
             for i, fnarg in enumerate(fnargs)
         ]

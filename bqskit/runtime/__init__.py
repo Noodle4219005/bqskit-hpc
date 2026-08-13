@@ -202,6 +202,7 @@ class RuntimeHandle(Protocol):
         *args: Any,
         task_name: Sequence[str | None] | str | None = None,
         log_context: Sequence[dict[str, str]] | dict[str, str] = {},
+        task_priority: int = 0,
         **kwargs: Any,
     ) -> RuntimeFuture:
         """

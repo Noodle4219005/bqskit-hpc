@@ -2,10 +2,6 @@
 from __future__ import annotations
 
 import cmath
-import json
-import os
-
-from typing import Any
 
 import numpy as np
 
@@ -16,40 +12,6 @@ from bqskit.ir.gates.constant.sx import SqrtXGate
 from bqskit.ir.gates.parameterized.rx import RXGate
 from bqskit.ir.gates.parameterized.rz import RZGate
 from bqskit.ir.gates.parameterized.u1 import U1Gate
-
-
-# What does this decomposition actually emit? It appends RZ, SX, RZ, SX, RZ
-# unconditionally, with no check on the three angles, so a pure Z rotation
-# costs five gates. The gate-deletion scan then removes the redundant ones by
-# brute force -- P0-g measured 1,993 successful single-qudit removals on
-# ham15-med, each paid for with a full-circuit instantiate. This probe sizes
-# what emitting the minimal form here instead would be worth.
-_ZXZXZ_PROBE_DIR = os.environ.get('BQPROF_ZXZXZ_DIR')
-_ZXZXZ_FH: dict[str, Any] = {'pid': None, 'fh': None}
-
-
-def _zxzxz_emit(record: dict[str, Any]) -> None:
-    """Append one decomposition record, fork-safe."""
-    if not _ZXZXZ_PROBE_DIR:
-        return
-    try:
-        pid = os.getpid()
-        if _ZXZXZ_FH['pid'] != pid:
-            stale = _ZXZXZ_FH.get('fh')
-            if stale is not None:
-                try:
-                    stale.close()
-                except Exception:
-                    pass
-            os.makedirs(_ZXZXZ_PROBE_DIR, exist_ok=True)
-            _ZXZXZ_FH['fh'] = open(
-                os.path.join(_ZXZXZ_PROBE_DIR, f'zxzxz_{pid}.jsonl'),
-                'a', buffering=1,
-            )
-            _ZXZXZ_FH['pid'] = pid
-        _ZXZXZ_FH['fh'].write(json.dumps(record) + '\n')
-    except Exception:
-        pass
 
 
 class ZXZXZDecomposition(BasePass):
@@ -148,17 +110,5 @@ class ZXZXZDecomposition(BasePass):
             new_circuit.append_gate(U1Gate(), 0, [p])
         else:
             new_circuit.append_gate(RZGate(), 0, [p])
-
-        if _ZXZXZ_PROBE_DIR:
-            def _triv(x: float) -> bool:
-                y = float(x) % (2 * np.pi)
-                return min(y, 2 * np.pi - y) < 1e-9
-            _zxzxz_emit({
-                'l': float(l), 't': float(t), 'p': float(p),
-                'l_id': _triv(l), 't_id': _triv(t), 'p_id': _triv(p),
-                't_pi': abs(abs(float(t)) - np.pi) < 1e-9,
-                'in_ops': circuit.num_operations,
-                'out_ops': new_circuit.num_operations,
-            })
 
         circuit.become(new_circuit)

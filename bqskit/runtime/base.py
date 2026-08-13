@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import abc
 import functools
+import heapq
 import logging
 import os
 import random
@@ -36,6 +37,79 @@ from bqskit.runtime.worker import start_worker
 
 _logger = logging.getLogger(__name__)
 
+# Seconds between occupancy broadcasts. The only consumer decides once per A*
+# round -- hundreds of milliseconds -- so a tenth of a second is already finer
+# than anything that reads it, while the idle count itself moves thousands of
+# times a second.
+_OCCUPANCY_INTERVAL = 0.1
+
+# Two-level task pool. 0 disables it and restores push-everything exactly,
+# which is what keeps the digest gate meaningful.
+#
+# Without a pool every task is committed to an employee the moment it arrives,
+# and a worker hides all but one of an incoming batch in a private list nothing
+# can drain. Worker A then sits on sixteen expensive blocks while worker B is
+# idle and unreachable -- measured as 112 processes uniformly at 21-44% of a
+# core with no single one saturated.
+#
+# The same code runs at both levels because the question is the same one twice:
+# who should hold this task next, and how much should they hold. Only the
+# capacity differs -- a manager holds enough for all its workers, a worker
+# holds enough to cover one round trip.
+try:
+    _POOL_PREFETCH = int(os.environ.get('BQSKIT_POOL_PREFETCH', '0'))
+except ValueError:
+    raise ValueError('BQSKIT_POOL_PREFETCH must be an integer')
+
+try:
+    _RESERVE_CORES = int(os.environ.get('BQSKIT_RESERVE_CORES', '0'))
+except ValueError:
+    raise ValueError('BQSKIT_RESERVE_CORES must be an integer')
+
+_PIN_WORKERS = os.environ.get('BQSKIT_PIN_WORKERS', '0') != '0'
+"""Pin each worker to one core. Separated from _RESERVE_CORES so the two
+effects can be told apart: reserving without pinning is not expressible, so a
+reserve arm otherwise changes two things at once."""
+
+
+def _node_busy_fraction(prev: tuple[float, float] | None) -> tuple[
+    float | None, tuple[float, float] | None,
+]:
+    """Busy fraction of this node's cores since `prev`, and a new snapshot.
+
+    `num_idle_workers` counts workers with nothing ASSIGNED, which is not the
+    same as cores doing nothing, and the gap is large: measured on adder_8 at
+    msz=4, LEAP saw 15.5 idle workers out of 112 while 41% of the cores -- about
+    46 of them -- were not computing. Sizing speculation from the worker count
+    therefore under-committed the machine threefold and pinned occupancy at 59%.
+
+    Reading /proc/stat costs one file read per broadcast and measures the thing
+    the decision is actually about. On a node shared with another job it
+    under-reports free capacity, which is the safe direction.
+    """
+    try:
+        with open('/proc/stat', encoding='ascii') as fh:
+            parts = fh.readline().split()
+    except OSError:
+        return None, prev
+    if not parts or parts[0] != 'cpu':
+        return None, prev
+    v = [float(x) for x in parts[1:9]]
+    while len(v) < 8:
+        v.append(0.0)
+    user, nice, system, idle, iowait, irq, softirq, steal = v
+    # iowait is not work; counting it as busy would make a starved machine look
+    # fed, which is the exact error this whole measurement exists to avoid.
+    busy = user + nice + system + irq + softirq
+    total = busy + idle + iowait + steal
+    now = (busy, total)
+    if prev is None:
+        return None, now
+    dbusy, dtotal = busy - prev[0], total - prev[1]
+    if dtotal <= 0 or dbusy < 0:
+        return None, now
+    return min(1.0, dbusy / dtotal), now
+
 
 class RuntimeEmployee:
     """Data structure for a boss's view of an employee."""
@@ -64,6 +138,10 @@ class RuntimeEmployee:
         self.num_tasks = 0
         self.num_idle_workers = total_workers
         self.is_manager = is_manager
+
+        self.pool_debt = 0
+        """Pool placements made on credit, i.e. with no idle worker to cover
+        them. Bounded by the flow-control window; repaid by each result."""
 
         self.submit_cache: list[tuple[RuntimeAddress, int]] = []
         """
@@ -161,6 +239,20 @@ class ServerBase:
         self.conn_to_employee_dict: dict[Connection, RuntimeEmployee] = {}
         """Used to find the employee associated with a message."""
 
+        self._init_pool()
+
+        self._cpu_snapshot: tuple[float, float] | None = None
+        """Previous (busy, total) jiffies, for the free-core measurement."""
+
+        self._last_occupancy_bcast = 0.0
+        """Throttle state for broadcast_occupancy.
+
+        Starts at zero rather than the current time so the first idle-count
+        change publishes immediately: a run that never fills its workers would
+        otherwise wait a tenth of a second before any pass could learn there
+        was room to speculate into.
+        """
+
         # Servers do not need blas threads
         set_blas_thread_counts(1)
 
@@ -215,6 +307,17 @@ class ServerBase:
         self.num_idle_workers = self.total_workers
 
         _logger.info(f'Node has {self.total_workers} total workers.')
+
+        # Tell each manager how many workers this node commands in total. A
+        # manager cannot otherwise know how large its siblings are, and that
+        # figure is the denominator it needs to retain only a fair share of a
+        # batch submitted from below (see Manager.send_up_or_schedule_tasks).
+        # This must wait until every manager has reported, hence its position
+        # after the registration loop rather than inside connect_to_manager.
+        for conn in manager_conns:
+            self.outgoing.put(
+                (conn, RuntimeMessage.STARTED, self.total_workers),
+            )
 
     def connect_to_manager(
         self,
@@ -284,20 +387,60 @@ class ServerBase:
             raise RuntimeError('Insufficient id range for workers.')
 
         # Create and start all worker processes
+        #
+        # BQSKit's worker already knows how to pin itself (worker.py, `cpu`
+        # argument) but nothing ever passed one, so workers float and the
+        # manager competes with 112 of them for the core it needs to run the
+        # select() relay on. _RESERVE_CORES hands the first N cores to the
+        # manager and starts workers above them; _PIN_WORKERS pins without
+        # reserving, so the cost of pinning itself stays separable.
+        pin = _PIN_WORKERS or _RESERVE_CORES > 0
+        ncpu = os.cpu_count() or 1
+        overflowed = False
         procs = {}
         for i in range(num_workers):
             w_id = self.lower_id_bound + i
+            kwargs = {
+                'logging_level': logging_level,
+                'num_blas_threads': num_blas_threads,
+            }
+            if pin:
+                cpu = _RESERVE_CORES + i
+                if cpu < ncpu:
+                    kwargs['cpu'] = cpu
+                elif not overflowed:
+                    # Wrapping would put a worker back on the reserved core and
+                    # quietly undo the reservation being measured.
+                    overflowed = True
+                    _logger.warning(
+                        'Only %d cores for %d workers + %d reserved; workers '
+                        'from index %d left unpinned.',
+                        ncpu, num_workers, _RESERVE_CORES, i,
+                    )
             procs[w_id] = Process(
                 target=start_worker,
                 args=(w_id, port),
-                kwargs={
-                    'logging_level': logging_level,
-                    'num_blas_threads': num_blas_threads,
-                },
+                kwargs=kwargs,
             )
             procs[w_id].daemon = True
             procs[w_id].start()
             _logger.debug(f'Stated worker process {i}.')
+
+        if _RESERVE_CORES > 0:
+            # Only after the children are forked: affinity is inherited, so
+            # narrowing this process first would drag every worker onto the
+            # reserved cores.
+            try:
+                os.sched_setaffinity(0, set(range(_RESERVE_CORES)))
+                _logger.info(
+                    'Reserved cores 0-%d for this process; %d workers pinned '
+                    'to cores %d-%d.', _RESERVE_CORES - 1, num_workers,
+                    _RESERVE_CORES, _RESERVE_CORES + num_workers - 1,
+                )
+            except (AttributeError, OSError) as e:
+                _logger.warning('Could not reserve cores: %s', e)
+        elif pin:
+            _logger.info('%d workers pinned 1:1, no core reserved.', num_workers)
 
         # Listen for the worker connections
         family = 'AF_INET' if sys.platform == 'win32' else None
@@ -396,8 +539,28 @@ class ServerBase:
         return conn
 
     def send_outgoing(self) -> None:
-        """Outgoing thread forwards messages as they are created."""
+        """Outgoing thread forwards messages as they are created.
+
+        One thread, one FIFO, every destination -- so a large SUBMIT_BATCH is
+        head-of-line blocking for whatever sits behind it, and the pool's
+        service-class ordering does not survive past the queue. Both are fixable
+        (per-destination queues served round-robin, i.e. virtual output queues),
+        but only worth fixing if the wire is actually the constraint, so the
+        depth is sampled here and reported rather than assumed.
+        """
+        sent = 0
+        qmax = 0
+        qsum = 0
         while True:
+            depth = self.outgoing.qsize()
+            qmax = max(qmax, depth)
+            qsum += depth
+            sent += 1
+            if sent % 20000 == 0:
+                _logger.info(
+                    'outgoing depth: mean %.1f max %d over %d messages.',
+                    qsum / sent, qmax, sent,
+                )
             outgoing = self.outgoing.get()
 
             if not self.running:
@@ -604,9 +767,175 @@ class ServerBase:
 
         return assignments
 
+    def _init_pool(self) -> None:
+        """Initialise every field `_drain_pool` touches.
+
+        One method rather than inline assignments because `_pool_cursor` was
+        once added to the drain path but not to __init__: the pool-off digest
+        gate returned before reaching it, so the gate stayed green while every
+        pool-on run died on the first task with AttributeError. Anything the
+        drain path needs is initialised here and nowhere else, and
+        scripts/pool_credit_check.py calls this same method.
+        """
+        self._pool: list[tuple[int, int, RuntimeTask]] = []
+        """Undispatched tasks, ordered (service class, arrival).
+
+        Placement preference is applied when draining rather than in the key:
+        the pool says WHICH task is next, `_drain_pool` says WHO gets it, and
+        only the second one needs to know about employees. Arrival is unique,
+        so tasks are never compared.
+        """
+
+        self._pool_seq = 0
+        """Monotonic arrival counter; see _pool."""
+
+        self._pool_cursor = 0
+        """Round-robin start index for placement; see _drain_pool."""
+
+    def _pool_window(self, employee: RuntimeEmployee) -> int:
+        """How far this employee may overdraw its idle credit.
+
+        Bandwidth-delay product, in the ordinary networking sense. The link is
+        the single-threaded select() relay: a worker that empties its ready
+        queue cannot be refilled faster than one WAITING plus one SUBMIT round
+        trip, and it computes nothing in between. The window is how much work
+        is kept in flight to cover that latency -- 0 leaves the link idle for a
+        full RTT per task, and too large is hoarding under another name.
+        """
+        if employee.is_manager:
+            return _POOL_PREFETCH * max(1, employee.total_workers)
+        return _POOL_PREFETCH
+
+    def _can_place(self, employee: RuntimeEmployee) -> bool:
+        """Whether `employee` has credit for one more pooled task.
+
+        Credit is idle workers, never held tasks, and the distinction is what
+        keeps this from deadlocking. A worker sends WAITING when its *ready
+        queue* empties (worker.py `_get_next_ready_task`), so a task blocked
+        awaiting its own children still counts its worker as idle. Gating on
+        `num_tasks` instead would let blocked parents fill every quota, leaving
+        no capacity to place the very children they wait on -- the credit-loop
+        deadlock that fabrics avoid by separating levels onto their own
+        virtual channels. Here the idle signal already does that separation,
+        because it measures runnable-emptiness rather than emptiness.
+        """
+        if employee.num_idle_workers > 0:
+            return True
+        return employee.pool_debt < self._pool_window(employee)
+
+    def _take_credit(self, employee: RuntimeEmployee) -> None:
+        """Charge one placement to `employee`, from idle first, then credit."""
+        if employee.num_idle_workers > 0:
+            employee.num_idle_workers -= 1
+        else:
+            employee.pool_debt += 1
+        employee.num_tasks += 1
+
+    def repay_pool_credit(self, employee: RuntimeEmployee) -> None:
+        """A completed task repays one unit of overdraft."""
+        if employee.pool_debt > 0:
+            employee.pool_debt -= 1
+
+    def _drain_pool(self) -> None:
+        """Hand pooled tasks out, nearest owner first.
+
+        Preference order, which is the same at both levels:
+
+          1. service class -- critical before speculative, matching the
+             worker's own ready queue so a task keeps its rank as it descends.
+          2. the employee that owns the task's PARENT -- its result then
+             travels straight down instead of going up to the server and back,
+             and the node advances its own blocks rather than servicing others'
+             while its own stall.
+          3. anyone else with room.
+
+        A task is only committed to an employee at the moment that employee has
+        capacity, which is the whole difference between a pool and N private
+        queues.
+        """
+        if _POOL_PREFETCH <= 0 or not self._pool:
+            return
+        batches: dict[int, tuple[RuntimeEmployee, list[RuntimeTask]]] = {}
+        progress = True
+        while self._pool and progress:
+            progress = False
+            _cls, _seq, task = heapq.heappop(self._pool)
+            target = None
+            owner = None
+            if self.is_my_worker(task.return_address.worker_id):
+                owner = self.get_employee_responsible_for(
+                    task.return_address.worker_id,
+                )
+                if self._can_place(owner):
+                    target = owner
+            if target is None:
+                # Round-robin from a rotating cursor rather than a scan from
+                # employee 0: a fixed start biases every placement toward the
+                # low-numbered employees, which is the imbalance the pool is
+                # here to remove.
+                n = len(self.employees)
+                for offset in range(n):
+                    e = self.employees[(self._pool_cursor + offset) % n]
+                    if e is owner:
+                        continue
+                    if self._can_place(e):
+                        target = e
+                        self._pool_cursor = (
+                            self._pool_cursor + offset + 1
+                        ) % n
+                        break
+            if target is None:
+                # Nobody has room; put it back and stop.
+                heapq.heappush(self._pool, (_cls, _seq, task))
+                break
+            batches.setdefault(id(target), (target, []))[1].append(task)
+            self._take_credit(target)
+            progress = True
+
+        # Coalesce before touching the wire. The relay is one select() loop per
+        # level, so a drain that places 1994 tasks costs 1994 pickles if each
+        # goes out on its own -- the same reason a network stack batches rather
+        # than sending a frame per byte. Order within a batch is preserved, so
+        # the service-class ordering out of the heap survives.
+        for employee, batch in batches.values():
+            if len(batch) == 1:
+                self.outgoing.put(
+                    (employee.conn, RuntimeMessage.SUBMIT, batch[0]),
+                )
+            else:
+                self.outgoing.put(
+                    (employee.conn, RuntimeMessage.SUBMIT_BATCH, batch),
+                )
+            # Same read-receipt accounting assign_tasks does: without it a
+            # WAITING that races an in-flight placement is credited as idle
+            # twice.
+            employee.submit_cache.append((batch[0].unique_id, len(batch)))
+
+        self.num_idle_workers = sum(
+            e.num_idle_workers for e in self.employees
+        )
+
+    def pooled_idle_workers(self) -> int:
+        """Idle capacity to advertise upward, net of this node's own backlog.
+
+        A node sitting on a full pool is not idle however many of its workers
+        are momentarily free: reporting them would pull more work toward a node
+        that already has more than it can start, undoing the proportional share
+        that send_up_or_schedule_tasks establishes.
+        """
+        return max(0, self.num_idle_workers - len(self._pool))
+
     def schedule_tasks(self, tasks: Sequence[RuntimeTask]) -> None:
         """Schedule tasks between this node's employees."""
         if len(tasks) == 0:
+            return
+        if _POOL_PREFETCH > 0:
+            for task in tasks:
+                self._pool_seq += 1
+                heapq.heappush(
+                    self._pool, (task.priority, self._pool_seq, task),
+                )
+            self._drain_pool()
             return
         assignments = zip(self.employees, self.assign_tasks(tasks))
         sorted_assignments = sorted(
@@ -684,6 +1013,49 @@ class ServerBase:
         employee.num_idle_workers = adjusted_idle_count
         self.num_idle_workers += (adjusted_idle_count - old_count)
         assert 0 <= self.num_idle_workers <= self.total_workers
+        self._drain_pool()
+        self.broadcast_occupancy()
+
+    def broadcast_occupancy(self) -> None:
+        """Tell the workers directly below how much of this node is idle.
+
+        Lives on ServerBase rather than on Manager because the attached server
+        -- `Compiler(num_workers=N)` -- owns its workers directly, with no
+        manager in between. Without this the signal would exist only in the
+        detached runtime, and every single-node A/B would silently fall back to
+        the estimator while appearing to test the measured path.
+
+        Sent only to employees that are workers. A manager receiving OCCUPANCY
+        from above would have no handler for it, and its own workers already
+        get the count from it rather than from here.
+
+        Throttled: the idle count moves on every task start and finish,
+        thousands per second, while the only consumer -- a pass sizing its own
+        speculation -- reads it once per A* round. The messages are node-local,
+        so they never reach the single-threaded server relay.
+        """
+        now = time.monotonic()
+        if now - self._last_occupancy_bcast < _OCCUPANCY_INTERVAL:
+            return
+        self._last_occupancy_bcast = now
+
+        # Free CORES, not unassigned workers. See _node_busy_fraction: the two
+        # differ threefold in practice, and it is the core count that says how
+        # much extra work the machine can absorb.
+        busy_frac, self._cpu_snapshot = _node_busy_fraction(self._cpu_snapshot)
+        if busy_frac is None:
+            free_cores = self.num_idle_workers
+        else:
+            free_cores = max(
+                self.num_idle_workers,
+                int(round(self.total_workers * (1.0 - busy_frac))),
+            )
+        payload = (self.num_idle_workers, self.total_workers, free_cores)
+        for employee in self.employees:
+            if not employee.is_manager:
+                self.outgoing.put(
+                    (employee.conn, RuntimeMessage.OCCUPANCY, payload),
+                )
 
 
 def parse_ipports(ipports_str: Sequence[str]) -> list[tuple[str, int]]:

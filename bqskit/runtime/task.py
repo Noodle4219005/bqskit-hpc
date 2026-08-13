@@ -10,6 +10,27 @@ import dill
 
 from bqskit.runtime.address import RuntimeAddress
 
+# Service classes for the worker's ready queue. Lower runs first.
+#
+# The queue is FIFO and non-preemptive, which forces a trade nobody wants:
+# speculate shallowly and leave cores idle, or speculate deeply and put
+# speculative work in front of the work that decides the answer. Measured on
+# adder_8 at msz=4, that trade is 59.2% occupancy while LEAP is active on one
+# node, or 0.87x wall once speculation gets ahead of the critical path.
+#
+# A service class breaks the trade rather than tuning a point on it:
+# speculation may go as deep as memory allows -- and memory is absurdly cheap
+# here, 1 GB of stored nodes being worth 77 CPU-hours of recomputation -- while
+# critical work still starts the moment a core frees.
+#
+# Values are spaced so classes can be inserted between them later without
+# renumbering anything already serialised into an in-flight task.
+PRIORITY_CRITICAL = 0
+"""Work the answer waits on. Everything defaults here."""
+
+PRIORITY_SPECULATIVE = 10
+"""Runahead: worth doing when a core would otherwise idle, never before."""
+
 
 class RuntimeTask:
     """
@@ -38,10 +59,19 @@ class RuntimeTask:
         max_logging_depth: int = -1,
         task_name: str | None = None,
         log_context: dict[str, str] = {},
+        priority: int = PRIORITY_CRITICAL,
     ) -> None:
         """Create the task with a new id and return address."""
         RuntimeTask.task_counter += 1
         self.task_id = RuntimeTask.task_counter
+
+        self.priority = priority
+        """Service class for the worker's ready queue; lower runs first.
+
+        Defaulted to PRIORITY_CRITICAL so every existing caller keeps exactly
+        the behaviour it has today: with a single class in play, a queue
+        ordered by (class, arrival) IS the FIFO it replaces.
+        """
 
         self.serialized_fnargs = dill.dumps(fnargs)
         self._fnargs: tuple[Any, Any, Any] | None = None

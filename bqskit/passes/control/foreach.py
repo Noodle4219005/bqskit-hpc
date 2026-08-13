@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import os
 import time
+
+import numpy as np
 from typing import Any
 from typing import Callable
 
@@ -41,6 +44,24 @@ _logger = logging.getLogger(__name__)
 # serial share -- confusing the two is what makes this stage look bigger than
 # it is.
 _FOREACH_PROF_DIR = os.environ.get('BQPROF_FOREACH_DIR')
+
+# Identical block targets are synthesised from scratch, once each.
+#
+# The synthesis input is (target unitary, coupling subgraph, radixes,
+# pass-down data). Measured across 76 connected blocks from three circuit
+# families on two topologies, only 44 of those inputs are distinct -- 42.1%
+# of the synthesis work is bit-for-bit duplicate, and one target recurs nine
+# times. On ham15-med/tokyo it is 71.4% (14 blocks, 4 distinct).
+#
+# The rate is entirely structure-dependent: Hamiltonian and arithmetic
+# circuits repeat heavily, random SU(4) (qv20) repeats 0%.
+#
+# This is the cheapest possible use of memory -- a dict -- against a domain
+# where a node costs 491 ms to evaluate and 1,768 bytes to store, so one GB of
+# stored results stands for 77 CPU-hours of numerical optimisation.
+#
+# Off by default so existing runs stay byte-identical.
+_FOREACH_DEDUP = os.environ.get('BQSKIT_BLOCK_DEDUP') == '1'
 _FOREACH_FH_STATE: dict[str, Any] = {'pid': None, 'fh': None}
 
 
@@ -298,16 +319,49 @@ class ForEachBlockPass(BasePass):
         # order below. The output is unchanged.
         _t_preprocess_end = time.perf_counter()
 
+        # Dispatch one representative per distinct synthesis input.
+        #
+        # `cycles` is NOT part of the key: it only says where the result is
+        # placed, not what is synthesised. Everything the worker actually
+        # consumes is.
+        dedup_index: list[int] = list(range(len(blocks)))
+        unique_positions: list[int] = list(range(len(blocks)))
+        if _FOREACH_DEDUP:
+            first_seen: dict[Any, int] = {}
+            dedup_index = []
+            unique_positions = []
+            for i, (_, op) in enumerate(blocks):
+                digest = hashlib.blake2b(digest_size=16)
+                digest.update(
+                    np.ascontiguousarray(
+                        np.round(np.asarray(op.get_unitary()), 12),
+                    ).tobytes(),
+                )
+                digest.update(repr(sorted(
+                    tuple(sorted(int(q) for q in edge))
+                    for edge in submodels[i].coupling_graph
+                )).encode())
+                digest.update(repr(tuple(submodels[i].radixes)).encode())
+                digest.update(repr(sorted(pass_down_datas[i].items())).encode())
+                key_bytes = digest.digest()
+                if key_bytes in first_seen:
+                    dedup_index.append(first_seen[key_bytes])
+                else:
+                    first_seen[key_bytes] = len(unique_positions)
+                    dedup_index.append(len(unique_positions))
+                    unique_positions.append(i)
+
+        n_dispatch = len(unique_positions)
         future = get_runtime().map(
             _sub_do_work_with_op,
-            [self.workflow] * len(blocks),
-            [op for _, op in blocks],
-            submodels,
-            subnumberings,
-            cycles,
-            [self.calculate_error_bound] * len(blocks),
-            [data.seed] * len(blocks),
-            pass_down_datas,
+            [self.workflow] * n_dispatch,
+            [blocks[i][1] for i in unique_positions],
+            [submodels[i] for i in unique_positions],
+            [subnumberings[i] for i in unique_positions],
+            [cycles[i] for i in unique_positions],
+            [self.calculate_error_bound] * n_dispatch,
+            [data.seed] * n_dispatch,
+            [pass_down_datas[i] for i in unique_positions],
         )
 
         _t_dispatch_end = time.perf_counter()
@@ -327,6 +381,11 @@ class ForEachBlockPass(BasePass):
         _foreach_emit({
             'phase': 'dispatch',
             'n_blocks': len(blocks),
+            # Distinct synthesis inputs actually sent. Equal to n_blocks when
+            # dedup is off; the ratio is the measured duplicate rate, which is
+            # the only honest way to report it -- 42.1% in docs/34 is a STATIC
+            # count over one block set, not a wall-clock saving.
+            'n_dispatch': n_dispatch,
             't_collect': round(_t_collect_end - _t_pass_start, 6),
             't_preprocess': round(_t_preprocess_end - _t_collect_end, 6),
             't_dispatch': round(_t_dispatch_end - _t_preprocess_end, 6),
@@ -345,72 +404,96 @@ class ForEachBlockPass(BasePass):
         error_sum = 0.0
         n_error_rejected = 0
         max_block_error = 0.0
-        num_remaining = num_blocks
+        # Each dispatched result may serve several blocks. Build the reverse
+        # map once so a result can be fanned out as soon as it lands.
+        blocks_of_dispatch: list[list[int]] = [[] for _ in unique_positions]
+        for block_index, dispatch_index in enumerate(dedup_index):
+            blocks_of_dispatch[dispatch_index].append(block_index)
+        num_remaining = len(unique_positions)
 
         while num_remaining > 0:
             _fetched = await get_runtime().next(future)
             _t_chunk = time.perf_counter()
-            for index, result in _fetched:
+            for dispatch_index, result in _fetched:
                 subcircuit, block_data = result
-                completed_subcircuits[index] = subcircuit
-                completed_block_datas[index] = block_data
                 num_remaining -= 1
-
-                if self.calculate_error_bound:
-                    max_block_error = max(max_block_error, block_data.error)
-
-                cycle, op = blocks[index]
-
-                # Mark Blocks to be Replaced
-                if replace_filter(subcircuit, op):
-                    # `not error <= threshold` rather than `error > threshold`
-                    # so that a NaN error is REJECTED. Every comparison
-                    # against NaN is False, so the natural spelling would let
-                    # a block through precisely when its distance could not be
-                    # computed -- the one case where accepting it is least
-                    # defensible.
-                    if (
-                        self.error_threshold is not None
-                        and not block_data.error <= self.error_threshold
-                    ):
-                        n_error_rejected += 1
-                        _logger.warning(
-                            'Block %d rejected by error threshold: measured '
-                            'error %g exceeds threshold %g.',
-                            index,
-                            block_data.error,
-                            self.error_threshold,
-                        )
-                        # Emitted per rejection, not only in the 'complete'
-                        # summary. The summary is written when the pass ends,
-                        # and the runs where this fires are exactly the ones
-                        # that time out inside the pass and never get there --
-                        # the first tokyo attempt recorded one 'dispatch' line
-                        # and nothing else.
-                        _foreach_emit({
-                            'phase': 'error_reject',
-                            'block': index,
-                            'error': block_data.error,
-                            'threshold': self.error_threshold,
-                        })
-                        block_data['replaced'] = False
-                        continue
-
-                    _logger.debug(f'Replacing block {index}.')
-                    replacements[index] = (
-                        CircuitPoint(cycle, op.location[0]),
-                        Operation(
-                            CircuitGate(subcircuit, True),
-                            op.location,
-                            subcircuit.params,
-                        ),
+                targets = blocks_of_dispatch[dispatch_index]
+                # One dispatched result may serve several blocks. Each
+                # gets its own copy and its own postprocessing pass:
+                # the replacement point, the error-threshold decision
+                # and the `replaced` flag are per block, even though the
+                # synthesised circuit is shared.
+                for offset, index in enumerate(targets):
+                    # The first recipient takes the objects; the rest take
+                    # copies. Sharing one Circuit across blocks would let
+                    # a later mutation of one replacement reach the others,
+                    # and sharing one PassData is worse: `replaced` is
+                    # decided per block just below, so every block sharing
+                    # a dispatch would report whatever the LAST one decided.
+                    subcircuit = (
+                        result[0] if offset == 0 else result[0].copy()
                     )
-                    block_data['replaced'] = True
+                    block_data = (
+                        result[1] if offset == 0 else result[1].copy()
+                    )
+                    completed_subcircuits[index] = subcircuit
+                    completed_block_datas[index] = block_data
 
-                    # Calculate Error
-                    error_sum += block_data.error
-                else:
-                    block_data['replaced'] = False
+                    if self.calculate_error_bound:
+                        max_block_error = max(max_block_error, block_data.error)
+
+                    cycle, op = blocks[index]
+
+                    # Mark Blocks to be Replaced
+                    if replace_filter(subcircuit, op):
+                        # `not error <= threshold` rather than `error > threshold`
+                        # so that a NaN error is REJECTED. Every comparison
+                        # against NaN is False, so the natural spelling would let
+                        # a block through precisely when its distance could not be
+                        # computed -- the one case where accepting it is least
+                        # defensible.
+                        if (
+                            self.error_threshold is not None
+                            and not block_data.error <= self.error_threshold
+                        ):
+                            n_error_rejected += 1
+                            _logger.warning(
+                                'Block %d rejected by error threshold: measured '
+                                'error %g exceeds threshold %g.',
+                                index,
+                                block_data.error,
+                                self.error_threshold,
+                            )
+                            # Emitted per rejection, not only in the 'complete'
+                            # summary. The summary is written when the pass ends,
+                            # and the runs where this fires are exactly the ones
+                            # that time out inside the pass and never get there --
+                            # the first tokyo attempt recorded one 'dispatch' line
+                            # and nothing else.
+                            _foreach_emit({
+                                'phase': 'error_reject',
+                                'block': index,
+                                'error': block_data.error,
+                                'threshold': self.error_threshold,
+                            })
+                            block_data['replaced'] = False
+                            continue
+
+                        _logger.debug(f'Replacing block {index}.')
+                        replacements[index] = (
+                            CircuitPoint(cycle, op.location[0]),
+                            Operation(
+                                CircuitGate(subcircuit, True),
+                                op.location,
+                                subcircuit.params,
+                            ),
+                        )
+                        block_data['replaced'] = True
+
+                        # Calculate Error
+                        error_sum += block_data.error
+                    else:
+                        block_data['replaced'] = False
             _postprocess_cpu += time.perf_counter() - _t_chunk
 
         _t_drain_end = time.perf_counter()

@@ -23,3 +23,8 @@ class RuntimeMessage(IntEnum):
     IMPORTPATH = 14
     READY = 15
     COMMUNICATE = 16
+    # Manager -> its own workers: (num_idle_workers, total_workers) for this
+    # node, throttled. Nothing else in the protocol tells a running pass how
+    # much of the machine is currently free, so any pass that sizes its own
+    # parallelism has to assume a number -- and LEAP assumes it owns all of it.
+    OCCUPANCY = 17

@@ -360,7 +360,14 @@ class DetachedServer(ServerBase):
     def handle_result(self, result: RuntimeResult) -> None:
         """Either store the result here or ship it to the destination worker."""
         # Record a task has been completed
-        self.get_employee_responsible_for(result.completed_by).num_tasks -= 1
+        employee = self.get_employee_responsible_for(result.completed_by)
+        employee.num_tasks -= 1
+        self.repay_pool_credit(employee)
+        # A completion frees capacity, which is exactly when the reserve should
+        # move down a level. Without this the server would hold its pool until
+        # the next WAITING, and a manager that merely finished a task -- rather
+        # than running dry -- would not be topped up.
+        self._drain_pool()
 
         # Check if the result is for a client
         if result.return_address.worker_id == -1:

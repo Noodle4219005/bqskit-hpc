@@ -1,11 +1,14 @@
 """This module implements the LEAPSynthesisPass."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import math
 import os
 import time
 from typing import Any
+from typing import NamedTuple
 
 import numpy as np
 from scipy.stats import linregress
@@ -26,6 +29,8 @@ from bqskit.qis.state.state import StateVector
 from bqskit.qis.state.system import StateSystem
 from bqskit.qis.unitary import UnitaryMatrix
 from bqskit.runtime import get_runtime
+from bqskit.runtime.task import PRIORITY_CRITICAL
+from bqskit.runtime.task import PRIORITY_SPECULATIVE
 from bqskit.runtime.future import RuntimeFuture
 from bqskit.utils.typing import is_integer
 from bqskit.utils.typing import is_real_number
@@ -77,9 +82,6 @@ _SPEC_PROBE_K = int(os.environ.get('BQPROF_SPEC_K', '32'))
 # large K while never having measured what a large K costs.
 _SPEC_WINDOW = int(os.environ.get('BQPROF_SPEC_WINDOW', str(_SPEC_PROBE_K)))
 _SPEC_STATE: dict[str, Any] = {}
-
-_CircuitStructureKey = tuple[tuple[Gate, CircuitLocation], ...]
-
 
 def _spec_probe_record(depth: int, rank: int | None) -> None:
     """Count one pop by its position and rank relative to the snapshot.
@@ -149,6 +151,166 @@ def _spec_probe_record(depth: int, rank: int | None) -> None:
 _PREFIX_PROBE_DIR = os.environ.get('BQPROF_PREFIX_DIR')
 _PREFIX_PROBE_K = int(os.environ.get('BQPROF_PREFIX_K', '16'))
 _PREFIX_FH_STATE: dict[str, Any] = {'pid': None, 'fh': None}
+_LTRACE_DIR = os.environ.get('BQPROF_LTRACE')
+
+# One JSON record per synthesis, written at every exit.
+#
+# The aggregate probe writes leapagg_<pid>.json, which sums over every block a
+# worker touched, so in a whole-circuit run it cannot say WHICH block consumed
+# the time. That is the first question to ask about a compute-bound timeout --
+# a few pathological blocks and a uniform cost need opposite fixes -- and it
+# was unanswerable. This record is per synthesis, so it can.
+#
+# It also carries the best-distance trajectory, which answers the question that
+# decides whether a timing-out block is worth more compute at all: a distance
+# still descending when the budget ran out is a budget problem, a distance that
+# plateaued is a stuck search, and no amount of parallelism fixes the second.
+_BLOCKPROF_DIR = os.environ.get('BQPROF_BLOCKPROF')
+
+# Measure how much of the frontier is the SAME circuit reached by a different
+# gate order, before deciding whether merging them is worth building.
+#
+# LEAP appends one two-qubit block per layer, so a node is a SEQUENCE of gate
+# locations. Two sequences that differ only by swapping adjacent gates on
+# disjoint qubits describe the same circuit: they commute, so they span exactly
+# the same set of reachable unitaries. Exploring both is provably wasted work,
+# and unlike a heuristic prune, merging them cannot lose a solution.
+#
+# The canonical representative is the ASAP schedule -- push every gate as early
+# as its qubits allow, then sort within each time step. Two members of a
+# commutation class always produce the same ASAP form.
+_DUPPROBE_DIR = os.environ.get('BQPROF_DUPPROBE')
+
+# Give critical work the front of the queue by emptying it first.
+#
+# On by default because the measured alternative is a 12% regression against
+# stock on a saturated machine. Set BQSKIT_SPEC_YIELD=0 to reproduce the old
+# dispatch-order-only behaviour.
+# Cancel every in-flight speculation before dispatching critical work.
+#
+# This existed because the worker's ready queue was a FIFO: once speculation
+# was queued, critical work could only wait behind it, and the only remedy was
+# to empty the queue. The comment at the cancellation site still says exactly
+# that -- "since the queue cannot be reordered, it is emptied instead".
+#
+# The queue CAN be reordered now. The QoS service classes put critical work
+# ahead of speculation regardless of arrival order, which is the same guarantee
+# without destroying the work: measured, cancellation threw away 67-81% of all
+# speculative tasks, and because it fires every round, speculation never
+# survives longer than one round's gap. That is why occupancy could not climb
+# even when a single block had the whole machine -- the mechanism meant to
+# protect the critical path was also the mechanism capping utilisation.
+#
+# So it defaults to the inverse of QoS: it is the fallback for a runtime whose
+# queue cannot be reordered, and nothing more. BQSKIT_SPEC_YIELD still forces
+# it either way for A/B.
+_SPEC_YIELD_ENV = os.environ.get('BQSKIT_SPEC_YIELD')
+
+# Skip successors whose commutation class has already been generated.
+#
+# LEAP appends one two-qubit block per layer, so a node is a sequence of gate
+# locations, and two sequences differing only by swapping gates on disjoint
+# qubits describe the same circuit. Measured on a 20-qubit msz=4 compile,
+# 31.3% of instantiate calls (weighted by block cost) were such repeats, and
+# the most expensive block was 44.4% -- the waste concentrates exactly where
+# the time goes.
+#
+# This is NOT strictly lossless, and the distinction matters. The templates
+# span the same set of unitaries, so no solution becomes unreachable. But each
+# template instantiates to its own parameters, and its successors continue
+# from those parameters; numerical synthesis is non-convex, so removing one
+# template also removes one starting point for the optimiser. The perturbation
+# is far weaker than a beam, which discards whole regions -- but it is not
+# zero, which is why this is verified on final circuit QUALITY rather than on
+# trace equality, and why it is off by default.
+_COMMUTE_DEDUP = os.environ.get('BQSKIT_COMMUTE_DEDUP') == '1'
+
+# How old an occupancy reading may be before it is treated as unknown. Set to
+# several broadcast intervals: one missed broadcast is normal jitter, but a
+# reading from seconds ago describes a machine that has since emptied or
+# filled, and acting on that is worse than falling back to the estimator.
+_OCCUPANCY_STALE_AFTER = 1.0
+
+# Speculation value bound. Below the floor a speculative task is worth less
+# than whatever it displaces, so K stops growing there regardless of how many
+# cores are free. Warmup exists because a hit rate estimated from three samples
+# would swing K wildly early in a synthesis.
+_SPEC_VALUE_FLOOR = float(os.environ.get('BQSKIT_SPEC_VALUE_FLOOR', '0.02'))
+_SPEC_VALUE_WARMUP = int(os.environ.get('BQSKIT_SPEC_VALUE_WARMUP', '32'))
+
+# Service class actually used for speculation. Set BQSKIT_TASK_QOS=0 to submit
+# speculation as PRIORITY_CRITICAL, which makes the worker's priority queue
+# degenerate to the FIFO it replaced.
+#
+# This exists so an A/B differs in exactly one variable. Comparing this tree
+# against an older snapshot would also change fair-share, the occupancy
+# broadcast and every leap.py edit since -- and an A/B with six differences
+# cannot attribute anything.
+_TASK_QOS = os.environ.get('BQSKIT_TASK_QOS', '1') != '0'
+_SPEC_PRIORITY = PRIORITY_SPECULATIVE if _TASK_QOS else PRIORITY_CRITICAL
+
+# Resolved here because it depends on _TASK_QOS: yield is what a FIFO runtime
+# has to do, and QoS replaces it.
+_SPEC_YIELD = (
+    (_SPEC_YIELD_ENV != '0') if _SPEC_YIELD_ENV is not None else not _TASK_QOS
+)
+
+
+def _commutation_canon(circuit: Circuit) -> tuple[Any, ...]:
+    """Canonical form of a circuit's two-qudit gate order, modulo commutation."""
+    ready: dict[int, int] = {}
+    steps: dict[int, list[tuple[int, ...]]] = {}
+    for op in circuit:
+        if op.num_qudits < 2:
+            continue
+        loc = tuple(sorted(int(q) for q in op.location))
+        step = max((ready.get(q, 0) for q in loc), default=0)
+        steps.setdefault(step, []).append(loc)
+        for q in loc:
+            ready[q] = step + 1
+    return tuple(tuple(sorted(steps[s])) for s in sorted(steps))
+
+
+_CircuitStructureKey = tuple[
+    tuple[Gate, CircuitLocation, tuple[float, ...]],
+    ...,
+]
+
+
+class _SpeculationFlight(NamedTuple):
+    """One dispatched speculation batch that has not been harvested yet.
+
+    Several may be outstanding at once: a batch is refilled as workers free up
+    rather than at batch boundaries, so the flights overlap.
+    """
+
+    future: Any
+    keys: list[Any]
+    batches: list[list[Circuit]]
+    owners: list[tuple[int, int]] | None
+    epoch: int
+    bound_generation: int | None
+    n_tasks: int
+
+
+class _SpeculationMemoEntry(NamedTuple):
+    """One deferred expansion and the logical context that produced it."""
+
+    epoch: int
+    bound_generation: int | None
+    successors: list[Circuit]
+    results: list[Circuit]
+    used: bool
+
+
+def _logical_trace(record: dict[str, Any]) -> None:
+    """Append one logical-search event when the trace probe is enabled."""
+    if not _LTRACE_DIR:
+        return
+    os.makedirs(_LTRACE_DIR, exist_ok=True)
+    path = os.path.join(_LTRACE_DIR, f'ltrace_{os.getpid()}.jsonl')
+    with open(path, 'a', encoding='utf-8') as handle:
+        handle.write(json.dumps(record, separators=(',', ':')) + '\n')
 
 
 def _prefix_probe_record(
@@ -274,6 +436,54 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'spec_misses': 0,
             'spec_evicted': 0,
             'spec_unused': 0,
+            'spec_eventual_hits': 0,
+            'spec_timely_hits': 0,
+            'spec_late': 0,
+            'spec_stale_epoch': 0,
+            # --- HPC accounting ---
+            # critical_stall_s is the metric speculation actually exists to
+            # minimise: seconds the logical search spent blocked on results it
+            # cannot proceed without. Wall clock alone cannot separate "the
+            # search got faster" from "the search waited less"; this can.
+            'critical_stall_s': 0.0,
+            # Work split. Dispatched tasks are also the communication volume:
+            # every task ships a Circuit to a worker and receives one back, so
+            # these counts are message counts, and the op sums are a payload
+            # proxy for how much circuit was actually moved.
+            'critical_tasks': 0,
+            'spec_tasks': 0,
+            'critical_payload_ops': 0,
+            'spec_payload_ops': 0,
+            'dispatch_rounds': 0,
+            # Which width source actually decided K, per round. The occupancy
+            # broadcast is silent when absent -- a run with no manager, or with
+            # a stale reading, falls back to the estimator and looks identical
+            # from the outside. Without these two counters an A/B cannot tell
+            # "the measured path did not help" from "the measured path never
+            # ran", and those have opposite conclusions.
+            'width_from_measured': 0,
+            'width_from_estimator': 0,
+            'idle_seen_sum': 0,
+            # Memory high-water, recorded rather than bounded.
+            'cache_peak_entries': 0,
+            'cache_peak_results': 0,
+            # Contention: mean over rounds of (batch wall / fastest batch
+            # wall). ~1 means this block had the machine to itself; ~N means it
+            # was sharing with about N others.
+            'contention_sum': 0.0,
+            'contention_samples': 0,
+            'stall_throttled_rounds': 0,
+            # Tasks thrown away to clear the queue for critical work, and how
+            # many rounds did it. Together they price the guarantee: if
+            # cancellation is large relative to spec_tasks, speculation is
+            # being issued faster than it can pay off.
+            'spec_cancelled': 0,
+            'spec_yield_rounds': 0,
+            'commute_skipped': 0,
+            # How many separate speculation batches were dispatched. With the
+            # old one-at-a-time rule this equalled the number of rounds that
+            # dispatched at all; a higher count means refill is working.
+            'spec_flights': 0,
             'gdfs_descent_hist': {},
             'gdfs_backtrack_jump_hist': {},
             'gdfs_post_commit_depth_hist': {},
@@ -468,10 +678,10 @@ class LEAPSynthesisPass(SynthesisPass):
         Environment:
             BQSKIT_MAX_ROLLBACKS controls the per-synthesis rollback budget.
             It defaults to BQSKIT_MAX_COMMITTED.
-            BQSKIT_SPECULATE_WIDTH controls ordered speculative expansion.
-            It is read when the pass is constructed and defaults to 1.
+            BQSKIT_EXPAND_K controls ordered speculative expansion. It is
+            read when the pass is constructed; unset disables speculation.
             BQSKIT_SPECULATE_MEMO caps the expansion memo and defaults to four
-            times BQSKIT_SPECULATE_WIDTH.
+            times BQSKIT_EXPAND_K.
             BQSKIT_DEEPEN_TO sets the ceiling for continuing a bounded search
             after it exhausts its current frontier. The bound doubles up to
             this ceiling, retaining children truncated at the old bound.
@@ -574,21 +784,102 @@ class LEAPSynthesisPass(SynthesisPass):
                 % type(parallel_multistart),
             )
 
-        try:
-            speculate_width = int(os.environ.get('BQSKIT_SPECULATE_WIDTH', '1'))
-        except ValueError as err:
+        # K is a resource knob, not a search knob: it decides how far ahead
+        # speculation runs, never which node is popped. 'auto' sizes it from
+        # the worker pool so speculation cannot displace critical work --
+        # with s successors per node and R = s reserving room for one critical
+        # batch, holding (K-1)*s <= W - R gives
+        #
+        #     K <= 1 + (W - s)/s
+        #
+        # so "speculation must never delay mandatory work" is a property of
+        # the construction rather than something to hope for. Any fixed
+        # integer keeps the previous behaviour and is the ablation baseline.
+
+        expand_k_value = os.environ.get('BQSKIT_EXPAND_K')
+        expand_k_auto = False
+        expand_k = 1
+        if expand_k_value is not None:
+            if expand_k_value.strip().lower() == 'auto':
+                expand_k_auto = True
+            else:
+                try:
+                    expand_k = int(expand_k_value)
+                except ValueError as err:
+                    raise ValueError(
+                        "BQSKIT_EXPAND_K must be an integer or 'auto'.",
+                    ) from err
+        if expand_k < 1:
             raise ValueError(
-                'BQSKIT_SPECULATE_WIDTH must be an integer.',
-            ) from err
-        if speculate_width < 1:
-            raise ValueError(
-                'BQSKIT_SPECULATE_WIDTH must be positive, got %d.'
-                % speculate_width,
+                'BQSKIT_EXPAND_K must be positive, got %d.' % expand_k,
             )
 
+        # W. This pass runs inside a worker and cannot see the Compiler's
+        # num_workers, so the width has to be supplied rather than discovered.
+        try:
+            worker_width = int(os.environ.get(
+                'BQSKIT_RUNAHEAD_WORKERS', str(os.cpu_count() or 1),
+            ))
+        except ValueError as err:
+            raise ValueError(
+                'BQSKIT_RUNAHEAD_WORKERS must be an integer.',
+            ) from err
+        if worker_width < 1:
+            raise ValueError(
+                'BQSKIT_RUNAHEAD_WORKERS must be positive, got %d.'
+                % worker_width,
+            )
+
+        # M: the speculative cache budget. Its owner is system memory, not the
+        # search -- evicting an entry only throws away computation, the logical
+        # node is still in the frontier and can be recomputed, so M cannot
+        # change what the search does, only what it costs.
+        #
+        # The previous default of 4*K was far too small and made eviction the
+        # common case rather than the backstop: measured over the qv20/tokyo
+        # sweep it discarded MORE than it served (spec_evicted 48-83 against
+        # spec_hits 52-82). That is the wrong trade in this domain, where a
+        # node costs 491 ms to evaluate and 1,768 bytes to store -- one GB of
+        # stored results stands for 77 CPU-hours of numerical optimisation, so
+        # reclaiming memory here buys a resource that is not scarce with one
+        # that is.
+        #
+        # The cap exists only to stop a runaway, not to save memory.
+        #
+        # It was 8, which was chosen when the memo was sized from K and memory
+        # was treated as scarce. It is not: a node costs 491 ms to evaluate and
+        # 1,768 bytes to store, so a gigabyte of cached results stands for 77
+        # CPU-hours of numerical optimisation. Bounding K to protect memory
+        # traded the resource that is scarce for the one that is not.
+        #
+        # 8 was also measured to be BINDING rather than protective: with s = 3
+        # successors on a sparse 4-qubit block and W = 96, the resource formula
+        # asks for K = 1 + (96-3)/3 = 32, so the cap was discarding three
+        # quarters of the parallelism the machine could have absorbed. The
+        # default is now W itself -- the formula is already bounded by W, so
+        # this only stops a pathological s.
+        try:
+            expand_k_max = int(os.environ.get(
+                'BQSKIT_EXPAND_K_MAX', str(max(1, worker_width)),
+            ))
+        except ValueError as err:
+            raise ValueError(
+                'BQSKIT_EXPAND_K_MAX must be an integer.',
+            ) from err
+        if expand_k_max < 1:
+            raise ValueError(
+                'BQSKIT_EXPAND_K_MAX must be positive, got %d.'
+                % expand_k_max,
+            )
+
+        # Sizing the cache from K was the mistake: it made the cheap resource
+        # (memory) rationed by the expensive one (parallelism). The default is
+        # now effectively unbounded within a synthesis -- `cache_peak_entries`
+        # is recorded instead, so the real high-water mark is a measurement
+        # rather than a guess, and `spec_evicted` should stay 0.
         try:
             speculate_memo = int(os.environ.get(
-                'BQSKIT_SPECULATE_MEMO', str(4 * speculate_width),
+                'BQSKIT_SPECULATE_MEMO', str(1 << 30),
             ))
         except ValueError as err:
             raise ValueError(
@@ -623,9 +914,38 @@ class LEAPSynthesisPass(SynthesisPass):
                 % self.max_rollbacks,
             )
         self.beam_width = beam_width
+        # A beam pops several nodes per round and publishes all of them, so
+        # the K-1 non-best expansions reach the frontier before the serial
+        # search would have expanded their parents at all. That is the
+        # ordering violation runahead exists to avoid, and it silently makes
+        # K a quality knob again, so the two are not allowed to coexist. The
+        # KBFS ablation lives on the expand_k=1 + beam_width=N side.
+        if (expand_k_auto or expand_k >= 2) and beam_width is not None:
+            raise ValueError(
+                'BQSKIT_EXPAND_K >= 2 requires beam_width=None, got '
+                'beam_width=%s. A beam publishes every popped node, which '
+                'reorders the logical search that runahead is required to '
+                'preserve.' % beam_width,
+            )
         self.async_drain = async_drain
         self.parallel_multistart = parallel_multistart
-        self.speculate_width = speculate_width
+        self.expand_k = expand_k
+        # How many of this block's own typical improvement gaps to wait
+        # before treating it as stalled. Below ~2 a normal gap looks like a
+        # stall; far above it the throttle never fires on a real compile.
+        try:
+            self.stall_patience = float(
+                os.environ.get('BQSKIT_STALL_PATIENCE', '3'),
+            )
+        except ValueError as err:
+            raise ValueError(
+                'BQSKIT_STALL_PATIENCE must be a number.',
+            ) from err
+        if self.stall_patience <= 0:
+            raise ValueError('BQSKIT_STALL_PATIENCE must be positive.')
+        self.expand_k_auto = expand_k_auto
+        self.expand_k_max = expand_k_max
+        self.worker_width = worker_width
         self.speculate_memo = speculate_memo
         self.heuristic_function = heuristic_function
         self.layer_gen = layer_generator
@@ -694,8 +1014,20 @@ class LEAPSynthesisPass(SynthesisPass):
 
         def dispatch_batches(
             batches: list[list[Circuit]],
+            task_priority: int = PRIORITY_CRITICAL,
         ) -> tuple[RuntimeFuture, list[tuple[int, int]] | None]:
-            """Dispatch several node expansions in one runtime map."""
+            """Dispatch several node expansions in one runtime map.
+
+            `task_priority` is the worker service class. Speculation passes
+            PRIORITY_SPECULATIVE so it can go as deep as memory allows without
+            ever standing in front of the work the answer waits on: the ready
+            queue is ordered by (class, arrival), so a critical batch submitted
+            after a thousand speculative ones still runs next.
+
+            Without this the two are indistinguishable once queued, and the
+            only lever left is how little to speculate -- which is what capped
+            occupancy at 59.2% while LEAP was active.
+            """
             flat_successors = [
                 successor
                 for batch in batches
@@ -733,6 +1065,7 @@ class LEAPSynthesisPass(SynthesisPass):
                     flat_circuits,
                     [utry] * len(flat_circuits),
                     flat_seeds,
+                    task_priority=task_priority,
                     **single_options,
                 )
                 return future, owner_of_task
@@ -741,6 +1074,7 @@ class LEAPSynthesisPass(SynthesisPass):
                 Circuit.instantiate,
                 flat_successors,
                 target=utry,
+                task_priority=task_priority,
                 **instantiate_options,
             )
             return future, None
@@ -783,19 +1117,140 @@ class LEAPSynthesisPass(SynthesisPass):
                 offset = end
             return results
 
-        def record_spec_metric(metric: str, amount: int = 1) -> None:
+        def record_spec_metric(metric: str, amount: float = 1) -> None:
             """Record ordered-speculation accounting when aggregation is on."""
             if aggregate_enabled:
                 _LEAPWASTE_AGG_STATE[metric] += amount
 
         speculation_memo: dict[
             _CircuitStructureKey,
-            tuple[list[Circuit], list[Circuit], bool],
+            _SpeculationMemoEntry,
         ] = {}
-        speculation_future: RuntimeFuture | None = None
-        speculation_keys: list[_CircuitStructureKey] = []
-        speculation_batches: list[list[Circuit]] = []
-        speculation_owners: list[tuple[int, int]] | None = None
+        speculation_flights: list[_SpeculationFlight] = []
+        epoch = 0
+        # s: successors per node, measured rather than assumed. None until the
+        # first expansion has been seen, which is why round one runs serially.
+        succ_ema: float | None = None
+        _bp_start = time.perf_counter()
+        _bp_traj: list[tuple[float, int, float]] = []
+        # Stall detector. A block that has stopped improving is still paying
+        # for speculation, and on a shared pool that speculation is taken from
+        # blocks that ARE still improving. Measured on a 20-qubit msz=4
+        # compile: the six 4-qubit blocks consumed 90% of the time, and one of
+        # them spent 334 of its 496 seconds after its last improvement.
+        #
+        # The gap between improvements is not constant, so a fixed round count
+        # cannot tell "searching" from "stuck". Comparing the current gap to
+        # this block's OWN typical gap can, and needs no global state: each
+        # block throttles itself, and the pool redistributes automatically
+        # because a block that dispatches less leaves room in the queue.
+        _last_improve_round = 0
+        _gap_ema: float | None = None
+        # Running speculation value, used to cap K by worth rather than by
+        # capacity. See the value bound where effective_k is computed.
+        _spec_issued = 0
+        _spec_hits = 0
+        _dup_seen: set[Any] = set()
+        # The set that matters for savings: canonical forms already SENT TO
+        # instantiate. add_child sees nodes after the expensive part is
+        # already paid, so its duplicate rate is an upper bound on waste, not
+        # a saving. `_commutation_canon` reads only gate locations, never
+        # parameters, so it can be evaluated on a bare successor template --
+        # before instantiate, where skipping actually costs nothing.
+        _dup_pre_seen: set[Any] = set()
+
+        def note_pre_dup(successors: list[Circuit]) -> list[Circuit]:
+            """Count globally, drop locally.
+
+            Measuring and acting need different scopes, and conflating them
+            broke the search. `_dup_pre_seen` accumulates for the whole
+            synthesis, so "has this commutation class been seen before" depends
+            on the order nodes were expanded in -- and speculation expands
+            nodes ahead of the critical path. Speculation therefore populated
+            the set early, and successors the critical path would have kept
+            were dropped instead. T_K = T_1 cannot hold against a filter whose
+            decisions depend on K.
+
+            Measured consequence: rc_adder_6 at msz=4 gave 2Q 81 on four arms
+            and 86 with runahead and commutation dedup together.
+
+            So the global set now only COUNTS -- it is what the probe reports
+            as the total redundancy rate -- while the drop decision uses a set
+            scoped to this one expansion. That set is a pure function of the
+            successor list, which `gen_successors` produces deterministically,
+            so no amount of speculation can change what survives.
+
+            The cost is real and should not be hidden: only repeats WITHIN one
+            node's successors are removed now, not repeats across nodes. The
+            cross-node share of the 31.3% cost-weighted redundancy is given up
+            until the memo can share an instantiate between commutation-
+            equivalent successors without dropping either of them.
+            """
+            if _DUPPROBE_DIR is None and not _COMMUTE_DEDUP:
+                return successors
+            local_seen: set[Any] = set()
+            kept: list[Circuit] = []
+            for _c in successors:
+                _dup_state['pre_generated'] += 1
+                _k = _commutation_canon(_c)
+                # Global: measurement only, never a control decision.
+                if _k in _dup_pre_seen:
+                    _dup_state['pre_dup'] += 1
+                else:
+                    _dup_pre_seen.add(_k)
+                # Local: the only thing allowed to drop a successor.
+                if _COMMUTE_DEDUP:
+                    if _k in local_seen:
+                        record_spec_metric('commute_skipped')
+                        continue
+                    local_seen.add(_k)
+                kept.append(_c)
+            return kept if _COMMUTE_DEDUP else successors
+        _dup_state: dict[str, Any] = {
+            'added': 0, 'dup': 0, 'by_layer': {}, 'dup_by_layer': {},
+            'pre_generated': 0, 'pre_dup': 0,
+        }
+
+        def emit_blockprof(status: str, layer: Any, dist: Any) -> None:
+            """Write this synthesis's cost and best-distance trajectory."""
+            if not _BLOCKPROF_DIR:
+                return
+            try:
+                os.makedirs(_BLOCKPROF_DIR, exist_ok=True)
+                digest = hashlib.blake2b(
+                    np.ascontiguousarray(
+                        np.round(np.asarray(utry), 12),
+                    ).tobytes(), digest_size=8,
+                ).hexdigest()
+                path = os.path.join(
+                    _BLOCKPROF_DIR, f'blockprof_{os.getpid()}.jsonl',
+                )
+                with open(path, 'a', encoding='utf-8') as fh:
+                    fh.write(json.dumps({
+                        'target': digest,
+                        'num_qudits': int(utry.num_qudits),
+                        'status': status,
+                        'wall_s': round(time.perf_counter() - _bp_start, 4),
+                        'final_layer': layer,
+                        'final_dist': None if dist is None else float(dist),
+                        'trajectory': [
+                            [round(t, 4), int(l), float(d)] for t, l, d in _bp_traj
+                        ],
+                        'pre_generated': _dup_state['pre_generated'],
+                        'pre_dup': _dup_state['pre_dup'],
+                        'dup_added': _dup_state['added'],
+                        'dup_hits': _dup_state['dup'],
+                        'dup_by_layer': _dup_state['dup_by_layer'],
+                        'added_by_layer': _dup_state['by_layer'],
+                    }, separators=(',', ':')) + '\n')
+            except Exception:
+                pass
+
+        # Contention estimator. `fastest_batch_s` is the uncontended reference:
+        # the one round that got the machine to itself. Everything slower than
+        # it is other blocks competing for the same workers.
+        fastest_batch_s: float | None = None
+        contention_ema: float = 1.0
 
         def circuit_structure_key(circuit: Circuit) -> _CircuitStructureKey:
             """Return an exact identity for one instantiation input.
@@ -832,28 +1287,54 @@ class LEAPSynthesisPass(SynthesisPass):
 
         def memoize_speculation(
             structure_key: _CircuitStructureKey,
+            dispatch_epoch: int,
+            bound_generation: int | None,
             expansion: tuple[list[Circuit], list[Circuit]],
         ) -> None:
-            """Insert one expansion, evicting the oldest memo entry first."""
-            while len(speculation_memo) >= self.speculate_memo:
+            """Insert one expansion, evicting the oldest entry if over budget.
+
+            Eviction is a memory backstop, never a search decision: the
+            evicted entry's logical node is untouched and will simply be
+            recomputed if it is ever popped. `spec_evicted` should be 0 in a
+            healthy run -- a nonzero count means M is binding and is costing
+            recomputation.
+            """
+            while (
+                structure_key not in speculation_memo
+                and len(speculation_memo) >= self.speculate_memo
+            ):
                 oldest_key = next(iter(speculation_memo))
                 speculation_memo.pop(oldest_key)
                 record_spec_metric('spec_evicted')
-            speculation_memo[structure_key] = (*expansion, False)
+            if aggregate_enabled:
+                _LEAPWASTE_AGG_STATE['cache_peak_entries'] = max(
+                    _LEAPWASTE_AGG_STATE['cache_peak_entries'],
+                    len(speculation_memo) + 1,
+                )
+                _LEAPWASTE_AGG_STATE['cache_peak_results'] = max(
+                    _LEAPWASTE_AGG_STATE['cache_peak_results'],
+                    sum(len(e.results) for e in speculation_memo.values()),
+                )
+            speculation_memo[structure_key] = _SpeculationMemoEntry(
+                dispatch_epoch,
+                bound_generation,
+                *expansion,
+                False,
+            )
 
         def finish_speculation() -> None:
             """Account for and stop speculative work at synthesis exit."""
-            nonlocal speculation_future
+            nonlocal speculation_flights
             record_spec_metric(
                 'spec_unused',
-                sum(not entry[2] for entry in speculation_memo.values())
-                + len(speculation_keys),
+                sum(not entry.used for entry in speculation_memo.values())
+                + sum(len(f.keys) for f in speculation_flights),
             )
             speculation_memo.clear()
-            if speculation_future is not None:
+            for _flight in speculation_flights:
                 # Unfinished speculation must not outlive the synthesis call.
-                get_runtime().cancel(speculation_future)
-                speculation_future = None
+                get_runtime().cancel(_flight.future)
+            speculation_flights = []
 
         # Get layer generator for search
         layer_gen = self._get_layer_gen(data)
@@ -868,6 +1349,19 @@ class LEAPSynthesisPass(SynthesisPass):
 
         def add_child(circuit: Circuit, layer: int) -> bool:
             """Add a child to the frontier or retain it past the bound."""
+            if _DUPPROBE_DIR is not None:
+                _dup_state['added'] += 1
+                _key = _commutation_canon(circuit)
+                if _key in _dup_seen:
+                    _dup_state['dup'] += 1
+                    _dup_state['dup_by_layer'][layer] = (
+                        _dup_state['dup_by_layer'].get(layer, 0) + 1
+                    )
+                else:
+                    _dup_seen.add(_key)
+                _dup_state['by_layer'][layer] = (
+                    _dup_state['by_layer'].get(layer, 0) + 1
+                )
             if current_max_layer is None or layer < current_max_layer:
                 frontier.add(circuit, layer)
                 return True
@@ -911,8 +1405,12 @@ class LEAPSynthesisPass(SynthesisPass):
         # Evalute initial layer
         if best_dist < self.success_threshold:
             _logger.debug('Successful synthesis with 0 layers.')
+            _logical_trace({
+                'event': 'success', 'layer': 0, 'distance': float(best_dist),
+            })
             if aggregate_enabled:
                 _leapwaste_aggregate_finish()
+            emit_blockprof('success_layer0', 0, float(best_dist))
             return initial_layer
 
         # Record layers that have been warned about
@@ -966,12 +1464,18 @@ class LEAPSynthesisPass(SynthesisPass):
                     restored_count, restored_state = frontier.rollback_to(
                         _target,
                     )
+                    epoch += 1
                     last_prefix_layer = (
                         restored_state.get('last_prefix_layer', 0)
                         if isinstance(restored_state, dict)
                         else (restored_state or 0)
                     )
                     n_rollbacks += 1
+                    _logical_trace({
+                        'event': 'rollback',
+                        'index': _target,
+                        'depth': frontier.committed_depth(),
+                    })
                     if aggregate_enabled:
                         # What the depth-burned criterion WOULD have seen, so
                         # the two can be compared without switching yet.
@@ -1004,10 +1508,16 @@ class LEAPSynthesisPass(SynthesisPass):
                 ):
                     # Rollback explores a cheaper different branch at this
                     # depth; only deepen after the rollback budget is spent.
+                    old_max_layer = current_max_layer
                     current_max_layer = min(
                         current_max_layer * 2,
                         self.deepen_to,
                     )
+                    _logical_trace({
+                        'event': 'deepen',
+                        'old_bound': old_max_layer,
+                        'new_bound': current_max_layer,
+                    })
                     for circuit, layer in overflow:
                         frontier.add(circuit, layer)
                     overflow.clear()
@@ -1028,27 +1538,147 @@ class LEAPSynthesisPass(SynthesisPass):
             # commit order.
             beam = self.beam_width
 
+            # K is recomputed every round from the measured successor width.
+            # It only decides how many frontier nodes are speculated on; the
+            # pop below is untouched by it, so any K schedule -- including one
+            # that changes every round -- leaves the logical trace alone. That
+            # is what makes a resource-driven K legitimate rather than a
+            # second search parameter.
+            if self.expand_k_auto:
+                if succ_ema is None:
+                    # Nothing measured yet. Run serially rather than guess a
+                    # width and over-commit the pool on the first round.
+                    effective_k = 1
+                else:
+                    s = max(1, round(succ_ema))
+                    # W is not the pool, it is this block's SHARE of the pool.
+                    # ForEachBlockPass dispatches every block at once, so a
+                    # width taken from the whole machine is claimed N times
+                    # over and speculation starts displacing other blocks'
+                    # critical work -- the very thing the resource rule exists
+                    # to prevent.
+                    #
+                    # Prefer the measured idle count over any estimate. The
+                    # contention estimator below divides by "this batch versus
+                    # the fastest batch this block has seen", and that is blind
+                    # in the one case it has to get right: a block that has
+                    # been contended since its first round has a contended
+                    # fastest, so the ratio sits at 1 and it never throttles.
+                    # An absolute reading of how many workers are free right
+                    # now cannot make that mistake.
+                    #
+                    # This also makes the two mechanisms compose. Reuse is
+                    # always on because it pays in memory, and memory is
+                    # absurdly cheap here -- 1 GB of stored nodes is worth 77
+                    # CPU-hours of recomputation. Speculation then tops up
+                    # whatever idle capacity reuse could not fill, and the
+                    # formula degenerates on its own: saturated means idle ~ 0
+                    # means k = 1 means no speculation. No threshold, no
+                    # policy switch, no hysteresis to tune.
+                    measured_idle = self._measured_idle_workers()
+                    if measured_idle is not None:
+                        share = max(float(s), float(measured_idle))
+                        record_spec_metric('width_from_measured')
+                        record_spec_metric('idle_seen_sum', measured_idle)
+                    else:
+                        share = max(
+                            float(s),
+                            self.worker_width / max(1.0, contention_ema),
+                        )
+                        record_spec_metric('width_from_estimator')
+
+                    # Cap K by what speculation is WORTH, not only by what the
+                    # machine can hold.
+                    #
+                    # Capacity alone is an unbounded rule: the frontier always
+                    # offers another node, so a worker that runs out of
+                    # critical work will always find speculation to do, will
+                    # never report itself idle, and the machine will read 100%
+                    # busy while measured hit rate is 6.3% -- 94% of that
+                    # occupancy is waste. Occupancy becomes a vanity metric the
+                    # moment the work filling it is unbounded.
+                    #
+                    # Value decays geometrically in depth while cost grows
+                    # linearly: reaching depth d needs the search to follow the
+                    # predicted path d times, so the payoff is ~p^d against a
+                    # cost of ~d*s*M. An optimum therefore exists and it is
+                    # small, which means filling every core with speculation is
+                    # provably past it.
+                    #
+                    # p is estimated from this block's own timely hits. Timely,
+                    # not eventual: only a hit that arrives before the critical
+                    # path needs it has shortened anything.
+                    if _spec_issued >= _SPEC_VALUE_WARMUP:
+                        p = _spec_hits / _spec_issued
+                        if p <= 0.0:
+                            value_k = 2.0
+                        else:
+                            # Largest d with p^d above the floor; the floor is
+                            # the point below which a speculative task is worth
+                            # less than the critical task it displaces.
+                            value_k = 1.0 + math.log(
+                                _SPEC_VALUE_FLOOR,
+                            ) / math.log(p)
+                        share = min(share, max(float(s), value_k * s))
+                        record_spec_metric('value_capped')
+                    effective_k = max(
+                        1,
+                        min(
+                            self.expand_k_max,
+                            1 + int((share - s) // s),
+                        ),
+                    )
+            else:
+                effective_k = self.expand_k
+
+            # Give the pool back when this block stops making progress.
+            #
+            # Speculation is a bet that the search will keep moving along the
+            # frontier. Once a block has gone several of its own typical gaps
+            # without a new best, that bet is worth less than the same workers
+            # spent on a block still descending -- so shrink K and let the
+            # queue hand the capacity to whoever is still improving.
+            #
+            # K never affects which node is popped, so throttling changes the
+            # schedule and not the search: T_K = T_1 still holds, and the
+            # block resumes its full width the moment it improves again.
+            if effective_k > 1 and _gap_ema is not None:
+                _since = iteration - _last_improve_round
+                _stall = _since / max(1.0, _gap_ema)
+                if _stall > self.stall_patience:
+                    effective_k = max(
+                        1, int(effective_k / (_stall / self.stall_patience)),
+                    )
+                    record_spec_metric('stall_throttled_rounds')
+
             # Poll at most once per round: RuntimeFuture._done warns that
             # busy-wait polling can deadlock the runtime task.
-            if speculation_future is not None and speculation_future._done:
-                speculative_results = await collect_batches(
-                    speculation_future,
-                    speculation_batches,
-                    speculation_owners,
-                )
-                for structure_key, node_successors, node_results in zip(
-                    speculation_keys,
-                    speculation_batches,
-                    speculative_results,
-                ):
-                    memoize_speculation(
-                        structure_key,
-                        (node_successors, node_results),
+            # Poll each outstanding flight once per round. `_done` is checked
+            # rather than awaited: the runtime has no wait-any across futures,
+            # and awaiting one would block the search on speculation -- the
+            # exact inversion this design forbids.
+            if speculation_flights:
+                still_flying: list[_SpeculationFlight] = []
+                for flight in speculation_flights:
+                    if not flight.future._done:
+                        still_flying.append(flight)
+                        continue
+                    flight_results = await collect_batches(
+                        flight.future, flight.batches, flight.owners,
                     )
-                speculation_future = None
-                speculation_keys = []
-                speculation_batches = []
-                speculation_owners = None
+                    for structure_key, node_successors, node_results in zip(
+                        flight.keys, flight.batches, flight_results,
+                    ):
+                        if flight.epoch != epoch:
+                            record_spec_metric('spec_stale_epoch')
+                            continue
+                        memoize_speculation(
+                            structure_key,
+                            flight.epoch,
+                            flight.bound_generation,
+                            (node_successors, node_results),
+                        )
+                speculation_flights = still_flying
 
             popped = []
             successors = []
@@ -1058,7 +1688,16 @@ class LEAPSynthesisPass(SynthesisPass):
             ] = []
 
             while not frontier.empty():
+                logical_pop_cost = (
+                    frontier.topk_costs(1)[0] if _LTRACE_DIR else 0.0
+                )
                 top_circuit, top_layer = frontier.pop()
+                if _LTRACE_DIR:
+                    _logical_trace({
+                        'event': 'pop',
+                        'cost': float(logical_pop_cost),
+                        'layer': top_layer,
+                    })
 
                 if _GDFS:
                     popped_id = frontier._last_popped_id
@@ -1139,35 +1778,97 @@ class LEAPSynthesisPass(SynthesisPass):
                 # shared loop variable would silently mis-record depth for
                 # every node after the first, and the search would still
                 # look healthy.
-                if self.speculate_width >= 2:
+                if effective_k >= 2:
                     structure_key = circuit_structure_key(top_circuit)
                     memo_entry = speculation_memo.get(structure_key)
+                    if memo_entry is not None and memo_entry.epoch != epoch:
+                        speculation_memo.pop(structure_key)
+                        record_spec_metric('spec_stale_epoch')
+                        memo_entry = None
+
+                    in_flight_batch: list[Circuit] | None = None
+                    for _flight in speculation_flights:
+                        if (
+                            _flight.epoch == epoch
+                            and structure_key in _flight.keys
+                        ):
+                            in_flight_batch = _flight.batches[
+                                _flight.keys.index(structure_key)
+                            ]
+                            break
                     if memo_entry is not None:
-                        node_successors, node_results, _ = memo_entry
-                        speculation_memo[structure_key] = (
-                            node_successors,
-                            node_results,
-                            True,
+                        record_spec_metric('spec_eventual_hits')
+                        node_successors = memo_entry.successors
+                        # A boundary child is logically overflow until the
+                        # bound rises; publishing its speculative result now
+                        # would expose state the bounded serial search cannot.
+                        #
+                        # Only that. Deepening does NOT invalidate E(A): the
+                        # evaluation does not depend on the bound at all, so
+                        # the bound decides *publication eligibility*, never
+                        # *evaluation validity*. Requiring the entry's own
+                        # bound_generation to be set and still current made a
+                        # raise of the bound discard results that remained
+                        # perfectly correct -- throwing away numerical work to
+                        # economise on a resource that is not scarce. The
+                        # field is kept for diagnostics and no longer gates.
+                        bound_is_eligible = (
+                            current_max_layer is None
+                            or top_layer + 1 < current_max_layer
                         )
-                        record_spec_metric('spec_hits')
+                        if bound_is_eligible:
+                            node_results = memo_entry.results
+                            speculation_memo[structure_key] = (
+                                memo_entry._replace(used=True)
+                            )
+                            record_spec_metric('spec_hits')
+                            record_spec_metric('spec_timely_hits')
+                            _spec_hits += 1
+                        else:
+                            node_results = None
+                    elif in_flight_batch is not None:
+                        record_spec_metric('spec_eventual_hits')
+                        record_spec_metric('spec_late')
+                        # Never await speculation for a logical pop. Reuse
+                        # only its immutable templates and submit fresh
+                        # critical instantiations below.
+                        node_successors = in_flight_batch
+                        node_results = None
                     else:
                         node_successors = list(
                             layer_gen.gen_successors(top_circuit, data),
                         )
+                        node_successors = note_pre_dup(node_successors)
                         node_results = None
-                        if node_successors:
-                            record_spec_metric('spec_misses')
+                    if node_results is None and node_successors:
+                        record_spec_metric('spec_misses')
                     popped_expansions.append((node_successors, node_results))
                     successors.extend(node_successors)
                     successor_layers.extend(
                         [top_layer] * len(node_successors),
                     )
+                    n_node_successors = len(node_successors)
                 else:
-                    for successor in layer_gen.gen_successors(
-                        top_circuit, data,
-                    ):
+                    n_node_successors = 0
+                    _plain = note_pre_dup(
+                        list(layer_gen.gen_successors(top_circuit, data)),
+                    )
+                    for successor in _plain:
                         successors.append(successor)
                         successor_layers.append(top_layer)
+                        n_node_successors += 1
+
+                # s, updated on the critical node in BOTH branches. Measuring
+                # it only under expand_k >= 2 would deadlock 'auto': round one
+                # runs serially, so the estimate would never be taken and K
+                # would stay at 1 forever. A node with no successors is a dead
+                # end and says nothing about the typical width, so it is not
+                # allowed to drag the estimate to zero and inflate K.
+                if n_node_successors > 0:
+                    succ_ema = (
+                        float(n_node_successors) if succ_ema is None
+                        else 0.5 * succ_ema + 0.5 * n_node_successors
+                    )
 
                 if beam is None:
                     # Original behaviour: one node per round.
@@ -1179,57 +1880,155 @@ class LEAPSynthesisPass(SynthesisPass):
                     # baseline for the order-preserving form.
                     break
 
-            if self.speculate_width < 2:
+            if effective_k < 2:
                 tasks_dispatched += len(successors)
+                # The K=1 path needs the same accounting as the K>=2 path.
+                # Without it the BASELINE every measurement is compared
+                # against records zero rounds, zero tasks and zero stall,
+                # which makes "did dedup reduce work?" unanswerable -- the
+                # counters existed only on the arm that did not need them.
+                record_spec_metric('critical_tasks', len(successors))
+                record_spec_metric('dispatch_rounds')
+                if aggregate_enabled:
+                    record_spec_metric('critical_payload_ops', sum(
+                        c.num_operations for c in successors
+                    ))
 
             critical_future: RuntimeFuture | None = None
             critical_batches: list[list[Circuit]] = []
             critical_owners: list[tuple[int, int]] | None = None
-            if self.speculate_width >= 2:
+            if effective_k >= 2:
                 critical_batches = [
                     node_successors
                     for node_successors, node_results in popped_expansions
                     if node_results is None and node_successors
                 ]
                 if critical_batches:
+                    # Clear the queue ahead of critical work.
+                    #
+                    # Dispatch ORDER is not enough. The runtime is FIFO and
+                    # non-preemptive -- no priority queue, no wait-any -- so
+                    # speculation dispatched in an earlier round is already
+                    # sitting in front of this batch, and critical work waits
+                    # behind it. On a saturated machine that is the whole
+                    # story: measured on a 20-qubit whole-circuit compile
+                    # where stock already reached peak occupancy 0.998,
+                    # runahead came out at 0.89x -- 12% SLOWER than stock --
+                    # while busy barely moved (0.294 -> 0.313). Speculation
+                    # was not filling idle capacity, it was displacing the
+                    # critical path.
+                    #
+                    # Since the queue cannot be reordered, it is emptied
+                    # instead. Anything already finished was harvested at the
+                    # top of this round, so only partially-executed work is
+                    # lost, and rolling refill re-issues speculation behind
+                    # critical immediately afterwards. Cancelling cannot
+                    # affect correctness: speculative results are advisory,
+                    # and a cancelled one simply becomes a cache miss that is
+                    # recomputed on the critical path if it is ever needed.
+                    if _SPEC_YIELD and speculation_flights:
+                        _cancelled = sum(
+                            f.n_tasks for f in speculation_flights
+                        )
+                        for _flight in speculation_flights:
+                            get_runtime().cancel(_flight.future)
+                        speculation_flights = []
+                        record_spec_metric('spec_cancelled', _cancelled)
+                        record_spec_metric('spec_yield_rounds')
                     # Queue critical work first so workers cannot choose newly
                     # dispatched speculation ahead of the search path.
                     critical_future, critical_owners = dispatch_batches(
                         critical_batches,
                     )
-                    tasks_dispatched += sum(
-                        len(batch) for batch in critical_batches
-                    )
+                    _n = sum(len(batch) for batch in critical_batches)
+                    tasks_dispatched += _n
+                    record_spec_metric('critical_tasks', _n)
+                    record_spec_metric('dispatch_rounds')
+                    if aggregate_enabled:
+                        record_spec_metric('critical_payload_ops', sum(
+                            c.num_operations
+                            for batch in critical_batches for c in batch
+                        ))
 
-                if speculation_future is None:
+                # Refill rather than wait for a batch boundary. The budget
+                # reserves one critical batch (s tasks) at all times, so the
+                # resource rule holds continuously instead of once per batch.
+                _s = max(1, round(succ_ema)) if succ_ema else len(successors)
+                _s = max(1, _s)
+                _in_flight = sum(f.n_tasks for f in speculation_flights)
+                _budget = max(0, (effective_k * _s) - _s - _in_flight)
+                if _budget > 0:
                     queued_keys: set[_CircuitStructureKey] = set()
+                    for _flight in speculation_flights:
+                        queued_keys.update(_flight.keys)
                     next_keys: list[_CircuitStructureKey] = []
                     next_batches: list[list[Circuit]] = []
-                    for _, circuit, _ in frontier.peek(self.speculate_width):
+                    _acc = 0
+                    # Peek PAST the cached prefix, not merely wider than K.
+                    #
+                    # peek() returns the best nodes, and the best nodes are
+                    # exactly the ones speculated in earlier rounds, so they
+                    # are skipped by the two conditions below. Only one node
+                    # leaves the frontier per round, so a K-wide window is
+                    # almost entirely stale: measured at K=32, 31 nodes were
+                    # requested and 1.03 new ones per round were found, a 3.3%
+                    # fill rate that fell as 1/(K-1) -- the signature of a
+                    # window that never reaches past what is already cached.
+                    #
+                    # The window therefore has to clear the cached prefix
+                    # before it starts finding work. Deeper nodes are less
+                    # likely to be popped soon, so H_timely falls, but the
+                    # cache lives for the whole synthesis and an unused
+                    # speculation on an otherwise idle worker costs nothing
+                    # but memory, which is not the scarce resource here.
+                    _peek = len(speculation_memo) + effective_k * 2 + 8
+                    for _, circuit, _ in frontier.peek(_peek):
+                        if _acc >= _budget:
+                            break
                         structure_key = circuit_structure_key(circuit)
+                        memo_entry = speculation_memo.get(structure_key)
                         if (
-                            structure_key in speculation_memo
+                            (
+                                memo_entry is not None
+                                and memo_entry.epoch == epoch
+                            )
                             or structure_key in queued_keys
                         ):
                             continue
                         node_successors = list(
                             layer_gen.gen_successors(circuit, data),
                         )
+                        node_successors = note_pre_dup(node_successors)
                         if not node_successors:
                             continue
+                        if _acc + len(node_successors) > _budget:
+                            break
+                        _acc += len(node_successors)
                         queued_keys.add(structure_key)
                         next_keys.append(structure_key)
                         next_batches.append(node_successors)
 
                     if next_batches:
-                        speculation_future, speculation_owners = (
-                            dispatch_batches(next_batches)
+                        # Count NODES speculated on, matching what a timely
+                        # hit is counted against: one node's speculation either
+                        # gets used before the critical path reaches it, or it
+                        # does not.
+                        _spec_issued += len(next_batches)
+                        _future, _owners = dispatch_batches(
+                            next_batches, _SPEC_PRIORITY,
                         )
-                        speculation_keys = next_keys
-                        speculation_batches = next_batches
-                        tasks_dispatched += sum(
-                            len(batch) for batch in next_batches
-                        )
+                        speculation_flights.append(_SpeculationFlight(
+                            _future, next_keys, next_batches, _owners,
+                            epoch, current_max_layer, _acc,
+                        ))
+                        tasks_dispatched += _acc
+                        record_spec_metric('spec_tasks', _acc)
+                        record_spec_metric('spec_flights')
+                        if aggregate_enabled:
+                            record_spec_metric('spec_payload_ops', sum(
+                                c.num_operations
+                                for batch in next_batches for c in batch
+                            ))
             current_iteration = iteration
             iteration += 1
 
@@ -1273,7 +2072,11 @@ class LEAPSynthesisPass(SynthesisPass):
             t_map_end = None
 
             # Instantiate successors
-            if self.speculate_width >= 2:
+            if effective_k >= 2:
+                # The one wait that cannot be hidden: the logical search
+                # cannot publish until these land. Speculation is judged by how
+                # much of this it removes, not by how busy it keeps the machine.
+                _t_stall = time.perf_counter()
                 pending_results = (
                     await collect_batches(
                         critical_future,
@@ -1282,6 +2085,24 @@ class LEAPSynthesisPass(SynthesisPass):
                     )
                     if critical_future is not None else []
                 )
+                _batch_s = time.perf_counter() - _t_stall
+                record_spec_metric('critical_stall_s', _batch_s)
+                # A critical batch is s tasks that run concurrently when the
+                # machine is free, so its wall time is ~one instantiate. Longer
+                # means the tasks queued behind somebody else.
+                if critical_batches and _batch_s > 0:
+                    if fastest_batch_s is None or _batch_s < fastest_batch_s:
+                        fastest_batch_s = _batch_s
+                    _c = max(1.0, _batch_s / fastest_batch_s)
+                    # Smoothed: one slow round is noise, a sustained rise is a
+                    # neighbour. Falls faster than it rises so the tail is
+                    # picked up quickly rather than being throttled by history.
+                    _w = 0.5 if _c > contention_ema else 0.25
+                    contention_ema = (
+                        (1 - _w) * contention_ema + _w * _c
+                    )
+                    record_spec_metric('contention_sum', contention_ema)
+                    record_spec_metric('contention_samples')
 
                 circuits = []
                 pending_index = 0
@@ -1294,6 +2115,7 @@ class LEAPSynthesisPass(SynthesisPass):
                             node_results = []
                     circuits.extend(node_results)
             elif leapwaste_enabled:
+                _t_stall1 = time.perf_counter()
                 t_map_start = time.time()
                 map_future = get_runtime().map(
                     Circuit.instantiate,
@@ -1304,6 +2126,9 @@ class LEAPSynthesisPass(SynthesisPass):
                 map_id = getattr(map_future, '_bqprof_leapwaste_map_id', None)
                 circuits = await map_future
                 t_map_end = time.time()
+                record_spec_metric(
+                    'critical_stall_s', time.perf_counter() - _t_stall1,
+                )
             elif self.async_drain:
                 # Consume results as they arrive instead of at a barrier.
                 #
@@ -1395,11 +2220,15 @@ class LEAPSynthesisPass(SynthesisPass):
                         best_costs[owner] = candidate_cost
                         circuits[owner] = candidate
             else:
+                _t_stall2 = time.perf_counter()
                 circuits = await get_runtime().map(
                     Circuit.instantiate,
                     successors,
                     target=utry,
                     **instantiate_options,
+                )
+                record_spec_metric(
+                    'critical_stall_s', time.perf_counter() - _t_stall2,
                 )
 
             # Evaluate successors
@@ -1409,6 +2238,11 @@ class LEAPSynthesisPass(SynthesisPass):
                 dist = self.cost.calc_cost(circuit, utry)
 
                 if dist < self.success_threshold:
+                    _logical_trace({
+                        'event': 'success',
+                        'layer': layer + 1,
+                        'distance': float(dist),
+                    })
                     if _GDFS:
                         solutions_in_round = 1
                         for remaining in circuits[win_index + 1:]:
@@ -1473,9 +2307,26 @@ class LEAPSynthesisPass(SynthesisPass):
                                 'deepen_solved_after_raise'
                             ] += 1
                         _leapwaste_aggregate_finish()
+                    emit_blockprof('success', layer + 1, float(dist))
                     return circuit
 
                 if self.check_new_best(layer + 1, dist, best_layer, best_dist):
+                    _logical_trace({
+                        'event': 'new_best',
+                        'layer': layer + 1,
+                        'distance': float(dist),
+                    })
+                    if _BLOCKPROF_DIR:
+                        _bp_traj.append(
+                            (time.perf_counter() - _bp_start,
+                             layer + 1, float(dist)),
+                        )
+                    _gap = iteration - _last_improve_round
+                    _gap_ema = (
+                        float(_gap) if _gap_ema is None
+                        else 0.6 * _gap_ema + 0.4 * _gap
+                    )
+                    _last_improve_round = iteration
                     plural = '' if layer == 0 else 's'
                     _logger.debug(
                         f'New best circuit found with {layer + 1} layer{plural}'
@@ -1493,6 +2344,9 @@ class LEAPSynthesisPass(SynthesisPass):
                         last_prefix_layer,
                     ):
                         _logger.debug(f'Prefix formed at {layer + 1} layers.')
+                        _logical_trace({
+                            'event': 'prefix', 'layer': layer + 1,
+                        })
                         if leapwaste_enabled:
                             prefix_formed = True
                             n_cleared = len(frontier)
@@ -1566,6 +2420,10 @@ class LEAPSynthesisPass(SynthesisPass):
                             'last_prefix_layer': last_prefix_layer,
                             'regret': _regret,
                             'layer': layer + 1,
+                        })
+                        _logical_trace({
+                            'event': 'commit',
+                            'depth': frontier.committed_depth(),
                         })
                         last_prefix_layer = layer + 1
                         if add_child(circuit, layer + 1):
@@ -1674,6 +2532,10 @@ class LEAPSynthesisPass(SynthesisPass):
         if aggregate_enabled:
             _LEAPWASTE_AGG_STATE['n_exhausted_unverified'] += 1
             _leapwaste_aggregate_finish()
+        # The exit that matters for a timeout: the search ran out of room
+        # rather than finding a verified answer, so the trajectory recorded
+        # here is the evidence for whether more budget would have helped.
+        emit_blockprof('exhausted', best_layer, float(best_dist))
         return best_circ
 
     def check_new_best(
@@ -1768,6 +2630,44 @@ class LEAPSynthesisPass(SynthesisPass):
         if self.max_layer is None or self.min_prefix_fraction is None:
             return self.min_prefix_size
         return max(1, int(self.max_layer * self.min_prefix_fraction))
+
+    def _measured_idle_workers(self) -> int | None:
+        """How much of this node is free right now, in cores, or None.
+
+        Free CORES, not unassigned workers. Sizing speculation from the worker
+        count under-committed the machine threefold -- LEAP saw 15.5 idle of
+        112 while 41% of the cores were not computing -- and that is what
+        pinned occupancy at 59%.
+
+        The manager broadcasts (idle, total) into the worker cache every
+        ``_OCCUPANCY_INTERVAL`` seconds. None means the reading is unavailable
+        or stale, and callers must then fall back to whatever they did before
+        -- None is "unknown", never "nothing is free". Reading absent-as-zero
+        would disable speculation in every attached run, where no manager
+        exists to broadcast at all.
+
+        Staleness matters more than precision here: a reading from several
+        seconds ago describes a machine that has since emptied or filled, and
+        acting on it is worse than acting on the estimator, which is at least
+        derived from this block's own current behaviour.
+        """
+        try:
+            cache = get_runtime().get_cache()
+        except Exception:
+            return None
+        entry = cache.get('__bqskit_occupancy__')
+        if not entry:
+            return None
+        try:
+            if len(entry) >= 4:
+                _idle, _total, free, stamp = entry[:4]
+            else:
+                free, _total, stamp = entry[:3]
+        except (TypeError, ValueError):
+            return None
+        if time.monotonic() - stamp > _OCCUPANCY_STALE_AFTER:
+            return None
+        return int(free)
 
     def _get_layer_gen(self, data: PassData) -> LayerGenerator:
         """
