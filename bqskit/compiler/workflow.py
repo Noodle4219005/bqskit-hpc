@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
+import time
+from typing import Any
 from typing import Iterable
 from typing import Iterator
 from typing import overload
@@ -22,6 +25,36 @@ if TYPE_CHECKING:
 
 
 _logger = logging.getLogger(__name__)
+
+_PASSLINE_DIR = os.environ.get('BQSKIT_PASSLINE_DIR')
+"""Directory for the pass timeline; unset disables the probe entirely.
+
+The DEBUG log line above already names each pass, but it travels the runtime's
+log-forwarding path, which means turning it on also turns on every other DEBUG
+record in the system. This writes one line per pass boundary straight to disk
+instead, so a 40%-idle stretch can be mapped onto the pass that owns it.
+"""
+
+_passline_fh: Any = None
+
+
+def _passline(name: str, edge: str, circuit: Any) -> None:
+    """Append one pass-boundary record. Handle opened once, never per call.
+
+    Opening a file per event once turned a 7 s smoke test into 2 minutes; the
+    handle is cached and the payload is a single short line.
+    """
+    global _passline_fh
+    if _passline_fh is None:
+        os.makedirs(_PASSLINE_DIR, exist_ok=True)
+        _passline_fh = open(
+            os.path.join(_PASSLINE_DIR, f'passline_{os.getpid()}.jsonl'),
+            'a', buffering=1,
+        )
+    _passline_fh.write(
+        '{"t": %.4f, "pid": %d, "pass": "%s", "edge": "%s", "gates": %d}\n'
+        % (time.time(), os.getpid(), name, edge, circuit.num_operations)
+    )
 
 
 class Workflow(BasePass, Sequence[BasePass]):
@@ -72,7 +105,11 @@ class Workflow(BasePass, Sequence[BasePass]):
             if data.seed is not None:
                 seed_random_sources(data.seed)
             _logger.debug(f'Running {pass_obj.name}')
+            if _PASSLINE_DIR:
+                _passline(pass_obj.name, 'enter', circuit)
             await pass_obj.run(circuit, data)
+            if _PASSLINE_DIR:
+                _passline(pass_obj.name, 'exit', circuit)
 
     def save(self, filename: str) -> None:
         import pickle
