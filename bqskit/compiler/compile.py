@@ -1430,8 +1430,28 @@ def build_gate_deletion_optimization_workflow(
     )
 
     if iterative:
+        # ChangePredicate stops only when the circuit stops changing AT ALL,
+        # including single-qudit reshuffles. Measured on qv_N060 (job 1022790):
+        # this loop runs 29 times and owns 90.7% of the wall, while total gates
+        # go 58457 -> 48083 -- and a prior measurement (job 1019430) found the
+        # scan succeeds on 2 of 4612 multi-qudit removal attempts, 0.04%. So
+        # nearly all of that wall buys single-qudit gates.
+        #
+        # GateCountPredicate('multi') is what the resynthesis loop already
+        # uses, and it stops as soon as the multi-qudit count stops falling --
+        # which is the quantity this project is judged on.
+        deletion_predicate = os.environ.get('BQSKIT_DELETION_PREDICATE', '')
+        if deletion_predicate == 'multi':
+            predicate = GateCountPredicate('multi')
+        elif deletion_predicate in ('', 'change'):
+            predicate = ChangePredicate()  # type: ignore[assignment]
+        else:
+            raise ValueError(
+                'BQSKIT_DELETION_PREDICATE must be "change" or "multi", got '
+                f'{deletion_predicate!r}.',
+            )
         return Workflow(
-            WhileLoopPass(ChangePredicate(), core_workflow),
+            WhileLoopPass(predicate, core_workflow),
             name='Iterative Gate Deletion Optimization',
         )
 
