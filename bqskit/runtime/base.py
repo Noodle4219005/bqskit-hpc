@@ -67,6 +67,12 @@ except ValueError:
     raise ValueError('BQSKIT_RESERVE_CORES must be an integer')
 
 _PIN_WORKERS = os.environ.get('BQSKIT_PIN_WORKERS', '0') != '0'
+
+try:
+    _OUTGOING_WINDOW_S = float(os.environ.get('BQSKIT_OUTGOING_WINDOW', '0'))
+except ValueError:
+    raise ValueError('BQSKIT_OUTGOING_WINDOW must be a number')
+"""Seconds between outgoing-queue reports; 0 disables them entirely."""
 """Pin each worker to one core. Separated from _RESERVE_CORES so the two
 effects can be told apart: reserving without pinning is not expressible, so a
 reserve arm otherwise changes two things at once."""
@@ -548,20 +554,44 @@ class ServerBase:
         but only worth fixing if the wire is actually the constraint, so the
         depth is sampled here and reported rather than assumed.
         """
-        sent = 0
-        qmax = 0
-        qsum = 0
+        # Windowed, on a wall-clock cadence, broken down by message type.
+        # The first version reported a mean since process start every 20000
+        # messages, which is wrong in both axes: a cumulative mean cannot show
+        # what the queue is doing now, and a message-count cadence goes SPARSE
+        # exactly when the system starves -- at 200 msg/s it reports every
+        # 100 s, and the idle stretches being diagnosed are 28 s long.
+        window = _OUTGOING_WINDOW_S
+        w_start = time.monotonic()
+        w_n = 0
+        w_qsum = 0
+        w_qmax = 0
+        w_kind: dict[int, int] = {}
+        w_tasks = 0
         while True:
             depth = self.outgoing.qsize()
-            qmax = max(qmax, depth)
-            qsum += depth
-            sent += 1
-            if sent % 20000 == 0:
-                _logger.info(
-                    'outgoing depth: mean %.1f max %d over %d messages.',
-                    qsum / sent, qmax, sent,
+            w_qmax = max(w_qmax, depth)
+            w_qsum += depth
+            w_n += 1
+            now = time.monotonic()
+            if window > 0 and now - w_start >= window:
+                span = now - w_start
+                kinds = ' '.join(
+                    f'{RuntimeMessage(k).name}={v}'
+                    for k, v in sorted(w_kind.items(), key=lambda kv: -kv[1])
                 )
+                _logger.info(
+                    'outgoing %.1fs: %.0f msg/s depth mean %.1f max %d '
+                    'tasks %d | %s',
+                    span, w_n / span, w_qsum / w_n, w_qmax, w_tasks, kinds,
+                )
+                w_start, w_n, w_qsum, w_qmax = now, 0, 0, 0
+                w_kind, w_tasks = {}, 0
             outgoing = self.outgoing.get()
+            w_kind[int(outgoing[1])] = w_kind.get(int(outgoing[1]), 0) + 1
+            if outgoing[1] == RuntimeMessage.SUBMIT_BATCH:
+                w_tasks += len(outgoing[2])
+            elif outgoing[1] == RuntimeMessage.SUBMIT:
+                w_tasks += 1
 
             if not self.running:
                 # NodeBase's handle_shutdown will put a dummy value in the
