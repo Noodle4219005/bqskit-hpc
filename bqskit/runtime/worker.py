@@ -37,6 +37,14 @@ from bqskit.runtime.task import RuntimeTask
 
 _logger = logging.getLogger(__name__)
 
+_TASKLOG_DIR = os.environ.get('BQSKIT_TASKLOG_DIR')
+"""Directory for the per-step task log; unset disables the probe entirely.
+
+Records (worker, start, end, service class, own-or-borrowed, block) so a
+per-core timeline can be reconstructed. /proc/stat says a core was busy; only
+this says with what.
+"""
+
 # Where a manager's occupancy broadcast is parked for the passes running on
 # this worker. Read it with:
 #
@@ -199,6 +207,7 @@ class Worker:
         """Tracks all started, unfinished tasks on this worker."""
 
         self._delayed_tasks: list[RuntimeTask] = []
+        self._tasklog_fh: Any = None
         """
         Store all delayed tasks in LIFO order.
 
@@ -588,8 +597,18 @@ class Worker:
         try:
             self._active_task = task
 
+            # One record per step: who ran, for how long, on whose work, at
+            # which service class, and under which block. Without this the
+            # only per-core signal is /proc/stat, which says a core was busy
+            # but never says with what -- so "did the mechanism work" can only
+            # be answered in aggregate, never per core over time.
+            _t0 = time.monotonic() if _TASKLOG_DIR else 0.0
+
             # Perform a step of the task and get the future it awaits on
             future = task.step(self._get_desired_result(task))
+
+            if _TASKLOG_DIR:
+                self._tasklog(task, _t0, time.monotonic())
 
             self._process_await(task, future)
 
@@ -607,6 +626,34 @@ class Worker:
 
         finally:
             self._active_task = None
+
+    def _tasklog(self, task: RuntimeTask, t0: float, t1: float) -> None:
+        """Append one step record. Handle opened once, buffered, never per call.
+
+        Four categories fall out of two fields the runtime already carries:
+        `priority` (0 critical / 10 speculative) and `return_address.worker_id`
+        (the worker whose work this is). Own vs borrowed is exactly whether
+        that id is this worker's.
+
+        `breadcrumbs[0]` is the outermost ancestor, which identifies the block
+        this step belongs to, so block boundaries are recoverable rather than
+        assumed.
+        """
+        if self._tasklog_fh is None:
+            os.makedirs(_TASKLOG_DIR, exist_ok=True)
+            self._tasklog_fh = open(
+                os.path.join(_TASKLOG_DIR, f'task_{self._id}.jsonl'),
+                'a', buffering=1 << 16,
+            )
+        owner = task.return_address.worker_id
+        bc = task.breadcrumbs
+        block = f'{bc[0].worker_id}:{bc[0].mailbox_index}' if bc else '-'
+        self._tasklog_fh.write(
+            '{"w":%d,"t0":%.6f,"t1":%.6f,"pri":%d,"mine":%d,"blk":"%s",'
+            '"fn":"%s"}\n'
+            % (self._id, t0, t1, task.priority, int(owner == self._id),
+               block, task._name)
+        )
 
     def _process_await(self, task: RuntimeTask, future: RuntimeFuture) -> None:
         """Process a task's await request."""

@@ -225,6 +225,9 @@ _SPEC_YIELD_ENV = os.environ.get('BQSKIT_SPEC_YIELD')
 # trace equality, and why it is off by default.
 _COMMUTE_DEDUP = os.environ.get('BQSKIT_COMMUTE_DEDUP') == '1'
 
+_TASKLOG_DIR = os.environ.get('BQSKIT_TASKLOG_DIR')
+"""Same switch as the worker probe; unset disables memo events."""
+
 # How old an occupancy reading may be before it is treated as unknown. Set to
 # several broadcast intervals: one missed broadcast is normal jitter, but a
 # reading from seconds ago describes a machine that has since emptied or
@@ -1118,9 +1121,36 @@ class LEAPSynthesisPass(SynthesisPass):
             return results
 
         def record_spec_metric(metric: str, amount: float = 1) -> None:
-            """Record ordered-speculation accounting when aggregation is on."""
+            """Record ordered-speculation accounting when aggregation is on.
+
+            When BQSKIT_TASKLOG_DIR is set this also emits a timestamped event,
+            so the memo's contents can be replayed rather than summarised. The
+            counters say how many hits there were; the event stream says *when*
+            each entry was computed, when it was used, and when it went stale --
+            which is the only way to see whether a speculative result arrived
+            before the critical path needed it.
+            """
             if aggregate_enabled:
                 _LEAPWASTE_AGG_STATE[metric] += amount
+            if _memo_ev is not None and metric.startswith('spec_'):
+                _memo_ev(metric, len(speculation_memo))
+
+        # Per-block memo event stream. One line per memo transition, with the
+        # memo's size at that moment, so a replay can show what the cache held
+        # rather than only how many times it was hit.
+        _memo_ev = None
+        if _TASKLOG_DIR:
+            _blk = '%x' % (abs(hash(utry)) & 0xFFFFFF)
+            _mf = open(
+                os.path.join(_TASKLOG_DIR, f'memo_{os.getpid()}.jsonl'),
+                'a', buffering=1 << 16,
+            )
+
+            def _memo_ev(ev: str, size: int) -> None:
+                _mf.write(
+                    '{"t":%.6f,"blk":"%s","ev":"%s","n":%d}\n'
+                    % (time.time(), _blk, ev, size)
+                )
 
         speculation_memo: dict[
             _CircuitStructureKey,
@@ -1315,6 +1345,8 @@ class LEAPSynthesisPass(SynthesisPass):
                     _LEAPWASTE_AGG_STATE['cache_peak_results'],
                     sum(len(e.results) for e in speculation_memo.values()),
                 )
+            if _memo_ev is not None:
+                _memo_ev('spec_insert', len(speculation_memo) + 1)
             speculation_memo[structure_key] = _SpeculationMemoEntry(
                 dispatch_epoch,
                 bound_generation,
