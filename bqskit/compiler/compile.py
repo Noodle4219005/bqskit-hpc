@@ -834,6 +834,37 @@ def _circuit_workflow(
     return Workflow(workflow, name='Off-the-Shelf Circuit Compilation')
 
 
+def _multistarts_override(default: int) -> int:
+    """Let BQSKIT_MULTISTARTS raise the numerical-optimisation start count.
+
+    This is the one quality knob that lives entirely inside LEAP's parallel
+    section: more random starts per instantiate means more chances to land in a
+    good local minimum, so LEAP terminates at a shallower circuit -- and the
+    extra work is embarrassingly parallel, unlike partition and unfold, which
+    are single-process (measured: 211.9 s + 134.4 s serial on qv_N060).
+
+    Note that instantiate options are shared with the gate-removal scan, so
+    raising this without also setting BQSKIT_DELETION_PREDICATE=multi makes the
+    90.7% of wall that scan already owns proportionally worse.
+
+    `scripts/scaling_client.py --multistarts` does NOT reach here: it only
+    applies to the 'maxquality' workflow, so every measurement taken with
+    'official' has run at the stock value for its optimization level.
+    """
+    text = os.environ.get('BQSKIT_MULTISTARTS')
+    if text is None:
+        return default
+    try:
+        value = int(text)
+    except ValueError as err:
+        raise ValueError(
+            f'BQSKIT_MULTISTARTS must be an integer, got {text!r}.',
+        ) from err
+    if value < 1:
+        raise ValueError(f'BQSKIT_MULTISTARTS must be >= 1, got {value}.')
+    return value
+
+
 def get_instantiate_options(optimization_level: int) -> dict[str, Any]:
     """
     Return good default instantiate options based on an optimization level.
@@ -849,7 +880,7 @@ def get_instantiate_options(optimization_level: int) -> dict[str, Any]:
     """
     if optimization_level == 1:
         return {
-            'multistarts': 1,
+            'multistarts': _multistarts_override(1),
             'ftol': 1e-6,
             'gtol': 1e-10,
             'diff_tol_r': 1e-4,
@@ -859,7 +890,7 @@ def get_instantiate_options(optimization_level: int) -> dict[str, Any]:
 
     elif optimization_level == 2:
         return {
-            'multistarts': 2,
+            'multistarts': _multistarts_override(2),
             'ftol': 5e-12,
             'gtol': 1e-14,
             'diff_tol_r': 1e-5,
@@ -869,7 +900,7 @@ def get_instantiate_options(optimization_level: int) -> dict[str, Any]:
 
     elif optimization_level == 3:
         return {
-            'multistarts': 4,
+            'multistarts': _multistarts_override(4),
             'ftol': 5e-16,
             'gtol': 1e-15,
             'diff_tol_r': 5e-5,
@@ -879,7 +910,7 @@ def get_instantiate_options(optimization_level: int) -> dict[str, Any]:
 
     elif optimization_level == 4:
         return {
-            'multistarts': 8,
+            'multistarts': _multistarts_override(8),
             'ftol': 5e-16,
             'gtol': 1e-15,
             'diff_tol_r': 1e-6,
@@ -1807,7 +1838,7 @@ def _stateprep_workflow(
 
     if optimization_level == 1:
         inst_ops = {
-            'multistarts': 1,
+            'multistarts': _multistarts_override(1),
             'method': 'minimization',
             'minimizer': LBFGSMinimizer(),
         }
@@ -1821,7 +1852,7 @@ def _stateprep_workflow(
 
     elif optimization_level == 2:
         inst_ops = {
-            'multistarts': 4,
+            'multistarts': _multistarts_override(4),
             'method': 'minimization',
             'ftol': 5e-12,
             'gtol': 1e-14,
@@ -1835,7 +1866,7 @@ def _stateprep_workflow(
 
     elif optimization_level == 3:
         inst_ops = {
-            'multistarts': 8,
+            'multistarts': _multistarts_override(8),
             'method': 'minimization',
             'ftol': 5e-16,
             'gtol': 1e-15,
@@ -1856,7 +1887,7 @@ def _stateprep_workflow(
 
     elif optimization_level == 4:
         inst_ops = {
-            'multistarts': 8,
+            'multistarts': _multistarts_override(8),
             'method': 'minimization',
             'ftol': 5e-16,
             'gtol': 1e-15,
@@ -1908,7 +1939,7 @@ def _statemap_workflow(
 
     if optimization_level == 1:
         inst_ops = {
-            'multistarts': 1,
+            'multistarts': _multistarts_override(1),
             'method': 'minimization',
         }
         synthesis: SynthesisPass = LEAPSynthesisPass(
@@ -1920,7 +1951,7 @@ def _statemap_workflow(
 
     elif optimization_level == 2:
         inst_ops = {
-            'multistarts': 4,
+            'multistarts': _multistarts_override(4),
             'method': 'minimization',
             'ftol': 5e-12,
             'gtol': 1e-14,
@@ -1934,7 +1965,7 @@ def _statemap_workflow(
 
     elif optimization_level == 3:
         inst_ops = {
-            'multistarts': 8,
+            'multistarts': _multistarts_override(8),
             'method': 'minimization',
             'ftol': 5e-16,
             'gtol': 1e-15,
@@ -1955,7 +1986,7 @@ def _statemap_workflow(
 
     elif optimization_level == 4:
         inst_ops = {
-            'multistarts': 8,
+            'multistarts': _multistarts_override(8),
             'method': 'minimization',
             'ftol': 5e-16,
             'gtol': 1e-15,
