@@ -45,6 +45,10 @@ _OCCUPANCY_INTERVAL = 0.1
 
 _PIN_WORKERS = os.environ.get('BQSKIT_PIN_WORKERS', '0') != '0'
 
+# Drains between pool statistics lines. Frequent enough to survive a SIGTERM
+# that never runs an exit handler, rare enough not to flood the log.
+_POOL_STAT_EVERY = int(os.environ.get('BQSKIT_POOL_STAT_EVERY', '2000'))
+
 
 def _node_busy_fraction(prev: tuple[float, float] | None) -> tuple[
     float | None, tuple[float, float] | None,
@@ -220,6 +224,12 @@ class ServerBase:
         self._pool_drains = 0
         self._pool_depth_sum = 0
         self._pool_depth_max = 0
+        # How often the owner-first branch could fire, and did. The owner is
+        # the worker that submitted these children and is still running them,
+        # so it is not idle at dispatch time -- this counts whether that makes
+        # the preference unreachable in practice.
+        self._pool_owner_eligible = 0
+        self._pool_owner_hit = 0
 
         self._cpu_snapshot: tuple[float, float] | None = None
         """Previous (busy, total) jiffies, for the free-core measurement."""
@@ -759,6 +769,23 @@ class ServerBase:
         self._pool_depth_sum += _depth_in
         if _depth_in > self._pool_depth_max:
             self._pool_depth_max = _depth_in
+        # Emitted DURING the run, every _POOL_STAT_EVERY drains, not at
+        # shutdown. The first version logged in handle_shutdown and printed
+        # nothing at all: srun kills the manager with SIGTERM, base.py only
+        # registers a SIGINT handler, so handle_shutdown never runs and
+        # "Shutting down node" appears zero times in a completed job's log.
+        if self._pool_drains % _POOL_STAT_EVERY == 0:
+            _logger.info(
+                'pool: %d drains, depth mean %.2f max %d, '
+                'owner %d/%d (%.1f%%)',
+                self._pool_drains,
+                self._pool_depth_sum / self._pool_drains,
+                self._pool_depth_max,
+                self._pool_owner_hit,
+                self._pool_owner_eligible,
+                100.0 * self._pool_owner_hit
+                / max(1, self._pool_owner_eligible),
+            )
         batches: dict[int, tuple[RuntimeEmployee, list[RuntimeTask]]] = {}
         progress = True
         while self._pool and progress:
@@ -770,8 +797,10 @@ class ServerBase:
                 owner = self.get_employee_responsible_for(
                     task.return_address.worker_id,
                 )
+                self._pool_owner_eligible += 1
                 if owner.num_idle_workers > 0:
                     target = owner
+                    self._pool_owner_hit += 1
             if target is None:
                 # Round-robin from a rotating cursor rather than a scan from
                 # employee 0: a fixed start biases every placement toward the
