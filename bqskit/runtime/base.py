@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import abc
 import functools
+# ==================== HPC: shared queue ============================================
 import heapq
+# ===================================================================================
 import logging
 import os
 import random
@@ -37,30 +39,18 @@ from bqskit.runtime.worker import start_worker
 
 _logger = logging.getLogger(__name__)
 
-# Seconds between occupancy broadcasts. The only consumer decides once per A*
-# round -- hundreds of milliseconds -- so a tenth of a second is already finer
-# than anything that reads it, while the idle count itself moves thousands of
-# times a second.
+# ==================== HPC: occupancy broadcast =====================================
 _OCCUPANCY_INTERVAL = 0.1
-
+# ===================================================================================
+# ==================== HPC: worker pinning ==========================================
 _PIN_WORKERS = os.environ.get('BQSKIT_PIN_WORKERS', '0') != '0'
+# ===================================================================================
 
-
+# ==================== HPC: occupancy broadcast =====================================
 def _node_busy_fraction(prev: tuple[float, float] | None) -> tuple[
     float | None, tuple[float, float] | None,
 ]:
-    """Busy fraction of this node's cores since `prev`, and a new snapshot.
-
-    `num_idle_workers` counts workers with nothing ASSIGNED, which is not the
-    same as cores doing nothing, and the gap is large: measured on adder_8 at
-    msz=4, LEAP saw 15.5 idle workers out of 112 while 41% of the cores -- about
-    46 of them -- were not computing. Sizing speculation from the worker count
-    therefore under-committed the machine threefold and pinned occupancy at 59%.
-
-    Reading /proc/stat costs one file read per broadcast and measures the thing
-    the decision is actually about. On a node shared with another job it
-    under-reports free capacity, which is the safe direction.
-    """
+    """Return busy-core fraction since `prev` and a new snapshot."""
     try:
         with open('/proc/stat', encoding='ascii') as fh:
             parts = fh.readline().split()
@@ -72,8 +62,7 @@ def _node_busy_fraction(prev: tuple[float, float] | None) -> tuple[
     while len(v) < 8:
         v.append(0.0)
     user, nice, system, idle, iowait, irq, softirq, steal = v
-    # iowait is not work; counting it as busy would make a starved machine look
-    # fed, which is the exact error this whole measurement exists to avoid.
+    # I/O wait is not work, so do not count it as busy.
     busy = user + nice + system + irq + softirq
     total = busy + idle + iowait + steal
     now = (busy, total)
@@ -83,6 +72,7 @@ def _node_busy_fraction(prev: tuple[float, float] | None) -> tuple[
     if dtotal <= 0 or dbusy < 0:
         return None, now
     return min(1.0, dbusy / dtotal), now
+# ===================================================================================
 
 
 class RuntimeEmployee:
@@ -209,29 +199,16 @@ class ServerBase:
         self.conn_to_employee_dict: dict[Connection, RuntimeEmployee] = {}
         """Used to find the employee associated with a message."""
 
+        # ==================== HPC: shared queue ====================================
         self._pool: list[tuple[int, float, int, RuntimeTask]] = []
         self._pool_seq = 0
         self._pool_cursor = 0
+        # ===========================================================================
 
-        # Declared here, unconditionally, for the reason job 1024323 taught:
-        # an undeclared counter is not a missing statistic, it is a KeyError or
-        # an AttributeError that propagates out and kills the run while Slurm
-        # still reports COMPLETED 0:0.
-        self._pool_drains = 0
-        self._pool_depth_sum = 0
-        self._pool_depth_max = 0
-
+        # ==================== HPC: occupancy broadcast =============================
         self._cpu_snapshot: tuple[float, float] | None = None
-        """Previous (busy, total) jiffies, for the free-core measurement."""
-
         self._last_occupancy_bcast = 0.0
-        """Throttle state for broadcast_occupancy.
-
-        Starts at zero rather than the current time so the first idle-count
-        change publishes immediately: a run that never fills its workers would
-        otherwise wait a tenth of a second before any pass could learn there
-        was room to speculate into.
-        """
+        # ===========================================================================
 
         # Servers do not need blas threads
         set_blas_thread_counts(1)
@@ -288,16 +265,13 @@ class ServerBase:
 
         _logger.info(f'Node has {self.total_workers} total workers.')
 
-        # Tell each manager how many workers this node commands in total. A
-        # manager cannot otherwise know how large its siblings are, and that
-        # figure is the denominator it needs to retain only a fair share of a
-        # batch submitted from below (see Manager.send_up_or_schedule_tasks).
-        # This must wait until every manager has reported, hence its position
-        # after the registration loop rather than inside connect_to_manager.
+        # ==================== HPC: cross-node fair share ===========================
+        # Managers need their parent's total after all siblings register.
         for conn in manager_conns:
             self.outgoing.put(
                 (conn, RuntimeMessage.STARTED, self.total_workers),
             )
+        # ===========================================================================
 
     def connect_to_manager(
         self,
@@ -367,11 +341,7 @@ class ServerBase:
             raise RuntimeError('Insufficient id range for workers.')
 
         # Create and start all worker processes
-        #
-        # BQSKit's worker already knows how to pin itself (worker.py, `cpu`
-        # argument) but nothing ever passed one, so workers float and the
-        # manager competes with 112 of them for the core it needs to run the
-        # select() relay on.
+        # ==================== HPC: worker pinning ==================================
         pin = _PIN_WORKERS
         ncpu = os.cpu_count() or 1
         overflowed = False
@@ -404,6 +374,7 @@ class ServerBase:
 
         if pin:
             _logger.info('%d workers pinned 1:1, no core reserved.', num_workers)
+        # ===========================================================================
 
         # Listen for the worker connections
         family = 'AF_INET' if sys.platform == 'win32' else None
@@ -502,15 +473,7 @@ class ServerBase:
         return conn
 
     def send_outgoing(self) -> None:
-        """Outgoing thread forwards messages as they are created.
-
-        One thread, one FIFO, every destination -- so a large SUBMIT_BATCH is
-        head-of-line blocking for whatever sits behind it, and the pool's
-        service-class ordering does not survive past the queue. Both are fixable
-        (per-destination queues served round-robin, i.e. virtual output queues),
-        but only worth fixing if the wire is actually the constraint, so the
-        depth is sampled here and reported rather than assumed.
-        """
+        """Outgoing thread forwards messages as they are created."""
         while True:
             outgoing = self.outgoing.get()
 
@@ -625,19 +588,6 @@ class ServerBase:
         """Shutdown the node and release resources."""
         # Stop running
         _logger.info('Shutting down node.')
-        # At INFO because it answers a standing question rather than tracing a
-        # run: max depth 1 means the pool never held a backlog, and therefore
-        # that ordering it -- LPT, heaviest-first, anything -- cannot change a
-        # placement. Emitted before `running = False` so a node killed by
-        # SIGTERM mid-shutdown has already said it.
-        if self._pool_drains:
-            _logger.info(
-                'pool depth: %d drains, mean %.2f, max %d, %d left undrained',
-                self._pool_drains,
-                self._pool_depth_sum / self._pool_drains,
-                self._pool_depth_max,
-                len(self._pool),
-            )
         self.running = False
 
         # Instruct employees to shutdown
@@ -731,34 +681,11 @@ class ServerBase:
 
         return assignments
 
+    # ==================== HPC: shared queue ========================================
     def _drain_pool(self) -> None:
-        """Hand pooled tasks to employees, preferring three levels in order.
-
-        Tasks retain their service class first, then prefer the employee that
-        owns their parent, and finally any other employee with an idle worker.
-        A task is delivered only when its recipient has an idle worker; this is
-        the difference between one shared pool and N private queues.
-        """
+        """Drain pooled tasks by priority, ownership, then idle capacity."""
         if not self._pool:
             return
-        # Pool depth on entry. This decides whether "heaviest task first" can
-        # do anything at all: LPT reorders a BACKLOG, and job 1023530 measured
-        # it at 0.997x for the reason that no backlog ever formed -- 21 blocks
-        # against 112 workers, all placed by the first drain, so there was no
-        # order to change. Two things have changed since: parallel multistart
-        # submits M tasks per block, and BQSKIT_SCAN_LOOKAHEAD submits up to 32,
-        # so a single block can now offer 32 at once.
-        #
-        # If _pool_depth_max stays at 1 the question is closed for good. If it
-        # runs deep, the next step is NOT switching LPT on -- cost_hint is set
-        # in exactly one place (foreach.py, for blocks), so every inner task
-        # carries 0.0 and LPT would sort ~30 items while leaving the other 99%
-        # tied. Populating cost_hint for the inner tasks comes first.
-        self._pool_drains += 1
-        _depth_in = len(self._pool)
-        self._pool_depth_sum += _depth_in
-        if _depth_in > self._pool_depth_max:
-            self._pool_depth_max = _depth_in
         batches: dict[int, tuple[RuntimeEmployee, list[RuntimeTask]]] = {}
         progress = True
         while self._pool and progress:
@@ -773,10 +700,7 @@ class ServerBase:
                 if owner.num_idle_workers > 0:
                     target = owner
             if target is None:
-                # Round-robin from a rotating cursor rather than a scan from
-                # employee 0: a fixed start biases every placement toward the
-                # low-numbered employees, which is the imbalance the pool is
-                # here to remove.
+                # Rotate the scan to avoid bias toward low-numbered employees.
                 n = len(self.employees)
                 for offset in range(n):
                     e = self.employees[(self._pool_cursor + offset) % n]
@@ -797,9 +721,7 @@ class ServerBase:
             target.num_tasks += 1
             progress = True
 
-        # Coalesce before touching the wire. The relay is one select() loop per
-        # level, so a drain that places many tasks avoids one pickle per task.
-        # Order within a batch is preserved, so service-class ordering survives.
+        # Coalesce placements while preserving their service-class order.
         for employee, batch in batches.values():
             if len(batch) == 1:
                 self.outgoing.put(
@@ -809,9 +731,7 @@ class ServerBase:
                 self.outgoing.put(
                     (employee.conn, RuntimeMessage.SUBMIT_BATCH, batch),
                 )
-            # Same read-receipt accounting assign_tasks does: without it a
-            # WAITING that races an in-flight placement is credited as idle
-            # twice.
+            # Account for placements that race with a WAITING message.
             employee.submit_cache.append((batch[0].unique_id, len(batch)))
 
         self.num_idle_workers = sum(
@@ -822,10 +742,6 @@ class ServerBase:
         """Return idle capacity to advertise upward, net of backlog."""
         return max(0, self.num_idle_workers - len(self._pool))
 
-    # Job 1023530 measured this key at 0.997x not because ordering was
-    # useless, but because 21 blocks for 112 workers all dispatched on the
-    # first drain, leaving no queue to reorder. The inner-task cost hints and
-    # expanded speculative capacity now make that queue exist.
     def schedule_tasks(self, tasks: Sequence[RuntimeTask]) -> None:
         """Add tasks to the shared pool and dispatch any that fit."""
         if len(tasks) == 0:
@@ -837,6 +753,7 @@ class ServerBase:
                 (task.priority, -task.cost_hint, self._pool_seq, task),
             )
         self._drain_pool()
+    # ===============================================================================
 
     def send_result_down(self, result: RuntimeResult) -> None:
         """Send the `result` to the appropriate employee."""
@@ -894,35 +811,22 @@ class ServerBase:
         employee.num_idle_workers = adjusted_idle_count
         self.num_idle_workers += (adjusted_idle_count - old_count)
         assert 0 <= self.num_idle_workers <= self.total_workers
+        # ==================== HPC: shared queue ====================================
         self._drain_pool()
+        # ===========================================================================
+        # ==================== HPC: occupancy broadcast =============================
         self.broadcast_occupancy()
+        # ===========================================================================
 
+    # ==================== HPC: occupancy broadcast =================================
     def broadcast_occupancy(self) -> None:
-        """Tell the workers directly below how much of this node is idle.
-
-        Lives on ServerBase rather than on Manager because the attached server
-        -- `Compiler(num_workers=N)` -- owns its workers directly, with no
-        manager in between. Without this the signal would exist only in the
-        detached runtime, and every single-node A/B would silently fall back to
-        the estimator while appearing to test the measured path.
-
-        Sent only to employees that are workers. A manager receiving OCCUPANCY
-        from above would have no handler for it, and its own workers already
-        get the count from it rather than from here.
-
-        Throttled: the idle count moves on every task start and finish,
-        thousands per second, while the only consumer -- a pass sizing its own
-        speculation -- reads it once per A* round. The messages are node-local,
-        so they never reach the single-threaded server relay.
-        """
+        """Broadcast this node's idle capacity to directly managed workers."""
         now = time.monotonic()
         if now - self._last_occupancy_bcast < _OCCUPANCY_INTERVAL:
             return
         self._last_occupancy_bcast = now
 
-        # Free CORES, not unassigned workers. See _node_busy_fraction: the two
-        # differ threefold in practice, and it is the core count that says how
-        # much extra work the machine can absorb.
+        # Use free cores when available; otherwise use idle workers.
         busy_frac, self._cpu_snapshot = _node_busy_fraction(self._cpu_snapshot)
         if busy_frac is None:
             free_cores = self.num_idle_workers
@@ -937,6 +841,7 @@ class ServerBase:
                 self.outgoing.put(
                     (employee.conn, RuntimeMessage.OCCUPANCY, payload),
                 )
+    # ===============================================================================
 
 
 def parse_ipports(ipports_str: Sequence[str]) -> list[tuple[str, int]]:

@@ -180,6 +180,7 @@ async def _sub_do_work(
     return circuit, data
 
 
+# ==================== HPC: sub-workflow operation =================================
 async def _sub_do_work_with_op(
     workflow: Workflow,
     op: Operation,
@@ -190,7 +191,7 @@ async def _sub_do_work_with_op(
     seed: int | None,
     pass_down_data: dict[str, Any],
 ) -> tuple[Circuit, PassData]:
-    """Build a ForEachBlockPass block and execute its workflow."""
+    """Build a block circuit and run its sub-workflow."""
     from bqskit.compiler.passdata import PassData
     from bqskit.ir.circuit import Circuit
     from bqskit.ir.gates.circuitgate import CircuitGate
@@ -212,3 +213,4 @@ async def _sub_do_work_with_op(
     data.seed = seed
 
     return await _sub_do_work(workflow, circuit, data)
+# ===================================================================================

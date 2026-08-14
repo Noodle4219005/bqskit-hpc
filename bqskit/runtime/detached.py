@@ -360,9 +360,10 @@ class DetachedServer(ServerBase):
     def handle_result(self, result: RuntimeResult) -> None:
         """Either store the result here or ship it to the destination worker."""
         # Record a task has been completed
-        employee = self.get_employee_responsible_for(result.completed_by)
-        employee.num_tasks -= 1
+        self.get_employee_responsible_for(result.completed_by).num_tasks -= 1  # HPC
+        # ==================== HPC: shared queue ====================================
         self._drain_pool()
+        # ===========================================================================
 
         # Check if the result is for a client
         if result.return_address.worker_id == -1:

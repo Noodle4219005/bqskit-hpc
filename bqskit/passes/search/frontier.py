@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import heapq
 import itertools
-import os
 from typing import Any
 from typing import NamedTuple
 
@@ -13,9 +12,6 @@ from bqskit.qis.state.state import StateVector
 from bqskit.qis.state.system import StateSystem
 from bqskit.qis.unitary.unitarymatrix import UnitaryMatrix
 
-_GDFS = os.environ.get('BQPROF_GDFS') == '1'
-
-
 class FrontierElement(NamedTuple):
     """The Frontier contains FrontierElements."""
 
@@ -23,7 +19,6 @@ class FrontierElement(NamedTuple):
     element_id: int
     circuit: Circuit
     extra_data: Any
-    parent_id: int | None = None
 
 
 class Frontier:
@@ -57,33 +52,25 @@ class Frontier:
 
         self.target = target
         self.heuristic_function = heuristic_function
+        # ==================== HPC: reversible commit ===============================
         self._frontier: list[FrontierElement] = []
         self._committed: list[tuple[list[FrontierElement], Any]] = []
         self._max_committed: int = int(
             os.environ.get('BQSKIT_MAX_COMMITTED', '8'),
         )
+        # ===========================================================================
         self._counter = itertools.count()
-        self._last_popped_id: int | None = None
-        """Identity of the most recent pop, for the speculation probe."""
-        self._last_popped_parent_id: int | None = None
-        """Parent identity of the most recent pop, for the G-DFS probe."""
 
     def add(self, circuit: Circuit, extra_data: Any = None) -> None:
         """Add `circuit` into the frontier."""
         heuristic_value = self.heuristic_function(circuit, self.target)
         count = next(self._counter)
-        parent_id = self._last_popped_id if _GDFS else None
-        elem = FrontierElement(
-            heuristic_value, count, circuit, extra_data, parent_id,
-        )
+        elem = FrontierElement(heuristic_value, count, circuit, extra_data)
         heapq.heappush(self._frontier, elem)
 
     def pop(self) -> tuple[Circuit, Any]:
         """Pop the top circuit."""
         elem = heapq.heappop(self._frontier)
-        self._last_popped_id = elem.element_id
-        if _GDFS:
-            self._last_popped_parent_id = elem.parent_id
         return elem.circuit, elem.extra_data
 
     def __len__(self) -> int:
@@ -91,22 +78,13 @@ class Frontier:
         return len(self._frontier)
 
     def topk_ids(self, k: int) -> list[int]:
-        """Return the element ids of the k cheapest entries, in order.
-
-        Read-only: `heapq.nsmallest` does not disturb the heap. Used by the
-        speculation probe to record what a speculative expansion would have
-        dispatched, without dispatching anything.
-        """
+        """Return the ids of the k cheapest entries without changing the heap."""
         if k <= 0 or not self._frontier:
             return []
         return [e.element_id for e in heapq.nsmallest(k, self._frontier)]
 
     def peek(self, k: int) -> list[tuple[int, Circuit, Any]]:
-        """Return the k cheapest entries without mutating the heap.
-
-        Each entry is returned as ``(element_id, circuit, extra_data)`` in the
-        same order that repeated calls to :meth:`pop` would return them.
-        """
+        """Return the k cheapest entries without changing the heap."""
         if k <= 0 or not self._frontier:
             return []
         return [
@@ -115,25 +93,13 @@ class Frontier:
         ]
 
     def topk_costs(self, k: int) -> list[float]:
-        """Return the heuristic costs of the k cheapest entries, in order.
-
-        Also read-only. Used by the prefix-diversity probe to record what
-        LEAP is about to throw away when a formed prefix clears the
-        frontier: if those costs sit within noise of the candidate being
-        kept, the choice of prefix is close to a coin flip and keeping
-        several is worth something.
-        """
+        """Return the heuristic costs of the k cheapest entries."""
         if k <= 0 or not self._frontier:
             return []
         return [e.cost for e in heapq.nsmallest(k, self._frontier)]
 
     def score(self, circuit: Circuit) -> float:
-        """Return the heuristic cost `circuit` would get in this frontier.
-
-        Evaluated against the same target and heuristic the frontier sorts
-        by, so the result is directly comparable with `topk_costs`. Does not
-        insert anything.
-        """
+        """Return the cost `circuit` would receive without adding it."""
         return self.heuristic_function(circuit, self.target)
 
     def empty(self) -> bool:
@@ -144,56 +110,21 @@ class Frontier:
         """Remove all elements from the frontier."""
         self._frontier.clear()
 
+    # ==================== HPC: reversible commit ===================================
     def commit(self, state: Any = None) -> int:
-        """
-        Set the current frontier aside rather than destroying it.
-
-        LEAP's prefix commit was `clear()`, which is irreversible: once the
-        frontier is gone there is no way back to the branch point if the
-        committed path turns out to be wrong. Measured, that matters -- when
-        the search does climb back up the tree it climbs one level (p90 1, or
-        2 on a real device graph), so recovery is cheap if it is possible at
-        all.
-
-        Setting the list aside rather than tagging its elements is deliberate.
-        A per-element epoch would force `empty`, `__len__`, `topk_ids`,
-        `topk_costs` and `score` to all learn to skip stale
-        entries, turning every read into a scan. Swapping the container leaves
-        each of them looking at exactly the live frontier, so equivalence with
-        `clear()` holds by construction rather than by argument.
-
-        Args:
-            state (Any): Optional caller state to restore with the frontier.
-
-        Returns:
-            int: The number of elements set aside.
-        """
+        """Set aside the live frontier and optionally save caller state."""
         count = len(self._frontier)
         self._committed.append((self._frontier, state))
         self._frontier = []
-        # A cap is required, not tidiness. At min_prefix_size=3 one synthesis
-        # forms up to 712 prefixes, and holding every frontier of ~120
-        # circuits would be real memory. Past the cap the oldest is dropped
-        # and becomes exactly as unrecoverable as it was before this change.
+        # Keep a bounded history so recovery cannot retain unbounded frontiers.
         while len(self._committed) > self._max_committed:
             self._committed.pop(0)
         return count
+    # ===============================================================================
 
+    # ==================== HPC: rollback ============================================
     def rollback(self) -> tuple[int, Any]:
-        """
-        Restore the most recently committed frontier, merging it back in.
-
-        The state returned with the frontier lets callers restore any
-        non-monotone state that belongs to the committed branch. In LEAP that
-        is `last_prefix_layer` and nothing else: `best_circ`, `best_dist`,
-        `best_layer` and `psols` all mean "best seen so far" and must survive a
-        rollback.
-
-        Returns:
-            tuple[int, Any]: The number of elements restored and the state
-                saved with the frontier, or ``(0, None)`` if nothing was
-                committed.
-        """
+        """Restore the latest committed frontier and its saved state."""
         if not self._committed:
             return 0, None
         prior, state = self._committed.pop()
@@ -206,37 +137,11 @@ class Frontier:
         return len(self._committed)
 
     def committed_states(self) -> list[Any]:
-        """
-        Return the state saved with each retained commit, oldest first.
-
-        Exposed so a caller can choose WHICH commit to return to rather than
-        always the most recent. Chronological backtracking undoes the latest
-        decision, which is not usually the one that caused the failure.
-        """
+        """Return retained states oldest first for targeted rollback."""
         return [state for _, state in self._committed]
 
     def rollback_to(self, index: int) -> tuple[int, Any]:
-        """
-        Restore the commit at `index`, discarding every commit above it.
-
-        This is backjumping rather than chronological backtracking. The
-        commits above `index` are descendants of the decision being undone,
-        so they cannot survive it -- returning to an ancestor invalidates
-        them by construction.
-
-        `rollback()` is the special case `index = committed_depth() - 1`.
-
-        Args:
-            index (int): Position in the commit stack, oldest first, as
-                indexed by `committed_states`.
-
-        Returns:
-            tuple[int, Any]: Elements restored and the state saved with that
-                commit, or ``(0, None)`` if nothing was committed.
-
-        Raises:
-            IndexError: If `index` is out of range.
-        """
+        """Restore a retained commit and discard its descendants."""
         if not self._committed:
             return 0, None
 
@@ -246,9 +151,7 @@ class Frontier:
                 f'0..{len(self._committed) - 1}.',
             )
 
-        # Everything above the target is a descendant of the decision being
-        # undone. Dropping it is not an optimisation -- keeping it would let
-        # a later rollback restore a frontier that depends on a choice this
-        # jump has just retracted.
+        # Descendant frontiers depend on the retracted decision and are invalid.
         del self._committed[index + 1:]
         return self.rollback()
+    # ===============================================================================

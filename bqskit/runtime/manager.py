@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import argparse
-import heapq
 import logging
-import os
 import selectors
 import time
 from multiprocessing.connection import Connection
@@ -28,8 +26,6 @@ from bqskit.runtime.task import RuntimeTask
 
 
 _logger = logging.getLogger(__name__)
-
-
 
 class Manager(ServerBase):
     """
@@ -134,13 +130,10 @@ class Manager(ServerBase):
         # Track info on sent messages to reduce redundant messages:
         self.last_num_idle_sent_up = self.total_workers
 
-        # The boss's total worker count, used as the denominator when deciding
-        # how much of a batch to retain. Defaults to this node's own total so
-        # that a manager which never hears from its boss behaves exactly as
-        # before. The boss overwrites it with a STARTED message once every
-        # sibling has registered; see send_up_or_schedule_tasks.
+        # ==================== HPC: cross-node fair share ===========================
+        # Defaults locally until the parent reports its total worker count.
         self.parent_total_workers = self.total_workers
-
+        # ===========================================================================
 
         # Track info on received messages to report read receipts:
         self.most_recent_read_submit: RuntimeAddress | None = None
@@ -186,24 +179,10 @@ class Manager(ServerBase):
                 paths = cast(List[str], payload)
                 self.handle_importpath(paths)
 
+            # ==================== HPC: cross-node fair share =======================
             elif msg == RuntimeMessage.STARTED:
-                # The boss reporting its own total worker count once all of
-                # this node's siblings have registered. Downward STARTED was
-                # previously only ever sent to workers, so there is no
-                # existing meaning to collide with here.
                 self.parent_total_workers = cast(int, payload)
-                # Logged at INFO because the fair-share fallback is SILENT: if
-                # this message never arrives, parent_total_workers keeps its
-                # default of self.total_workers, share becomes len(tasks), and
-                # the retention rule degrades to exactly the pre-fix
-                # behaviour with no symptom other than the imbalance it was
-                # meant to remove. This line is the only positive evidence
-                # that the fix is active in a given run -- grep for it before
-                # believing any balance measurement.
-                _logger.info(
-                    f'Boss reports {self.parent_total_workers} total workers; '
-                    f'this node has {self.total_workers}. Fair-share active.',
-                )
+            # =======================================================================
 
             elif msg == RuntimeMessage.COMMUNICATE:
                 self.broadcast(RuntimeMessage.COMMUNICATE, payload)
@@ -229,7 +208,6 @@ class Manager(ServerBase):
                 p = cast(Tuple[int, Optional[RuntimeAddress]], payload)
                 num_idle, read_receipt = p
                 self.handle_waiting(conn, num_idle, read_receipt)
-                self._drain_pool()
                 self.update_upstream_idle_workers()
 
             elif msg == RuntimeMessage.UPDATE:
@@ -280,30 +258,9 @@ class Manager(ServerBase):
             # If server has already shutdown or crashed, just exit
             pass
 
+    # ==================== HPC: cross-node fair share ===============================
     def send_up_or_schedule_tasks(self, tasks: Sequence[RuntimeTask]) -> None:
-        """Either send the tasks upstream or schedule them downstream.
-
-        Retains only this node's proportional share of the batch rather than
-        everything that fits. The previous rule -- keep `num_idle` tasks and
-        forward only the overflow -- is locally correct but globally wrong,
-        because these tasks are not leaves: a block-synthesis task spawns a
-        large subtree, so accepting one commits far more than one worker.
-
-        Measured consequence of the old rule: ForEachBlockPass issues a single
-        map() of 22 block tasks, the receiving manager has 111 idle workers,
-        `22 > 111` is false, and not one block crosses a node boundary. On four
-        nodes, three of them never ran a block at all and node-seconds
-        utilisation was 30.1% against 25% for a single node doing everything.
-
-        The denominator is the boss's total worker count, not the cluster's. At
-        the top level they are the same; deeper in the hierarchy, using the
-        cluster total would make a manager forward more than its parent can
-        redistribute. Sharing against the immediate parent balances recursively.
-
-        Single-node deployments are unaffected: `parent_total_workers` then
-        equals `self.total_workers`, so `share == len(tasks)` and the retained
-        set is `tasks[:num_idle]` exactly as before.
-        """
+        """Keep this node's share and forward the remaining tasks upstream."""
         if len(tasks) == 0:
             return
 
@@ -328,10 +285,7 @@ class Manager(ServerBase):
         keep = min(num_idle, share)
 
         if keep > 0:
-            # `keep`, not `num_idle`: UPDATE carries a task-count delta, and
-            # exactly `keep` tasks are scheduled below. The old call reported
-            # `num_idle` even when the batch was smaller, overcounting this
-            # node's load in the boss's ledger.
+            # UPDATE counts only the tasks retained below.
             self.outgoing.put((self.upstream, RuntimeMessage.UPDATE, keep))
             self.schedule_tasks(tasks[:keep])
             self.update_upstream_idle_workers()
@@ -342,13 +296,15 @@ class Manager(ServerBase):
                 RuntimeMessage.SUBMIT_BATCH,
                 tasks[keep:],
             ))
+    # ===============================================================================
 
     def handle_result_from_below(self, result: RuntimeResult) -> None:
         """Forward the result to its destination and track the completion."""
         # Record a task has been completed
-        employee = self.get_employee_responsible_for(result.completed_by)
-        employee.num_tasks -= 1
+        self.get_employee_responsible_for(result.completed_by).num_tasks -= 1  # HPC
+        # ==================== HPC: shared queue ====================================
         self._drain_pool()
+        # ===========================================================================
         # Forward result to final destination
         if self.is_my_worker(result.return_address.worker_id):
             self.send_result_down(result)
@@ -361,13 +317,17 @@ class Manager(ServerBase):
 
     def update_upstream_idle_workers(self) -> None:
         """Update the total number of idle workers upstream."""
+        # ==================== HPC: shared queue ====================================
         _idle = self.pooled_idle_workers()
+        # ===========================================================================
         if _idle != self.last_num_idle_sent_up:
             self.last_num_idle_sent_up = _idle
             payload = (_idle, self.most_recent_read_submit)
             m = (self.upstream, RuntimeMessage.WAITING, payload)
             self.outgoing.put(m)
+        # ==================== HPC: occupancy broadcast =============================
         self.broadcast_occupancy()
+        # ===========================================================================
 
 
     def handle_update(self, conn: Connection, task_diff: int) -> None:

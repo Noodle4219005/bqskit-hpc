@@ -833,25 +833,9 @@ def _circuit_workflow(
     return Workflow(workflow, name='Off-the-Shelf Circuit Compilation')
 
 
+# ==================== HPC: parallel multistart =====================================
 def _multistarts_override(default: int) -> int:
-    """Let BQSKIT_MULTISTARTS raise the numerical-optimisation start count.
-
-    This is the one quality knob that lives entirely inside LEAP's parallel
-    section: more random starts per instantiate means more chances to land in a
-    good local minimum, so LEAP terminates at a shallower circuit. The extra
-    work is embarrassingly parallel in principle, but the default path runs it
-    serially inside one worker; BQSKIT_PARALLEL_MULTISTART makes it actually
-    parallel, unlike partition and unfold, which are single-process (measured:
-    211.9 s + 134.4 s serial on qv_N060).
-
-    Note that instantiate options are shared with the gate-removal scan, so
-    raising this without also setting BQSKIT_DELETION_PREDICATE=multi makes the
-    90.7% of wall that scan already owns proportionally worse.
-
-    `scripts/scaling_client.py --multistarts` does NOT reach here: it only
-    applies to the 'maxquality' workflow, so every measurement taken with
-    'official' has run at the stock value for its optimization level.
-    """
+    """Override the numerical-optimisation start count."""
     text = os.environ.get('BQSKIT_MULTISTARTS')
     if text is None:
         return default
@@ -867,16 +851,7 @@ def _multistarts_override(default: int) -> int:
 
 
 def _parallel_multistart() -> bool:
-    """Let BQSKIT_PARALLEL_MULTISTART split each start into its own task.
-
-    With the flag off, ``multistarts=M`` is an M-times serial section hidden
-    inside every task LEAP dispatches: ``Circuit.instantiate`` ends at
-    ``Instantiater.multi_start_instantiate_inplace``
-    (``bqskit/ir/opt/instantiater.py:90``), a plain list comprehension with no
-    runtime involvement. The parallel version seeds each start explicitly
-    instead of sharing one process's random stream, so it is not byte-identical
-    to the serial version at the same M; a parallel M=4 arm is its own control.
-    """
+    """Enable one runtime task per numerical-optimisation start."""
     text = os.environ.get('BQSKIT_PARALLEL_MULTISTART')
     if text is None:
         return False
@@ -888,6 +863,7 @@ def _parallel_multistart() -> bool:
         'BQSKIT_PARALLEL_MULTISTART must be 0 or 1, '
         f'got {text!r}.',
     )
+# ===================================================================================
 
 
 def get_instantiate_options(optimization_level: int) -> dict[str, Any]:
@@ -1412,25 +1388,8 @@ def build_gate_deletion_optimization_workflow(
     """Build standard workflow for circuit gate deletion optimization."""
     workflow: list[BasePass] = [LogPass('Attempting to delete gates.')]
 
-    # MEASURED AND REFUTED 2026-08-11. Kept, off by default, because the
-    # proposal is an obvious one and someone will make it again.
-    #
-    # The idea was that 62% of the operations this scan iterates over sit in a
-    # run of >=2 consecutive single-qudit gates, so merging each run would cut
-    # the same fraction of its one-instantiate-per-operation loop. That 62%
-    # was an upper bound nobody can reach: it counted `run_length - 1`, which
-    # assumes a run collapses to ONE gate, and a single-qubit unitary in a
-    # native gate set costs up to five (ZXZXZ).
-    #
-    # The run-length histogram at the scan input is {1:17, 2:4, 3:4, 4:23,
-    # 5:20} -- nothing exceeds five, because these runs ARE the ZXZXZ
-    # expansions the rebase emitted. Merging five into five saves nothing, the
-    # less-than filter below correctly rejects every replacement, and an A/B
-    # over the acceptance circuits is byte-identical with the switch on.
-    #
-    # The filter is what kept this from being a regression rather than a
-    # no-op: GroupSingleQuditGatePass folds runs of length 1 too, and ZXZXZ on
-    # a lone SX emits five gates.
+    # ==================== HPC: pre-scan merge =======================================
+    # Keep replacements only when native re-decomposition shortens the run.
     if os.environ.get('BQSKIT_MERGE_BEFORE_SCAN') == '1':
         workflow += [
             GroupSingleQuditGatePass(),
@@ -1459,6 +1418,8 @@ def build_gate_deletion_optimization_workflow(
         workflow,
         name='Gate Deletion Optimization',
     )
+
+    # ===================================================================================
 
     if iterative:
         # ChangePredicate stops only when the circuit stops changing AT ALL,

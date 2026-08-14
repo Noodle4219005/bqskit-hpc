@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any
 from typing import Callable
 
@@ -13,9 +12,6 @@ from bqskit.ir.opt.cost.functions import HilbertSchmidtResidualsGenerator
 from bqskit.ir.opt.cost.generator import CostFunctionGenerator
 from bqskit.passes.processing.scan import ScanningGateRemovalPass
 from bqskit.runtime import get_runtime
-from bqskit.passes.processing.scan import _mergeable_single_qudit_runs
-from bqskit.passes.processing.scan import _SCAN_PROBE_DIR
-from bqskit.passes.processing.scan import _scan_probe_emit
 from bqskit.utils.typing import is_integer
 from bqskit.utils.typing import is_real_number
 
@@ -175,17 +171,6 @@ class TreeScanningGateRemovalPass(ScanningGateRemovalPass):
 
     async def run(self, circuit: Circuit, data: PassData) -> None:
         """Perform the pass's operation, see :class:`BasePass` for more."""
-        # This class OVERRIDES run, so the probe in the parent class never
-        # executes for it. Without this block an A/B between the two reads
-        # the tree variant's cost as near zero, because the only records left
-        # are the plain-scan invocations elsewhere in the workflow. That
-        # mistake reported a 196x speedup that did not exist.
-        _probe_on = bool(_SCAN_PROBE_DIR)
-        _t_pass = time.perf_counter()
-        _n_batches = 0
-        _n_circuits = 0
-        _t_inst = 0.0
-
         instantiate_options = self.instantiate_options.copy()
         if 'seed' not in instantiate_options:
             instantiate_options['seed'] = data.seed
@@ -217,20 +202,12 @@ class TreeScanningGateRemovalPass(ScanningGateRemovalPass):
                 f' {self.tree_depth} operations.',
             )
 
-            _t0 = time.perf_counter() if _probe_on else 0.0
             instantiated_circuits: list[Circuit] = await get_runtime().map(
                 Circuit.instantiate,
                 all_circs,
                 target=target,
                 **instantiate_options,
             )
-            if _probe_on:
-                # Wall, not CPU: the point of this pass is that the 2^d
-                # circuits go out in parallel, so summing per-circuit CPU
-                # would hide exactly the property being tested.
-                _t_inst += time.perf_counter() - _t0
-                _n_batches += 1
-                _n_circuits += len(all_circs)
 
             dists = [self.cost(c, target) for c in instantiated_circuits]
 
@@ -252,20 +229,6 @@ class TreeScanningGateRemovalPass(ScanningGateRemovalPass):
                     )
                     circuit_copy = instantiated_circuits[i]
                     break
-
-        if _probe_on:
-            _runs, _saved, _lengths = _mergeable_single_qudit_runs(circuit)
-            _scan_probe_emit({
-                'pass': 'treescan',
-                'tree_depth': self.tree_depth,
-                'n_ops': circuit.num_operations,
-                'n_batches': _n_batches,
-                'n_circuits_instantiated': _n_circuits,
-                'inst_seconds_wall': round(_t_inst, 6),
-                'pass_seconds': round(time.perf_counter() - _t_pass, 6),
-                'mergeable_runs': _runs,
-                'run_length_hist': {str(k): v for k, v in _lengths.items()},
-            })
 
         circuit.become(circuit_copy)
 
