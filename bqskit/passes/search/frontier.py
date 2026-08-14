@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import heapq
 import itertools
-import json
 import os
 from typing import Any
 from typing import NamedTuple
@@ -13,62 +12,8 @@ from bqskit.passes.search.heuristic import HeuristicFunction
 from bqskit.qis.state.state import StateVector
 from bqskit.qis.state.system import StateSystem
 from bqskit.qis.unitary.unitarymatrix import UnitaryMatrix
-from bqskit.utils.typing import is_integer
 
 _GDFS = os.environ.get('BQPROF_GDFS') == '1'
-_BEAM_PROBE_DIR = os.environ.get('BQPROF_BEAM_DIR')
-
-# Delayed pruning: do not prune while the heuristic cannot tell the kept
-# candidates apart.
-#
-# E9 measured the relative span of the kept costs -- (max-min)/|min| over the
-# k survivors -- and found it collapses on a sparse coupling graph:
-#
-#     tokyo      rel_span_kept  0.095 - 0.104
-#     all-to-all rel_span_kept  0.244 - 0.278
-#
-# AStarHeuristic is 10*distance + 1*two_qudit_count and the count is constant
-# within a layer, so ordering inside a layer is purely by distance. On tokyo
-# the top-k distances are near-ties, so the beam is choosing essentially at
-# random -- and beam width is measurably NOT monotone (2 of 4 width 32->64
-# pairs got worse on 2Q), so widening is not a safe answer.
-#
-# The hypothesis this implements: when the span is below tau the ranking
-# carries no information, so pruning should be POSTPONED rather than widened.
-# Once the span exceeds tau the heuristic discriminates again and the normal
-# width bound applies.
-#
-# BQSKIT_PRUNE_TAU     relative-span threshold below which pruning is skipped
-# BQSKIT_PRUNE_DELAY_K hard ceiling while delaying, so a delayed prune cannot
-#                      grow the frontier without bound (defaults to 8*k)
-_PRUNE_TAU = os.environ.get('BQSKIT_PRUNE_TAU')
-_PRUNE_DELAY_CAP = os.environ.get('BQSKIT_PRUNE_DELAY_K')
-_PRUNE_STATS: dict[str, int] = {'delayed': 0, 'pruned': 0, 'capped': 0}
-_BEAM_FH: dict[str, Any] = {'pid': None, 'fh': None}
-
-
-def _beam_emit(record: dict[str, Any]) -> None:
-    """Append one prune record, fork-safe."""
-    if not _BEAM_PROBE_DIR:
-        return
-    try:
-        pid = os.getpid()
-        if _BEAM_FH['pid'] != pid:
-            stale = _BEAM_FH.get('fh')
-            if stale is not None:
-                try:
-                    stale.close()
-                except Exception:
-                    pass
-            os.makedirs(_BEAM_PROBE_DIR, exist_ok=True)
-            _BEAM_FH['fh'] = open(
-                os.path.join(_BEAM_PROBE_DIR, f'beam_{pid}.jsonl'),
-                'a', buffering=1,
-            )
-            _BEAM_FH['pid'] = pid
-        _BEAM_FH['fh'].write(json.dumps(record) + '\n')
-    except Exception:
-        pass
 
 
 class FrontierElement(NamedTuple):
@@ -191,115 +136,6 @@ class Frontier:
         """
         return self.heuristic_function(circuit, self.target)
 
-    def prune(self, k: int | None) -> int:
-        """
-        Keep only the `k` best nodes, discarding the rest.
-
-        This bounds the frontier directly, by width, rather than indirectly
-        through LEAP's prefix condition. Returns the number of nodes
-        discarded, so callers can record how much was pruned.
-
-        Args:
-            k (int | None): The number of nodes to keep. `None` is a no-op,
-                preserving the unbounded behaviour.
-
-        Raises:
-            ValueError: If `k` is not positive.
-        """
-        if k is None:
-            return 0
-
-        if not is_integer(k):
-            raise TypeError(f'Expected integer for k, got {type(k)}.')
-
-        if k <= 0:
-            raise ValueError(f'Expected positive k, got {k}.')
-
-        if len(self._frontier) <= k:
-            return 0
-
-        discarded = len(self._frontier) - k
-        if _BEAM_PROBE_DIR:
-            # Why does beam go deeper on a sparse graph (layer 9 -> 140)?
-            #
-            # AStarHeuristic is 10*distance + 1*two_qudit_count, and the count
-            # is constant within a layer, so ordering inside a layer is purely
-            # by distance -- and P0-d measured 95.3% of top candidates within
-            # 1% of each other. Beam may therefore be pruning on what is
-            # nearly noise, keeping an arbitrary K among near-ties. On
-            # all-to-all many paths reach a shallow solution so an arbitrary K
-            # still hits one; on a sparse graph there are few, and pruning
-            # loses them.
-            #
-            # Two fixes follow and this decides between them: if the kept K
-            # already spread across distinct final edges, the problem is the
-            # ties and the answer is to delay pruning until they separate; if
-            # the kept K crowd onto a few edges, the problem is lost diversity
-            # and the answer is to keep one representative per edge.
-            _kept = heapq.nsmallest(k, self._frontier)
-            _all = sorted(self._frontier)
-
-            def _edge(elem: FrontierElement) -> str:
-                for op in reversed(list(elem.circuit)):
-                    if op.num_qudits > 1:
-                        return str(tuple(sorted(op.location)))
-                return '-'
-
-            _kc = {_edge(e) for e in _kept}
-            _ac = {_edge(e) for e in _all}
-            _costs = [e.cost for e in _all]
-            _span = (max(_costs) - min(_costs)) if _costs else 0.0
-            _kspan = (
-                max(e.cost for e in _kept) - min(e.cost for e in _kept)
-            ) if _kept else 0.0
-            _beam_emit({
-                'n': len(self._frontier), 'k': k,
-                'edges_kept': len(_kc), 'edges_total': len(_ac),
-                'cost_span_all': _span, 'cost_span_kept': _kspan,
-                'cost_min': min(_costs) if _costs else 0.0,
-                # A tie is a relative span; an absolute one is meaningless
-                # when the distance term can be anywhere in [0, 10].
-                'rel_span_kept': (
-                    _kspan / abs(min(_costs)) if _costs and min(_costs) else 0.0
-                ),
-            })
-        if _PRUNE_TAU is not None:
-            # Measure discrimination on the candidates the beam WOULD keep.
-            kept = heapq.nsmallest(k, self._frontier)
-            # FrontierElement's field is `cost`; there is no `heuristic`
-            # attribute. Getting this wrong raises inside the WORKER, which
-            # surfaces only as 'Server connection unexpectedly closed' -- the
-            # same message an unsatisfiable block produces, so it is easy to
-            # misread as a benchmark property rather than a crash.
-            costs = [element.cost for element in kept]
-            low = min(costs)
-            span = (max(costs) - low) / abs(low) if low else 0.0
-            if span < float(_PRUNE_TAU):
-                # The heuristic cannot separate the survivors. Keep them all,
-                # up to a cap, and let a later layer -- where the distances
-                # have spread -- make the decision instead.
-                # 2*k, not 8*k. Delaying is meant to hold the tie band until
-                # it separates, not to stop pruning: an 8*k cap with beam 32
-                # keeps 256 nodes, which measurably explodes the search
-                # instead of deferring one decision. Two beams' worth covers
-                # the ties and still bounds the width.
-                cap = int(_PRUNE_DELAY_CAP) if _PRUNE_DELAY_CAP else 2 * k
-                if len(self._frontier) <= cap:
-                    _PRUNE_STATS['delayed'] += 1
-                    return 0
-                _PRUNE_STATS['capped'] += 1
-                discarded = len(self._frontier) - cap
-                self._frontier = heapq.nsmallest(cap, self._frontier)
-                heapq.heapify(self._frontier)
-                return discarded
-            _PRUNE_STATS['pruned'] += 1
-
-        # FrontierElement orders by (heuristic, counter), so nsmallest
-        # selects exactly the k the heap would have popped first.
-        self._frontier = heapq.nsmallest(k, self._frontier)
-        heapq.heapify(self._frontier)
-        return discarded
-
     def empty(self) -> bool:
         """Return true if the frontier is empty."""
         return len(self._frontier) == 0
@@ -320,8 +156,8 @@ class Frontier:
         all.
 
         Setting the list aside rather than tagging its elements is deliberate.
-        A per-element epoch would force `empty`, `__len__`, `prune`,
-        `topk_ids`, `topk_costs` and `score` to all learn to skip stale
+        A per-element epoch would force `empty`, `__len__`, `topk_ids`,
+        `topk_costs` and `score` to all learn to skip stale
         entries, turning every read into a scan. Swapping the container leaves
         each of them looking at exactly the live frontier, so equivalence with
         `clear()` holds by construction rather than by argument.

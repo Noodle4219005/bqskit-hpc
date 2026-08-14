@@ -607,9 +607,6 @@ class Worker:
             # Perform a step of the task and get the future it awaits on
             future = task.step(self._get_desired_result(task))
 
-            if _TASKLOG_DIR:
-                self._tasklog(task, _t0, time.monotonic())
-
             self._process_await(task, future)
 
         except StopIteration as e:
@@ -625,6 +622,16 @@ class Worker:
             self._conn.send((RuntimeMessage.ERROR, error_payload))
 
         finally:
+            # In `finally`, not after `task.step`. A step that COMPLETES its
+            # task raises StopIteration, which jumps straight past the old call
+            # site -- so the log only ever held steps that awaited. A
+            # speculative instantiate runs to completion in one step, so not one
+            # of them was ever recorded: `pri` came back 0 for every row even on
+            # the speculation arm, and `fn` held only the two long-lived
+            # coroutines. The figure drawn from it had four legend entries and
+            # one colour.
+            if _TASKLOG_DIR:
+                self._tasklog(task, _t0, time.monotonic())
             self._active_task = None
 
     def _tasklog(self, task: RuntimeTask, t0: float, t1: float) -> None:
@@ -635,24 +642,38 @@ class Worker:
         (the worker whose work this is). Own vs borrowed is exactly whether
         that id is this worker's.
 
-        `breadcrumbs[0]` is the outermost ancestor, which identifies the block
-        this step belongs to, so block boundaries are recoverable rather than
-        assumed.
+        Block identity is the FIRST breadcrumb with a real worker id, not
+        `breadcrumbs[0]`. The outermost ancestor is the client, whose worker id
+        is -1, so `breadcrumbs[0]` is the same string for every task in the run
+        -- the first version collapsed a 20-block circuit to one block and made
+        the boundaries in the figure invisible.
         """
+        # Line-buffered, not block-buffered. Workers are stopped with SIGTERM
+        # and never run an exit handler, so a 64 KB buffer is simply lost: the
+        # first attempt produced 0 records from 39 worker files. One write
+        # syscall per step costs about a microsecond against a step that runs
+        # actual synthesis; the earlier disaster was opening a file per event,
+        # not writing to an open one.
         if self._tasklog_fh is None:
             os.makedirs(_TASKLOG_DIR, exist_ok=True)
             self._tasklog_fh = open(
                 os.path.join(_TASKLOG_DIR, f'task_{self._id}.jsonl'),
-                'a', buffering=1 << 16,
+                'a', buffering=1,   # line-buffered: see below
             )
         owner = task.return_address.worker_id
-        bc = task.breadcrumbs
-        block = f'{bc[0].worker_id}:{bc[0].mailbox_index}' if bc else '-'
+        block = '-'
+        for crumb in task.breadcrumbs:
+            if crumb.worker_id != -1:
+                block = (
+                    f'{crumb.worker_id}:{crumb.mailbox_index}'
+                    f':{crumb.mailbox_slot}'
+                )
+                break
         self._tasklog_fh.write(
             '{"w":%d,"t0":%.6f,"t1":%.6f,"pri":%d,"mine":%d,"blk":"%s",'
-            '"fn":"%s"}\n'
+            '"fn":"%s","dep":%d}\n'
             % (self._id, t0, t1, task.priority, int(owner == self._id),
-               block, task._name)
+               block, task._name, len(task.breadcrumbs))
         )
 
     def _process_await(self, task: RuntimeTask, future: RuntimeFuture) -> None:
@@ -743,6 +764,7 @@ class Worker:
         task_name: str | None = None,
         log_context: dict[str, str] = {},
         task_priority: int = PRIORITY_CRITICAL,
+        cost_hint: float = 0.0,
         **kwargs: Any,
     ) -> RuntimeFuture:
         """Submit `fn` as a task to the runtime.
@@ -786,6 +808,7 @@ class Worker:
             task_name,
             {**self._active_task.log_context, **log_context},
             task_priority,
+            cost_hint,
         )
 
         # Submit the task (on the next cycle)
@@ -801,6 +824,7 @@ class Worker:
         task_name: Sequence[str | None] | str | None = None,
         log_context: Sequence[dict[str, str]] | dict[str, str] = {},
         task_priority: int = PRIORITY_CRITICAL,
+        cost_hints: Sequence[float] | None = None,
         **kwargs: Any,
     ) -> RuntimeFuture:
         """Map `fn` over the input arguments distributed across the runtime.
@@ -849,6 +873,14 @@ class Worker:
         if len(fnargs) == 0:
             raise RuntimeError('Unable to map 0 tasks.')
 
+        if cost_hints is None:
+            cost_hints = [0.0] * len(fnargs)
+        elif len(cost_hints) != len(fnargs):
+            raise ValueError(
+                f'cost_hints has length {len(cost_hints)}, but '
+                f'{len(fnargs)} tasks were created.',
+            )
+
         # Create a new mailbox
         mailbox_id = self._get_new_mailbox_id()
         self._mailboxes[mailbox_id] = WorkerMailbox.new_mailbox(len(fnargs))
@@ -868,6 +900,7 @@ class Worker:
                 task_name[i],
                 {**self._active_task.log_context, **log_context[i]},
                 task_priority,
+                cost_hints[i],
             )
             for i, fnarg in enumerate(fnargs)
         ]

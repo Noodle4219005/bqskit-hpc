@@ -206,25 +206,6 @@ _DUPPROBE_DIR = os.environ.get('BQPROF_DUPPROBE')
 # it either way for A/B.
 _SPEC_YIELD_ENV = os.environ.get('BQSKIT_SPEC_YIELD')
 
-# Skip successors whose commutation class has already been generated.
-#
-# LEAP appends one two-qubit block per layer, so a node is a sequence of gate
-# locations, and two sequences differing only by swapping gates on disjoint
-# qubits describe the same circuit. Measured on a 20-qubit msz=4 compile,
-# 31.3% of instantiate calls (weighted by block cost) were such repeats, and
-# the most expensive block was 44.4% -- the waste concentrates exactly where
-# the time goes.
-#
-# This is NOT strictly lossless, and the distinction matters. The templates
-# span the same set of unitaries, so no solution becomes unreachable. But each
-# template instantiates to its own parameters, and its successors continue
-# from those parameters; numerical synthesis is non-convex, so removing one
-# template also removes one starting point for the optimiser. The perturbation
-# is far weaker than a beam, which discards whole regions -- but it is not
-# zero, which is why this is verified on final circuit QUALITY rather than on
-# trace equality, and why it is off by default.
-_COMMUTE_DEDUP = os.environ.get('BQSKIT_COMMUTE_DEDUP') == '1'
-
 _TASKLOG_DIR = os.environ.get('BQSKIT_TASKLOG_DIR')
 """Same switch as the worker probe; unset disables memo events."""
 
@@ -240,6 +221,19 @@ _OCCUPANCY_STALE_AFTER = 1.0
 # would swing K wildly early in a synthesis.
 _SPEC_VALUE_FLOOR = float(os.environ.get('BQSKIT_SPEC_VALUE_FLOOR', '0.02'))
 _SPEC_VALUE_WARMUP = int(os.environ.get('BQSKIT_SPEC_VALUE_WARMUP', '32'))
+
+# Scheduling counters that are not memo events but must still reach the task-log
+# event stream. Without this, `stall_throttled_rounds` only ever landed in the
+# BQPROF_LEAPWASTE_AGGREGATE aggregate, so a run that did not enable it could not
+# tell whether the throttle had fired at all -- which is the state the tail
+# investigation of 2026-08-13 found itself in.
+_SCHEDULE_METRICS = frozenset({
+    'stall_throttled_rounds',
+    'stall_yield_suppressed',
+    'width_from_measured',
+    'width_from_estimator',
+    'value_capped',
+})
 
 # Service class actually used for speculation. Set BQSKIT_TASK_QOS=0 to submit
 # speculation as PRIORITY_CRITICAL, which makes the worker's priority queue
@@ -322,7 +316,12 @@ def _prefix_probe_record(
     kept: Any,
     n_frontier: int,
 ) -> None:
-    """Record the cost of the kept continuation against the discarded ones."""
+    """Record the cost of the kept continuation against the discarded ones.
+
+    The multi-prefix mechanism it motivated was measured and removed; see
+    results/prefix_diversity/summary_run_1018476.txt for the 91.8% / 95.7%
+    figures.
+    """
     if not _PREFIX_PROBE_DIR:
         return
     try:
@@ -397,9 +396,6 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
     now = time.monotonic()
     if not force and now - _LEAPWASTE_AGG_STATE.get('last_flush', 0.0) < 30.0:
         return
-    # Delayed pruning lives in Frontier, so its counters have to be folded
-    # in here rather than incremented at the LEAP call sites.
-    from bqskit.passes.search.frontier import _PRUNE_STATS
     pid = os.getpid()
     if _LEAPWASTE_AGG_STATE.get('pid') != pid:
         _LEAPWASTE_AGG_STATE.clear()
@@ -423,18 +419,11 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'deepen_raises': 0,
             'deepen_solved_after_raise': 0,
             'deepen_overflow_max': 0,
-            'prune_delayed': 0,
-            'prune_fired': 0,
-            'prune_capped': 0,
             'frontier_len_hist': {},
             'n_successors_hist': {},
             'layer_hist': {},
             'max_layer_per_synth_hist': {},
             'active_synth_max_layer': None,
-            'sum_n_pruned': 0,
-            'rounds_where_prune_fired': 0,
-            'sum_popped_per_round': 0,
-            'n_rounds': 0,
             'spec_hits': 0,
             'spec_misses': 0,
             'spec_evicted': 0,
@@ -476,13 +465,25 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'contention_sum': 0.0,
             'contention_samples': 0,
             'stall_throttled_rounds': 0,
+            # The other two arms of the same two counters. Both were emitted by
+            # `record_spec_metric` while missing from THIS dict, and because the
+            # increment below was a bare `+=` on a plain dict that is a
+            # KeyError, not a lost sample: job 1024323 (bigm, four arms) ran for
+            # 2 h 17 m and every arm died inside `synthesize` on
+            # `KeyError: 'value_capped'`. The job exited COMPLETED with no
+            # result.json, so it read as "the circuit was too big" rather than
+            # as a crash. `stall_yield_suppressed` was the same bug waiting on
+            # a run that both enabled the aggregate and took the non-scarce
+            # branch. Declaring them is the narrow fix; the guard in
+            # `record_spec_metric` is the one that stops it recurring.
+            'value_capped': 0,
+            'stall_yield_suppressed': 0,
             # Tasks thrown away to clear the queue for critical work, and how
             # many rounds did it. Together they price the guarantee: if
             # cancellation is large relative to spec_tasks, speculation is
             # being issued faster than it can pay off.
             'spec_cancelled': 0,
             'spec_yield_rounds': 0,
-            'commute_skipped': 0,
             # How many separate speculation batches were dispatched. With the
             # old one-at-a-time rule this equalled the number of rounds that
             # dispatched at all; a higher count means refill is working.
@@ -503,9 +504,6 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
         # must not appear in old aggregate output.
         for key in _GDFS_HIST_KEYS:
             summary.pop(key, None)
-    summary['prune_delayed'] = _PRUNE_STATS['delayed']
-    summary['prune_fired'] = _PRUNE_STATS['pruned']
-    summary['prune_capped'] = _PRUNE_STATS['capped']
     path = os.path.join(_LEAPWASTE_DIR, f'leapagg_{pid}.json')
     temporary = f'{path}.tmp'
     try:
@@ -625,11 +623,9 @@ class LEAPSynthesisPass(SynthesisPass):
         store_partial_solutions: bool = False,
         partials_per_depth: int = 25,
         min_prefix_size: int = 3,
-        beam_width: int | None = None,
         async_drain: bool = False,
         parallel_multistart: bool = False,
         instantiate_options: dict[str, Any] = {},
-        num_prefixes: int = 1,
     ) -> None:
         """
         Construct a search-based synthesis pass.
@@ -674,9 +670,6 @@ class LEAPSynthesisPass(SynthesisPass):
             instantiate_options (dict[str: Any]): Options passed directly
                 to circuit.instantiate when instantiating circuit
                 templates. (Default: {})
-
-            num_prefixes (int): The number of prefix continuations to keep.
-                (Default: 1)
 
         Environment:
             BQSKIT_MAX_ROLLBACKS controls the per-synthesis rollback budget.
@@ -756,18 +749,6 @@ class LEAPSynthesisPass(SynthesisPass):
             raise ValueError(
                 'Expected min_prefix_size to be positive, got %d.'
                 % int(min_prefix_size),
-            )
-
-        if beam_width is not None and not is_integer(beam_width):
-            raise TypeError(
-                'Expected beam_width to be an integer, got %s'
-                % type(beam_width),
-            )
-
-        if beam_width is not None and beam_width <= 0:
-            raise ValueError(
-                'Expected beam_width to be positive, got %d.'
-                % int(beam_width),
             )
 
         if not isinstance(instantiate_options, dict):
@@ -894,19 +875,6 @@ class LEAPSynthesisPass(SynthesisPass):
                 % speculate_memo,
             )
 
-        if not is_integer(num_prefixes):
-            raise TypeError(
-                'Expected num_prefixes to be an integer, got %s'
-                % type(num_prefixes),
-            )
-
-        if num_prefixes < 1:
-            raise ValueError(
-                'Expected num_prefixes to be at least 1, got %d.'
-                % int(num_prefixes),
-            )
-
-        self.num_prefixes = num_prefixes
         self.max_rollbacks = int(os.environ.get(
             'BQSKIT_MAX_ROLLBACKS',
             os.environ.get('BQSKIT_MAX_COMMITTED', '8'),
@@ -915,20 +883,6 @@ class LEAPSynthesisPass(SynthesisPass):
             raise ValueError(
                 'Expected BQSKIT_MAX_ROLLBACKS to be nonnegative, got %d.'
                 % self.max_rollbacks,
-            )
-        self.beam_width = beam_width
-        # A beam pops several nodes per round and publishes all of them, so
-        # the K-1 non-best expansions reach the frontier before the serial
-        # search would have expanded their parents at all. That is the
-        # ordering violation runahead exists to avoid, and it silently makes
-        # K a quality knob again, so the two are not allowed to coexist. The
-        # KBFS ablation lives on the expand_k=1 + beam_width=N side.
-        if (expand_k_auto or expand_k >= 2) and beam_width is not None:
-            raise ValueError(
-                'BQSKIT_EXPAND_K >= 2 requires beam_width=None, got '
-                'beam_width=%s. A beam publishes every popped node, which '
-                'reorders the logical search that runahead is required to '
-                'preserve.' % beam_width,
             )
         self.async_drain = async_drain
         self.parallel_multistart = parallel_multistart
@@ -1131,8 +1085,33 @@ class LEAPSynthesisPass(SynthesisPass):
             before the critical path needed it.
             """
             if aggregate_enabled:
-                _LEAPWASTE_AGG_STATE[metric] += amount
-            if _memo_ev is not None and metric.startswith('spec_'):
+                # `+=` on a plain dict raises KeyError for a metric that was
+                # never declared in the aggregate's key set, and that exception
+                # propagates out of `synthesize` and kills the compile. A probe
+                # must never be able to do that. Job 1024323 lost four arms and
+                # 2 h 17 m of a 448-core allocation to exactly this, and its
+                # Slurm state was COMPLETED, so nothing about the failure said
+                # "probe".
+                #
+                # Self-registering instead of raising costs one thing: a typo in
+                # a metric name silently becomes a new counter rather than an
+                # error. That is why the unknown name is ALSO appended to
+                # `undeclared_metrics`, which lands in the aggregate file -- a
+                # typo shows up as a named entry there instead of as a crash or
+                # as silence. This project has been bitten more often by probes
+                # that reported confidently on nothing than by typos.
+                if metric in _LEAPWASTE_AGG_STATE:
+                    _LEAPWASTE_AGG_STATE[metric] += amount
+                else:
+                    _LEAPWASTE_AGG_STATE[metric] = amount
+                    unknown = _LEAPWASTE_AGG_STATE.setdefault(
+                        'undeclared_metrics', [],
+                    )
+                    if metric not in unknown:
+                        unknown.append(metric)
+            if _memo_ev is not None and (
+                metric.startswith('spec_') or metric in _SCHEDULE_METRICS
+            ):
                 _memo_ev(metric, len(speculation_memo))
 
         # Per-block memo event stream. One line per memo transition, with the
@@ -1143,7 +1122,7 @@ class LEAPSynthesisPass(SynthesisPass):
             _blk = '%x' % (abs(hash(utry)) & 0xFFFFFF)
             _mf = open(
                 os.path.join(_TASKLOG_DIR, f'memo_{os.getpid()}.jsonl'),
-                'a', buffering=1 << 16,
+                'a', buffering=1,   # line-buffered: see below
             )
 
             def _memo_ev(ev: str, size: int) -> None:
@@ -1190,36 +1169,9 @@ class LEAPSynthesisPass(SynthesisPass):
         _dup_pre_seen: set[Any] = set()
 
         def note_pre_dup(successors: list[Circuit]) -> list[Circuit]:
-            """Count globally, drop locally.
-
-            Measuring and acting need different scopes, and conflating them
-            broke the search. `_dup_pre_seen` accumulates for the whole
-            synthesis, so "has this commutation class been seen before" depends
-            on the order nodes were expanded in -- and speculation expands
-            nodes ahead of the critical path. Speculation therefore populated
-            the set early, and successors the critical path would have kept
-            were dropped instead. T_K = T_1 cannot hold against a filter whose
-            decisions depend on K.
-
-            Measured consequence: rc_adder_6 at msz=4 gave 2Q 81 on four arms
-            and 86 with runahead and commutation dedup together.
-
-            So the global set now only COUNTS -- it is what the probe reports
-            as the total redundancy rate -- while the drop decision uses a set
-            scoped to this one expansion. That set is a pure function of the
-            successor list, which `gen_successors` produces deterministically,
-            so no amount of speculation can change what survives.
-
-            The cost is real and should not be hidden: only repeats WITHIN one
-            node's successors are removed now, not repeats across nodes. The
-            cross-node share of the 31.3% cost-weighted redundancy is given up
-            until the memo can share an instantiate between commutation-
-            equivalent successors without dropping either of them.
-            """
-            if _DUPPROBE_DIR is None and not _COMMUTE_DEDUP:
+            """Count commutation duplicates for instrumentation."""
+            if _DUPPROBE_DIR is None:
                 return successors
-            local_seen: set[Any] = set()
-            kept: list[Circuit] = []
             for _c in successors:
                 _dup_state['pre_generated'] += 1
                 _k = _commutation_canon(_c)
@@ -1228,14 +1180,7 @@ class LEAPSynthesisPass(SynthesisPass):
                     _dup_state['pre_dup'] += 1
                 else:
                     _dup_pre_seen.add(_k)
-                # Local: the only thing allowed to drop a successor.
-                if _COMMUTE_DEDUP:
-                    if _k in local_seen:
-                        record_spec_metric('commute_skipped')
-                        continue
-                    local_seen.add(_k)
-                kept.append(_c)
-            return kept if _COMMUTE_DEDUP else successors
+            return successors
         _dup_state: dict[str, Any] = {
             'added': 0, 'dup': 0, 'by_layer': {}, 'dup_by_layer': {},
             'pre_generated': 0, 'pre_dup': 0,
@@ -1287,10 +1232,10 @@ class LEAPSynthesisPass(SynthesisPass):
 
             The parameters are part of the key, not decoration. Successors are
             built as `circuit.copy()` plus one appended layer, so a node
-            carries its parent's optimised parameters, and instantiate starts
-            from them. Two nodes reached by different paths can share a
-            gate/location sequence while holding different parameters -- and
-            they then settle into DIFFERENT local minima.
+            carries its parent's optimised parameters. Two nodes reached by
+            different paths can share a gate/location sequence while holding
+            different parameters -- and they then settle into DIFFERENT local
+            minima.
 
             Measured on a structure that cannot represent its target (one CNOT
             against a random SU(4), which needs three), four starting points
@@ -1304,6 +1249,23 @@ class LEAPSynthesisPass(SynthesisPass):
             changing commitment -- exactly what the design forbids. Note that
             bit-identity checks pass with the unsound key whenever the run
             happens not to collide, so they cannot be the guard here.
+
+            CORRECTED 2026-08-14. This docstring used to continue "and
+            instantiate starts from them", and that was FALSE for every run
+            before BQSKIT_WARM_START existed. `Circuit.instantiate` has one
+            exit, `Instantiater.multi_start_instantiate_inplace`, and all four
+            of its implementations hardcoded `RandomStartGenerator()` -- so the
+            carried parameters were discarded at every multistarts value,
+            including 1. Probe: a circuit whose parameters WERE the exact
+            solution still got a start 4.7668 rad away and converged elsewhere.
+            The four costs quoted above are evidence OF random starts, not of
+            inherited ones; a true measurement was attached to a false
+            mechanism, which reads more convincingly than a guess would have.
+
+            The conclusion survives the correction, so the key is unchanged:
+            including parameters is now permanently over-strict while starts
+            are random (fewer hits, never a wrong hit), kept only because
+            removing them is a separate unverified change.
 
             Keying on (gates, locations, parameters) loses nothing the cache
             was for: a node before and after a commit is the SAME circuit with
@@ -1409,8 +1371,90 @@ class LEAPSynthesisPass(SynthesisPass):
         # Begin the search with an initial layer
         frontier = Frontier(utry, self.heuristic_function)
         initial_layer = layer_gen.gen_initial_layer(utry, data)
-        initial_layer.instantiate(utry, **instantiate_options)
+        prefetched_initial_successors: list[Circuit] | None = None
+        prefetched_initial_future: RuntimeFuture | None = None
+        prefetched_initial_owners: list[tuple[int, int]] | None = None
+        if self.parallel_multistart and int(
+            instantiate_options.get('multistarts', 1),
+        ) > 1:
+            # The initial layer is one circuit per block, so its only
+            # parallelism is its M independent starts. At msz=6 on
+            # square_heisenberg_N16 there are six blocks: this map is 6 x M
+            # tasks (24 at M=4). More importantly, the first expansion is
+            # certain because the initial layer is the frontier's only node.
+            # Its 6 x C(6, 2) x M = 360 tasks at M=4 fill the first trough
+            # against 96 workers, where measured msz=6 occupancy was median
+            # 9.0 with p90 86.7: bursty capacity that this work can use without
+            # speculation or a T_K = T_1 argument.
+            num_starts = int(instantiate_options['multistarts'])
+            single_options = dict(instantiate_options)
+            single_options.pop('multistarts', None)
+            single_options.pop('seed', None)
+            base_seed = int(instantiate_options.get('seed', 0) or 0)
+
+            # gen_successors reads only structure and connectivity, while one
+            # random start overwrites every parameter during instantiation.
+            # Therefore the templates below are exactly the ones that would be
+            # generated after the initial layer converges; retain the future
+            # outside the speculation memo and consume it on the first pop.
+            prefetched_initial_successors = note_pre_dup(list(
+                layer_gen.gen_successors(initial_layer, data),
+            ))
+            if prefetched_initial_successors:
+                flat_circuits = []
+                flat_seeds = []
+                prefetched_initial_owners = []
+                for successor_index, successor in enumerate(
+                    prefetched_initial_successors,
+                ):
+                    for start_index in range(num_starts):
+                        flat_circuits.append(successor)
+                        flat_seeds.append(
+                            base_seed * num_starts
+                            + successor_index * num_starts
+                            + start_index,
+                        )
+                        prefetched_initial_owners.append(
+                            (0, successor_index),
+                        )
+                prefetched_initial_future = get_runtime().map(
+                    _instantiate_single_start,
+                    flat_circuits,
+                    [utry] * len(flat_circuits),
+                    flat_seeds,
+                    **single_options,
+                )
+
+            initial_seeds = [
+                base_seed * num_starts + start_index
+                for start_index in range(num_starts)
+            ]
+            initial_candidates = await get_runtime().map(
+                _instantiate_single_start,
+                [initial_layer] * num_starts,
+                [utry] * num_starts,
+                initial_seeds,
+                **single_options,
+            )
+            initial_layer = min(
+                initial_candidates,
+                key=lambda candidate: self.cost.calc_cost(candidate, utry),
+            )
+        else:
+            initial_layer.instantiate(utry, **instantiate_options)
         frontier.add(initial_layer, 0)
+
+        def abandon_prefetched_initial() -> None:
+            """Cancel first-round work if no first expansion consumes it."""
+            nonlocal prefetched_initial_future
+            if prefetched_initial_future is not None:
+                # Runtime futures own a mailbox until they are awaited. Dropping
+                # the Python reference would leave it owned by this synthesis;
+                # cancel removes that mailbox and sends cancellation to every
+                # outstanding task, so an early success or empty frontier
+                # cannot leave work behind or deadlock a later runtime wait.
+                get_runtime().cancel(prefetched_initial_future)
+                prefetched_initial_future = None
 
         # Track best circuit, initially the initial layer
         best_dist = self.cost.calc_cost(initial_layer, utry)
@@ -1443,6 +1487,7 @@ class LEAPSynthesisPass(SynthesisPass):
             if aggregate_enabled:
                 _leapwaste_aggregate_finish()
             emit_blockprof('success_layer0', 0, float(best_dist))
+            abandon_prefetched_initial()
             return initial_layer
 
         # Record layers that have been warned about
@@ -1564,11 +1609,10 @@ class LEAPSynthesisPass(SynthesisPass):
                 n_added_this_iter = 0
                 prefix_formed = False
                 n_cleared = None
-            # `beam_width` controls how many nodes are committed per round.
-            # Ordered speculation separately fills the runtime with expansions
-            # of nodes that remain in the frontier, without changing this
-            # commit order.
-            beam = self.beam_width
+            # Read once per round, used twice: to size K below, and to decide
+            # whether the stall throttle has anyone to yield to. None means the
+            # occupancy broadcast is missing or stale.
+            measured_idle: int | None = None
 
             # K is recomputed every round from the measured successor width.
             # It only decides how many frontier nodes are speculated on; the
@@ -1683,14 +1727,36 @@ class LEAPSynthesisPass(SynthesisPass):
             # K never affects which node is popped, so throttling changes the
             # schedule and not the search: T_K = T_1 still holds, and the
             # block resumes its full width the moment it improves again.
+            # Yielding is only a gift if somebody can take it. At the end of a
+            # circuit one straggler block runs alone, and then shrinking K hands
+            # its workers to nobody: measured on rc_adder_6 msz=4, the final
+            # 195 s of a 404 s run kept 7.6 of 112 workers busy. Use the
+            # scarcity test unconditionally: it was 1.346x faster and
+            # bit-identical on rc_adder_6 msz=4 (job 1023530). The flag was
+            # deleted rather than defaulted because a speedup that does not
+            # change the output has no business being optional. The test uses
+            # the same measured count K is sized from -- a saturated machine
+            # reports ~0 idle, which is below any width.
             if effective_k > 1 and _gap_ema is not None:
                 _since = iteration - _last_improve_round
                 _stall = _since / max(1.0, _gap_ema)
                 if _stall > self.stall_patience:
-                    effective_k = max(
-                        1, int(effective_k / (_stall / self.stall_patience)),
+                    _scarce = (
+                        measured_idle is None
+                        or measured_idle < s
                     )
-                    record_spec_metric('stall_throttled_rounds')
+                    if _scarce:
+                        effective_k = max(
+                            1,
+                            int(effective_k / (_stall / self.stall_patience)),
+                        )
+                        record_spec_metric('stall_throttled_rounds')
+                    else:
+                        # Counted, not silent: a suppression that leaves no
+                        # trace is indistinguishable from a throttle that never
+                        # fired, and telling those apart is the whole point of
+                        # the A/B.
+                        record_spec_metric('stall_yield_suppressed')
 
             # Poll at most once per round: RuntimeFuture._done warns that
             # busy-wait polling can deadlock the runtime task.
@@ -1727,6 +1793,8 @@ class LEAPSynthesisPass(SynthesisPass):
             popped_expansions: list[
                 tuple[list[Circuit], list[Circuit] | None],
             ] = []
+            first_expansion_future: RuntimeFuture | None = None
+            first_expansion_owners: list[tuple[int, int]] | None = None
 
             while not frontier.empty():
                 logical_pop_cost = (
@@ -1819,7 +1887,20 @@ class LEAPSynthesisPass(SynthesisPass):
                 # shared loop variable would silently mis-record depth for
                 # every node after the first, and the search would still
                 # look healthy.
-                if effective_k >= 2:
+                if prefetched_initial_future is not None:
+                    # This is not speculation. The initial layer was the only
+                    # node in the frontier, so its expansion was certain; the
+                    # future was launched before initial-layer instantiation
+                    # and is consumed here instead of dispatching the same
+                    # (successor, start) pairs a second time.
+                    first_expansion_future = prefetched_initial_future
+                    first_expansion_owners = prefetched_initial_owners
+                    prefetched_initial_future = None
+                    node_successors = prefetched_initial_successors or []
+                    successors.extend(node_successors)
+                    successor_layers.extend([top_layer] * len(node_successors))
+                    n_node_successors = len(node_successors)
+                elif effective_k >= 2:
                     structure_key = circuit_structure_key(top_circuit)
                     memo_entry = speculation_memo.get(structure_key)
                     if memo_entry is not None and memo_entry.epoch != epoch:
@@ -1911,17 +1992,9 @@ class LEAPSynthesisPass(SynthesisPass):
                         else 0.5 * succ_ema + 0.5 * n_node_successors
                     )
 
-                if beam is None:
-                    # Original behaviour: one node per round.
-                    break
-                if len(popped) >= beam:
-                    # Never speculate on more nodes than the frontier is
-                    # allowed to keep. This is the fixed-K expansion of KBFS
-                    # (Felner, Kraus & Korf 2003), kept as the ablation
-                    # baseline for the order-preserving form.
-                    break
+                break
 
-            if effective_k < 2:
+            if first_expansion_future is not None or effective_k < 2:
                 tasks_dispatched += len(successors)
                 # The K=1 path needs the same accounting as the K>=2 path.
                 # Without it the BASELINE every measurement is compared
@@ -1938,7 +2011,7 @@ class LEAPSynthesisPass(SynthesisPass):
             critical_future: RuntimeFuture | None = None
             critical_batches: list[list[Circuit]] = []
             critical_owners: list[tuple[int, int]] | None = None
-            if effective_k >= 2:
+            if effective_k >= 2 and first_expansion_future is None:
                 critical_batches = [
                     node_successors
                     for node_successors, node_results in popped_expansions
@@ -2113,7 +2186,17 @@ class LEAPSynthesisPass(SynthesisPass):
             t_map_end = None
 
             # Instantiate successors
-            if effective_k >= 2:
+            if first_expansion_future is not None:
+                # The parent was popped only after its initial instantiation
+                # completed, but this prefetch has been running since before
+                # that wait. `collect_batches` restores successor order and
+                # picks the best start exactly like an ordinary fan-out.
+                circuits = (await collect_batches(
+                    first_expansion_future,
+                    [successors],
+                    first_expansion_owners,
+                ))[0]
+            elif effective_k >= 2:
                 # The one wait that cannot be hidden: the logical search
                 # cannot publish until these land. Speculation is judged by how
                 # much of this it removes, not by how busy it keeps the machine.
@@ -2186,9 +2269,7 @@ class LEAPSynthesisPass(SynthesisPass):
                 # Note: the runtime has no wait-any across futures and
                 # `RuntimeFuture._done` documents that polling can deadlock,
                 # so overlapping the next round's dispatch with this round's
-                # tail is not expressible here. Rounds are sized by
-                # `beam_width` instead, which amortises the tail over B
-                # parents rather than over the block's degree.
+                # tail is not expressible here.
                 drain_future = get_runtime().map(
                     Circuit.instantiate,
                     successors,
@@ -2349,6 +2430,7 @@ class LEAPSynthesisPass(SynthesisPass):
                             ] += 1
                         _leapwaste_aggregate_finish()
                     emit_blockprof('success', layer + 1, float(dist))
+                    abandon_prefetched_initial()
                     return circuit
 
                 if self.check_new_best(layer + 1, dist, best_layer, best_dist):
@@ -2404,29 +2486,6 @@ class LEAPSynthesisPass(SynthesisPass):
                             layer + 1, frontier, circuit, len(frontier),
                         )
 
-                        # Multi-prefix: keep the best few continuations
-                        # rather than only the one LEAP picked.
-                        #
-                        # P0-d measured that 85-93% of prefix formations
-                        # discard a candidate the frontier itself ranks
-                        # CHEAPER than the one kept. That is possible
-                        # because check_new_best keeps by depth progress
-                        # while the frontier orders by AStarHeuristic, so
-                        # the two criteria disagree -- and racing both is
-                        # how you avoid having to know which is right.
-                        #
-                        # Popped destructively, and BEFORE the clear:
-                        # Frontier exposes no way to read the circuits
-                        # behind topk_ids, so this is the only way to retain
-                        # them. At num_prefixes == 1 the loop body never
-                        # runs and what follows is exactly the original
-                        # clear-then-add.
-                        alternates = []
-                        for _ in range(self.num_prefixes - 1):
-                            if frontier.empty():
-                                break
-                            alternates.append(frontier.pop())
-
                         # Commit stores the value from BEFORE this prefix, so
                         # a rollback lands at the branch point rather than at
                         # the prefix that turned out to be wrong. Advance only
@@ -2441,9 +2500,7 @@ class LEAPSynthesisPass(SynthesisPass):
                         # something the frontier itself ranks cheaper, median
                         # gap 0.083-0.114. A large gap means the decision was
                         # forced against the frontier's own ordering, which
-                        # makes it the likeliest mistake to undo. Unlike the
-                        # progress-rate signal that sank the adaptive beam,
-                        # this distribution is not saturated.
+                        # makes it the likeliest mistake to undo.
                         _remaining = frontier.topk_costs(1)
                         _regret = (
                             frontier.score(circuit) - _remaining[0]
@@ -2470,14 +2527,6 @@ class LEAPSynthesisPass(SynthesisPass):
                         if add_child(circuit, layer + 1):
                             if leapwaste_enabled:
                                 n_added_this_iter += 1
-                        # Re-seeded at the LAYER THEY HELD, not at layer + 1:
-                        # an alternate is a sibling of the kept node, not a
-                        # child of it, and promoting it would corrupt every
-                        # depth statistic downstream.
-                        for alt_circuit, alt_layer in alternates:
-                            if add_child(alt_circuit, alt_layer):
-                                if leapwaste_enabled:
-                                    n_added_this_iter += 1
 
                 if self.store_partial_solutions:
                     if layer not in psols:
@@ -2532,23 +2581,6 @@ class LEAPSynthesisPass(SynthesisPass):
                     n_cleared,
                 )
 
-            # Bound the frontier by width.
-            #
-            # LEAP's own bound is `frontier.clear()` on a formed prefix, which
-            # fires on an absolute layer threshold (min_prefix_size). Measured
-            # at max_synthesis_size 4 that condition fires in 0.04-0.16% of
-            # rounds while the frontier reaches a p90 of 3,676, because the
-            # depth a generic w-qubit unitary needs grows with 4^w while the
-            # threshold does not. A width bound does not depend on depth.
-            # No-op when `beam_width` is unset.
-            n_pruned_this_round = frontier.prune(beam)
-            if aggregate_enabled and _LEAPWASTE_AGG_STATE:
-                _LEAPWASTE_AGG_STATE['sum_n_pruned'] += n_pruned_this_round
-                if n_pruned_this_round > 0:
-                    _LEAPWASTE_AGG_STATE['rounds_where_prune_fired'] += 1
-                _LEAPWASTE_AGG_STATE['sum_popped_per_round'] += len(popped)
-                _LEAPWASTE_AGG_STATE['n_rounds'] += 1
-
             layer_diff = abs(best_layer - round_layer)
             if (
                 layer_diff % self.no_progress_layers_allowed == 0
@@ -2577,6 +2609,7 @@ class LEAPSynthesisPass(SynthesisPass):
         # rather than finding a verified answer, so the trajectory recorded
         # here is the evidence for whether more budget would have helped.
         emit_blockprof('exhausted', best_layer, float(best_dist))
+        abandon_prefetched_initial()
         return best_circ
 
     def check_new_best(

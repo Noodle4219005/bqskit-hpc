@@ -15,7 +15,7 @@ from bqskit.ir.opt.cost.residual import ResidualsFunction
 from bqskit.ir.opt.instantiater import Instantiater
 from bqskit.ir.opt.minimizer import Minimizer
 from bqskit.ir.opt.minimizers.ceres import CeresMinimizer
-from bqskit.ir.opt.multistartgens.random import RandomStartGenerator
+from bqskit.ir.opt.multistartgens import RandomStartGenerator
 from bqskit.qis.state.state import StateLike
 from bqskit.qis.state.state import StateVector
 

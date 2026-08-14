@@ -8,7 +8,7 @@ import numpy as np
 import numpy.typing as npt
 
 from bqskit.ir.opt.cost.functions import HilbertSchmidtCostGenerator
-from bqskit.ir.opt.multistartgens.random import RandomStartGenerator
+from bqskit.ir.opt.multistartgens import RandomStartGenerator
 from bqskit.qis.state.state import StateVector
 from bqskit.qis.state.system import StateSystem
 from bqskit.qis.unitary.unitarymatrix import UnitaryMatrix

@@ -839,9 +839,11 @@ def _multistarts_override(default: int) -> int:
 
     This is the one quality knob that lives entirely inside LEAP's parallel
     section: more random starts per instantiate means more chances to land in a
-    good local minimum, so LEAP terminates at a shallower circuit -- and the
-    extra work is embarrassingly parallel, unlike partition and unfold, which
-    are single-process (measured: 211.9 s + 134.4 s serial on qv_N060).
+    good local minimum, so LEAP terminates at a shallower circuit. The extra
+    work is embarrassingly parallel in principle, but the default path runs it
+    serially inside one worker; BQSKIT_PARALLEL_MULTISTART makes it actually
+    parallel, unlike partition and unfold, which are single-process (measured:
+    211.9 s + 134.4 s serial on qv_N060).
 
     Note that instantiate options are shared with the gate-removal scan, so
     raising this without also setting BQSKIT_DELETION_PREDICATE=multi makes the
@@ -863,6 +865,30 @@ def _multistarts_override(default: int) -> int:
     if value < 1:
         raise ValueError(f'BQSKIT_MULTISTARTS must be >= 1, got {value}.')
     return value
+
+
+def _parallel_multistart() -> bool:
+    """Let BQSKIT_PARALLEL_MULTISTART split each start into its own task.
+
+    With the flag off, ``multistarts=M`` is an M-times serial section hidden
+    inside every task LEAP dispatches: ``Circuit.instantiate`` ends at
+    ``Instantiater.multi_start_instantiate_inplace``
+    (``bqskit/ir/opt/instantiater.py:90``), a plain list comprehension with no
+    runtime involvement. The parallel version seeds each start explicitly
+    instead of sharing one process's random stream, so it is not byte-identical
+    to the serial version at the same M; a parallel M=4 arm is its own control.
+    """
+    text = os.environ.get('BQSKIT_PARALLEL_MULTISTART')
+    if text is None:
+        return False
+    if text == '1':
+        return True
+    if text == '0':
+        return False
+    raise ValueError(
+        'BQSKIT_PARALLEL_MULTISTART must be 0 or 1, '
+        f'got {text!r}.',
+    )
 
 
 def get_instantiate_options(optimization_level: int) -> dict[str, Any]:
@@ -1057,6 +1083,7 @@ def build_standard_search_synthesis_workflow(
         success_threshold=synthesis_epsilon,
         min_prefix_size=[3, 4, 7, 9][optimization_level - 1],
         instantiate_options=get_instantiate_options(optimization_level),
+        parallel_multistart=_parallel_multistart(),
     )
     return IfThenElsePass(WidthPredicate(3), qsearch, leap)
 
@@ -1304,6 +1331,7 @@ def build_seqpam_mapping_optimization_workflow(
         success_threshold=synthesis_epsilon,
         min_prefix_size=9,
         instantiate_options=get_instantiate_options(optimization_level),
+        parallel_multistart=_parallel_multistart(),
     )
 
     if error_sim_size is not None:
@@ -1788,6 +1816,7 @@ def _synthesis_workflow(
         success_threshold=synthesis_epsilon,
         min_prefix_size=[3, 4, 7, 9][optimization_level - 1],
         instantiate_options=get_instantiate_options(optimization_level),
+        parallel_multistart=_parallel_multistart(),
     )
 
     if optimization_level < 4:
@@ -1846,6 +1875,7 @@ def _stateprep_workflow(
             success_threshold=synthesis_epsilon,
             layer_generator=layer_gen,
             instantiate_options=inst_ops,
+            parallel_multistart=_parallel_multistart(),
             min_prefix_size=3,
             cost=HilbertSchmidtCostGenerator(),
         )
@@ -1861,6 +1891,7 @@ def _stateprep_workflow(
             success_threshold=synthesis_epsilon,
             layer_generator=layer_gen,
             instantiate_options=inst_ops,
+            parallel_multistart=_parallel_multistart(),
             min_prefix_size=5,
         )
 
@@ -1876,6 +1907,7 @@ def _stateprep_workflow(
                 success_threshold=synthesis_epsilon,
                 layer_generator=layer_gen,
                 instantiate_options=inst_ops,
+                parallel_multistart=_parallel_multistart(),
                 min_prefix_size=7,
             )
         else:
@@ -1897,6 +1929,7 @@ def _stateprep_workflow(
                 success_threshold=synthesis_epsilon,
                 layer_generator=layer_gen,
                 instantiate_options=inst_ops,
+                parallel_multistart=_parallel_multistart(),
                 min_prefix_size=7,
             )
         else:
@@ -1946,6 +1979,7 @@ def _statemap_workflow(
             success_threshold=synthesis_epsilon,
             layer_generator=layer_gen,
             instantiate_options=inst_ops,
+            parallel_multistart=_parallel_multistart(),
             min_prefix_size=3,
         )
 
@@ -1960,6 +1994,7 @@ def _statemap_workflow(
             success_threshold=synthesis_epsilon,
             layer_generator=layer_gen,
             instantiate_options=inst_ops,
+            parallel_multistart=_parallel_multistart(),
             min_prefix_size=5,
         )
 
@@ -1975,6 +2010,7 @@ def _statemap_workflow(
                 success_threshold=synthesis_epsilon,
                 layer_generator=layer_gen,
                 instantiate_options=inst_ops,
+                parallel_multistart=_parallel_multistart(),
                 min_prefix_size=7,
             )
         else:
@@ -1996,6 +2032,7 @@ def _statemap_workflow(
                 success_threshold=synthesis_epsilon,
                 layer_generator=layer_gen,
                 instantiate_options=inst_ops,
+                parallel_multistart=_parallel_multistart(),
                 min_prefix_size=7,
             )
         else:

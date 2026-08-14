@@ -60,6 +60,7 @@ class RuntimeTask:
         task_name: str | None = None,
         log_context: dict[str, str] = {},
         priority: int = PRIORITY_CRITICAL,
+        cost_hint: float = 0.0,
     ) -> None:
         """Create the task with a new id and return address."""
         RuntimeTask.task_counter += 1
@@ -72,6 +73,9 @@ class RuntimeTask:
         the behaviour it has today: with a single class in play, a queue
         ordered by (class, arrival) IS the FIFO it replaces.
         """
+
+        self.cost_hint = cost_hint
+        """Estimated processing cost used by optional pool ordering."""
 
         self.serialized_fnargs = dill.dumps(fnargs)
         self._fnargs: tuple[Any, Any, Any] | None = None

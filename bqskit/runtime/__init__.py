@@ -144,6 +144,7 @@ class RuntimeHandle(Protocol):
         *args: Any,
         task_name: str | None = None,
         log_context: dict[str, str] = {},
+        cost_hint: float = 0.0,
         **kwargs: Any,
     ) -> RuntimeFuture:
         """
@@ -203,6 +204,7 @@ class RuntimeHandle(Protocol):
         task_name: Sequence[str | None] | str | None = None,
         log_context: Sequence[dict[str, str]] | dict[str, str] = {},
         task_priority: int = 0,
+        cost_hints: Sequence[float] | None = None,
         **kwargs: Any,
     ) -> RuntimeFuture:
         """

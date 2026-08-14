@@ -15,6 +15,7 @@ from bqskit.ir.operation import Operation
 from bqskit.qis.unitary.unitarymatrix import UnitaryMatrix
 from bqskit.ir.opt.cost.functions import HilbertSchmidtResidualsGenerator
 from bqskit.ir.opt.cost.generator import CostFunctionGenerator
+from bqskit.runtime import get_runtime
 from bqskit.utils.typing import is_real_number
 _logger = logging.getLogger(__name__)
 
@@ -38,6 +39,24 @@ _logger = logging.getLogger(__name__)
 # what it would COST.
 _SCAN_PROBE_DIR = os.environ.get('BQPROF_SCAN_DIR')
 _SCAN_FH_STATE: dict[str, Any] = {'pid': None, 'fh': None}
+_SCAN_LOOKAHEAD = int(os.environ.get('BQSKIT_SCAN_LOOKAHEAD', '0'))
+
+if _SCAN_LOOKAHEAD < 0:
+    raise ValueError('BQSKIT_SCAN_LOOKAHEAD must be non-negative.')
+
+
+def _try_removal(
+    circuit: Circuit,
+    target: Any,
+    cycle: int,
+    qudit: int,
+    **kwargs: Any,
+) -> Circuit:
+    """Try one gate removal without modifying the supplied baseline."""
+    wc = circuit.copy()
+    wc.pop((cycle, qudit))
+    wc.instantiate(target, **kwargs)
+    return wc
 
 
 def _scan_probe_emit(record: dict[str, Any]) -> None:
@@ -246,6 +265,156 @@ class ScanningGateRemovalPass(BasePass):
                 for length, count in _lengths.items() if length > 5
             )
         _t_pass = time.perf_counter()
+        if _SCAN_LOOKAHEAD > 0:
+            candidates: list[tuple[int, Operation]] = []
+            for cycle, op in circuit.operations_with_cycles(
+                reverse=reverse_iter,
+            ):
+                if _probe_on:
+                    if op.num_qudits >= 2:
+                        _probe['n_ops_multi'] += 1
+                    else:
+                        _probe['n_ops_1q'] += 1
+
+                if not self.collection_filter(op):
+                    _logger.debug(
+                        f'Skipping operation {op} at cycle {cycle}.',
+                    )
+                    if _probe_on:
+                        _probe['skipped_by_filter'] += 1
+                    continue
+
+                candidates.append((cycle, op))
+
+            # LEAP keeps 61.4 of 96 workers occupied because its independent
+            # instantiations fan out through the runtime. This scan measured
+            # 1,014 seconds but only 2,867 core-seconds, or 2.0 of 96 workers;
+            # its 87--99.96% rejected removal attempts do not change the
+            # baseline, so their answers can be made concurrently. Keep both
+            # counts explicit: a low discarded count is the evidence that this
+            # speculative work is buying occupancy rather than needlessly
+            # re-instantiating an already obsolete circuit.
+            _probe['speculations_used'] = 0
+            _probe['speculations_discarded'] = 0
+            next_candidate = 0
+            while next_candidate < len(candidates):
+                window_start = next_candidate
+                window = candidates[
+                    next_candidate:next_candidate + _SCAN_LOOKAHEAD
+                ]
+                next_candidate += len(window)
+
+                # A candidate's stored cycle belongs to the original circuit.
+                # Every result in this window shares this one baseline, so the
+                # left-to-right shift is calculated ONCE from that baseline.
+                # Recomputing it from a speculative result would incorrectly
+                # make an unaccepted removal affect a later decision.
+                idx_shift = 0
+                if self.start_from_left:
+                    idx_shift = circuit.num_cycles - circuit_copy.num_cycles
+                shifted_cycles = [cycle - idx_shift for cycle, _ in window]
+                qudits = [op.location[0] for _, op in window]
+
+                _t_window = time.perf_counter() if _probe_on else 0.0
+                working_copies: list[Circuit] = await get_runtime().map(
+                    _try_removal,
+                    [circuit_copy] * len(window),
+                    [target] * len(window),
+                    shifted_cycles,
+                    qudits,
+                    **instantiate_options,
+                )
+                _window_elapsed = (
+                    time.perf_counter() - _t_window if _probe_on else 0.0
+                )
+
+                for index, ((cycle, op), working_copy) in enumerate(
+                    zip(window, working_copies),
+                ):
+                    _logger.debug(
+                        f'Attempting removal of operation at cycle {cycle}.',
+                    )
+                    _logger.debug(f'Operation: {op}')
+
+                    _removed = (
+                        self.cost(working_copy, target)
+                        < self.success_threshold
+                    )
+                    _probe['speculations_used'] += 1
+                    if _probe_on:
+                        _arity = 'multi' if op.num_qudits >= 2 else '1q'
+                        _probe[f'attempts_{_arity}'] += 1
+                        # Runtime.map exposes one elapsed time for the whole
+                        # window, not one worker time per candidate. Splitting
+                        # it preserves the pass-wall total while the two
+                        # speculation counters record which candidate work
+                        # was actually published and which was thrown away.
+                        _inst_elapsed = _window_elapsed / len(window)
+                        _probe[f'inst_seconds_{_arity}'] += _inst_elapsed
+                        if _removed:
+                            _probe[f'removed_{_arity}'] += 1
+                        try:
+                            _u = op.get_unitary()
+                            _d = float(
+                                _u.get_distance_from(
+                                    UnitaryMatrix.identity(
+                                        _u.dim, _u.radixes,
+                                    ),
+                                ),
+                            )
+                        except Exception:
+                            _d = -1.0
+                        if _d >= 0.0:
+                            _b = min(int(_d * 20), 19)
+                            _hist = _probe.setdefault(
+                                'idist_'
+                                f'{_arity}_'
+                                f'{"removed" if _removed else "kept"}',
+                                {},
+                            )
+                            _hist[str(_b)] = _hist.get(str(_b), 0) + 1
+                        _by = _probe.setdefault(
+                            f'gate_{"removed" if _removed else "kept"}',
+                            {},
+                        )
+                        _name = type(op.gate).__name__
+                        _by[_name] = _by.get(_name, 0) + 1
+                        _sec = _probe.setdefault('gate_inst_seconds', {})
+                        _sec[_name] = round(
+                            _sec.get(_name, 0.0) + _inst_elapsed, 6,
+                        )
+
+                    if _removed:
+                        _logger.debug('Successfully removed operation.')
+                        circuit_copy = working_copy
+                        _probe['speculations_discarded'] += (
+                            len(window) - index - 1
+                        )
+                        # Roll the cursor back to just after the accepted
+                        # candidate. Without this the discarded tail is SKIPPED
+                        # rather than retried, and those gates never get their
+                        # chance -- the output would then differ from
+                        # BQSKIT_SCAN_LOOKAHEAD=0, which is the one property
+                        # this whole change exists to preserve.
+                        next_candidate = window_start + index + 1
+                        # All remaining answers were instantiated from the
+                        # old circuit. A removal shrinks the reachable set, so
+                        # even disjoint-looking gates cannot be safely reused:
+                        # two individually removable RZ gates can fail when
+                        # removed together. Start the next window afresh.
+                        break
+
+            if _probe_on:
+                _probe['pass_seconds'] = round(
+                    time.perf_counter() - _t_pass, 6,
+                )
+                for _key in ('inst_seconds_1q', 'inst_seconds_multi'):
+                    _probe[_key] = round(_probe[_key], 6)
+                _scan_probe_emit(_probe)
+
+            circuit.become(circuit_copy)
+            return
+
         for cycle, op in circuit.operations_with_cycles(reverse=reverse_iter):
 
             if _probe_on:

@@ -61,6 +61,23 @@ try:
 except ValueError:
     raise ValueError('BQSKIT_POOL_PREFETCH must be an integer')
 
+_POOL_LPT = os.environ.get('BQSKIT_POOL_LPT', '0') != '0'
+
+# Separates "is the pool on" from "how far may an employee overdraw". Today
+# BQSKIT_POOL_PREFETCH does both, which makes window 0 -- pure join-idle-queue,
+# place only where a worker is already idle -- inexpressible: prefetch=0 means
+# "no pool at all". This flag exists to answer one question and should be
+# deleted with its answer; see _pool_window.
+_pool_window_env = os.environ.get('BQSKIT_POOL_WINDOW')
+try:
+    _POOL_WINDOW = (
+        None if _pool_window_env is None else int(_pool_window_env)
+    )
+except ValueError:
+    raise ValueError('BQSKIT_POOL_WINDOW must be an integer')
+if _POOL_WINDOW is not None and _POOL_WINDOW < 0:
+    raise ValueError('BQSKIT_POOL_WINDOW must be >= 0')
+
 try:
     _RESERVE_CORES = int(os.environ.get('BQSKIT_RESERVE_CORES', '0'))
 except ValueError:
@@ -587,11 +604,6 @@ class ServerBase:
                 w_start, w_n, w_qsum, w_qmax = now, 0, 0, 0
                 w_kind, w_tasks = {}, 0
             outgoing = self.outgoing.get()
-            w_kind[int(outgoing[1])] = w_kind.get(int(outgoing[1]), 0) + 1
-            if outgoing[1] == RuntimeMessage.SUBMIT_BATCH:
-                w_tasks += len(outgoing[2])
-            elif outgoing[1] == RuntimeMessage.SUBMIT:
-                w_tasks += 1
 
             if not self.running:
                 # NodeBase's handle_shutdown will put a dummy value in the
@@ -599,6 +611,18 @@ class ServerBase:
                 # Hence the node.running check now rather than in the
                 # while condition.
                 break
+
+            # AFTER the shutdown check, not before. That dummy value is
+            # `b'\0'` (base.py:742) -- one byte, not a message tuple -- so
+            # indexing it raises IndexError and kills the sender thread with a
+            # traceback instead of letting it break cleanly. Every run ended
+            # that way until 2026-08-14, and this project has already lost time
+            # twice to a real fault hiding inside routine-looking noise.
+            w_kind[int(outgoing[1])] = w_kind.get(int(outgoing[1]), 0) + 1
+            if outgoing[1] == RuntimeMessage.SUBMIT_BATCH:
+                w_tasks += len(outgoing[2])
+            elif outgoing[1] == RuntimeMessage.SUBMIT:
+                w_tasks += 1
 
             if outgoing[0].closed:
                 continue
@@ -807,8 +831,8 @@ class ServerBase:
         drain path needs is initialised here and nowhere else, and
         scripts/pool_credit_check.py calls this same method.
         """
-        self._pool: list[tuple[int, int, RuntimeTask]] = []
-        """Undispatched tasks, ordered (service class, arrival).
+        self._pool: list[tuple[int, float, int, RuntimeTask]] = []
+        """Undispatched tasks, ordered (service class, cost, arrival).
 
         Placement preference is applied when draining rather than in the key:
         the pool says WHICH task is next, `_drain_pool` says WHO gets it, and
@@ -832,9 +856,17 @@ class ServerBase:
         is kept in flight to cover that latency -- 0 leaves the link idle for a
         full RTT per task, and too large is hoarding under another name.
         """
+        # BQSKIT_POOL_WINDOW is a temporary probe on this very sentence: is the
+        # overdraft earning its 60 lines? `prefetch=1` already beat `prefetch=4`
+        # by 1.16x (job 1022605) -- the tightest window won, which leaves the
+        # debt machinery nearly vestigial at the setting that wins. Window 0 is
+        # pure join-idle-queue. If it ties, `_pool_window`, `pool_debt`,
+        # `repay_pool_credit` and half of `_can_place` all go away, and this
+        # flag goes with them.
+        window = _POOL_PREFETCH if _POOL_WINDOW is None else _POOL_WINDOW
         if employee.is_manager:
-            return _POOL_PREFETCH * max(1, employee.total_workers)
-        return _POOL_PREFETCH
+            return window * max(1, employee.total_workers)
+        return window
 
     def _can_place(self, employee: RuntimeEmployee) -> bool:
         """Whether `employee` has credit for one more pooled task.
@@ -889,7 +921,7 @@ class ServerBase:
         progress = True
         while self._pool and progress:
             progress = False
-            _cls, _seq, task = heapq.heappop(self._pool)
+            _cls, _cost, _seq, task = heapq.heappop(self._pool)
             target = None
             owner = None
             if self.is_my_worker(task.return_address.worker_id):
@@ -916,7 +948,7 @@ class ServerBase:
                         break
             if target is None:
                 # Nobody has room; put it back and stop.
-                heapq.heappush(self._pool, (_cls, _seq, task))
+                heapq.heappush(self._pool, (_cls, _cost, _seq, task))
                 break
             batches.setdefault(id(target), (target, []))[1].append(task)
             self._take_credit(target)
@@ -962,8 +994,16 @@ class ServerBase:
         if _POOL_PREFETCH > 0:
             for task in tasks:
                 self._pool_seq += 1
+                # LPT starts expensive blocks first; width separates the
+                # measured 3-qubit 20–35 s and 4-qubit 268–616 s regimes.
                 heapq.heappush(
-                    self._pool, (task.priority, self._pool_seq, task),
+                    self._pool,
+                    (
+                        task.priority,
+                        -task.cost_hint if _POOL_LPT else 0.0,
+                        self._pool_seq,
+                        task,
+                    ),
                 )
             self._drain_pool()
             return
