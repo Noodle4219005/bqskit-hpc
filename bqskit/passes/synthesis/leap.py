@@ -1550,7 +1550,12 @@ class LEAPSynthesisPass(SynthesisPass):
         # Congestion window for speculation. Starts at one round's width -- the
         # most conservative value that still speculates at all -- and grows only
         # while the frontier is still supplying new nodes.
-        _k_ctl = 1.0
+        # 2, not 1. The budget is (K - 1) * s - in_flight, so K = 1 makes it
+        # exactly zero, the growth rule below sits inside `if _budget > 0`, and
+        # the controller can never leave the floor: job 1025659 ran 1,361 rounds
+        # with _k_ctl pinned at 1.00 and spec_tasks 0, which is the
+        # no-speculation baseline and 2.6x slower than a static window.
+        _k_ctl = 2.0
         _fill_ema: float | None = None
         _k_probe_allowed = True
         best_dists = [best_dist]
@@ -2278,7 +2283,13 @@ class LEAPSynthesisPass(SynthesisPass):
                         next_keys.append(structure_key)
                         next_batches.append(node_successors)
 
-                    if _SPEC_CONTROL and _budget > 0:
+                    if _SPEC_CONTROL and _budget <= 0 and _k_probe_allowed:
+                        # Nothing could be asked, so there is no fill rate to
+                        # read -- but a window too small to ask is starving by
+                        # definition, and treating "could not measure" as "do
+                        # not grow" is the bootstrap deadlock this arm hit.
+                        _k_ctl = max(2.0, min(_k_ctl * 2.0, float(effective_k)))
+                    elif _SPEC_CONTROL and _budget > 0:
                         # Slow start while the frontier still supplies, then
                         # linear, then stop. No multiplicative decrease: a low
                         # fill rate is exhaustion, not congestion, and backing
