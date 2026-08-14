@@ -73,6 +73,27 @@ if _SCAN_LOOKAHEAD < 0:
 # falling back to the constant.
 _SCAN_OCCUPANCY_STALE_AFTER = 1.0
 
+# The window is capped by the ACCEPTANCE RATE, not by the machine. Measured
+# 2026-08-14 on square_heisenberg_N16 at msz=4, each arm against the K=8 arm of
+# its OWN job so the comparison is in-job:
+#
+#   K     wall vs that job's K=8   discarded speculations
+#   8              --                       1,138
+#   32          -9.9%  (job 1025050)          n/a
+#   ~65         -2.7%  (job 1025213)         8,019
+#
+# The curve turns over. Sizing K from free cores read 64.7 idle of 96 and set
+# K=64.7, which bought 2.7% of wall for 7.0x the discards -- worse than a flat
+# 32. Single-qudit removals are accepted 12.8% of the time, so the expected
+# number of candidates before the next acceptance is 1/0.128 = 7.8. A window
+# past that speculates BEYOND the acceptance point, and everything past it is
+# discarded and retried. Free cores are therefore the wrong ceiling: they say
+# how much can run at once, not how much is worth running.
+#
+# 32 rather than 8 because dispatch still overlaps the waste -- k32 was the
+# fastest arm measured. The cap is where the curve was still improving.
+_SCAN_LOOKAHEAD_CAP = int(os.environ.get('BQSKIT_SCAN_LOOKAHEAD_CAP', '32'))
+
 
 def _scan_free_cores() -> int | None:
     """Free CORES on this node right now, or None when unknown.
@@ -383,7 +404,7 @@ class ScanningGateRemovalPass(BasePass):
                         # measured ceiling is the window, not the machine.
                         # Even K=32 left this phase at 23.5% of 112 cores
                         # (job 1025050), so erring high is what fills it.
-                        _k = max(_SCAN_LOOKAHEAD, _free)
+                        _k = max(_SCAN_LOOKAHEAD, min(_free, _SCAN_LOOKAHEAD_CAP))
                         _probe['window_from_measured'] += 1
                         _probe['free_cores_seen_sum'] += _free
                         _probe['window_size_sum'] += _k
