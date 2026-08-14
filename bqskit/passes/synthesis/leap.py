@@ -1251,8 +1251,8 @@ class LEAPSynthesisPass(SynthesisPass):
             happens not to collide, so they cannot be the guard here.
 
             CORRECTED 2026-08-14. This docstring used to continue "and
-            instantiate starts from them", and that was FALSE for every run
-            before BQSKIT_WARM_START existed. `Circuit.instantiate` has one
+            instantiate starts from them", and that is FALSE, unconditionally.
+            `Circuit.instantiate` has one
             exit, `Instantiater.multi_start_instantiate_inplace`, and all four
             of its implementations hardcoded `RandomStartGenerator()` -- so the
             carried parameters were discarded at every multistarts value,
