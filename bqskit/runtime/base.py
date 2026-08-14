@@ -209,7 +209,7 @@ class ServerBase:
         self.conn_to_employee_dict: dict[Connection, RuntimeEmployee] = {}
         """Used to find the employee associated with a message."""
 
-        self._pool: list[tuple[int, int, RuntimeTask]] = []
+        self._pool: list[tuple[int, float, int, RuntimeTask]] = []
         self._pool_seq = 0
         self._pool_cursor = 0
 
@@ -763,7 +763,7 @@ class ServerBase:
         progress = True
         while self._pool and progress:
             progress = False
-            _cls, _seq, task = heapq.heappop(self._pool)
+            _cls, _cost, _seq, task = heapq.heappop(self._pool)
             target = None
             owner = None
             if self.is_my_worker(task.return_address.worker_id):
@@ -790,7 +790,7 @@ class ServerBase:
                         break
             if target is None:
                 # Nobody has room; put it back and stop.
-                heapq.heappush(self._pool, (_cls, _seq, task))
+                heapq.heappush(self._pool, (_cls, _cost, _seq, task))
                 break
             batches.setdefault(id(target), (target, []))[1].append(task)
             target.num_idle_workers -= 1
@@ -822,13 +822,20 @@ class ServerBase:
         """Return idle capacity to advertise upward, net of backlog."""
         return max(0, self.num_idle_workers - len(self._pool))
 
+    # Job 1023530 measured this key at 0.997x not because ordering was
+    # useless, but because 21 blocks for 112 workers all dispatched on the
+    # first drain, leaving no queue to reorder. The inner-task cost hints and
+    # expanded speculative capacity now make that queue exist.
     def schedule_tasks(self, tasks: Sequence[RuntimeTask]) -> None:
         """Add tasks to the shared pool and dispatch any that fit."""
         if len(tasks) == 0:
             return
         for task in tasks:
             self._pool_seq += 1
-            heapq.heappush(self._pool, (task.priority, self._pool_seq, task))
+            heapq.heappush(
+                self._pool,
+                (task.priority, -task.cost_hint, self._pool_seq, task),
+            )
         self._drain_pool()
 
     def send_result_down(self, result: RuntimeResult) -> None:

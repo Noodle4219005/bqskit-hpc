@@ -840,11 +840,15 @@ class LEAPSynthesisPass(SynthesisPass):
         # successors on a sparse 4-qubit block and W = 96, the resource formula
         # asks for K = 1 + (96-3)/3 = 32, so the cap was discarding three
         # quarters of the parallelism the machine could have absorbed. The
-        # default is now W itself -- the formula is already bounded by W, so
-        # this only stops a pathological s.
+        # default was W itself, which still prevented a useful backlog.
+        # The former W default limited speculative depth to no more than the
+        # workers assigned to this block: it intentionally avoided backlog.
+        # Idle workers create no value, while a backlog is what lets cost
+        # ordering help. Even K=32 used only 23.5% of 112 cores during gate
+        # removal, so begin at 4W; BQSKIT_EXPAND_K_MAX remains an override.
         try:
             expand_k_max = int(os.environ.get(
-                'BQSKIT_EXPAND_K_MAX', str(max(1, worker_width)),
+                'BQSKIT_EXPAND_K_MAX', str(max(1, 4 * worker_width)),
             ))
         except ValueError as err:
             raise ValueError(
@@ -1023,6 +1027,10 @@ class LEAPSynthesisPass(SynthesisPass):
                     [utry] * len(flat_circuits),
                     flat_seeds,
                     task_priority=task_priority,
+                    cost_hints=[
+                        float(4 ** circuit.num_qudits)
+                        for circuit in flat_circuits
+                    ],
                     **single_options,
                 )
                 return future, owner_of_task
@@ -1032,6 +1040,10 @@ class LEAPSynthesisPass(SynthesisPass):
                 flat_successors,
                 target=utry,
                 task_priority=task_priority,
+                cost_hints=[
+                    float(4 ** circuit.num_qudits)
+                    for circuit in flat_successors
+                ],
                 **instantiate_options,
             )
             return future, None
@@ -1422,6 +1434,10 @@ class LEAPSynthesisPass(SynthesisPass):
                     flat_circuits,
                     [utry] * len(flat_circuits),
                     flat_seeds,
+                    cost_hints=[
+                        float(4 ** circuit.num_qudits)
+                        for circuit in flat_circuits
+                    ],
                     **single_options,
                 )
 
@@ -1434,6 +1450,9 @@ class LEAPSynthesisPass(SynthesisPass):
                 [initial_layer] * num_starts,
                 [utry] * num_starts,
                 initial_seeds,
+                cost_hints=[
+                    float(4 ** initial_layer.num_qudits)
+                ] * num_starts,
                 **single_options,
             )
             initial_layer = min(
@@ -2245,6 +2264,10 @@ class LEAPSynthesisPass(SynthesisPass):
                     Circuit.instantiate,
                     successors,
                     target=utry,
+                    cost_hints=[
+                        float(4 ** circuit.num_qudits)
+                        for circuit in successors
+                    ],
                     **instantiate_options,
                 )
                 map_id = getattr(map_future, '_bqprof_leapwaste_map_id', None)
@@ -2274,6 +2297,10 @@ class LEAPSynthesisPass(SynthesisPass):
                     Circuit.instantiate,
                     successors,
                     target=utry,
+                    cost_hints=[
+                        float(4 ** circuit.num_qudits)
+                        for circuit in successors
+                    ],
                     **instantiate_options,
                 )
                 circuits = [None] * len(successors)  # type: ignore
@@ -2325,6 +2352,10 @@ class LEAPSynthesisPass(SynthesisPass):
                     flat_circuits,
                     [utry] * len(flat_circuits),
                     flat_seeds,
+                    cost_hints=[
+                        float(4 ** circuit.num_qudits)
+                        for circuit in flat_circuits
+                    ],
                     **single_options,
                 )
 
@@ -2347,6 +2378,10 @@ class LEAPSynthesisPass(SynthesisPass):
                     Circuit.instantiate,
                     successors,
                     target=utry,
+                    cost_hints=[
+                        float(4 ** circuit.num_qudits)
+                        for circuit in successors
+                    ],
                     **instantiate_options,
                 )
                 record_spec_metric(

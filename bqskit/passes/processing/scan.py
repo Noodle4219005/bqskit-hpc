@@ -40,27 +40,30 @@ _logger = logging.getLogger(__name__)
 _SCAN_PROBE_DIR = os.environ.get('BQPROF_SCAN_DIR')
 _SCAN_FH_STATE: dict[str, Any] = {'pid': None, 'fh': None}
 # How many undecided candidates to dispatch against the current baseline before
-# consuming the answers in the original greedy order. Measured 2026-08-14 on
-# square_heisenberg_N16 at msz=4 with 96 workers (job 1025050), against the
-# sequential loop this replaces:
+# consuming the answers in the original greedy order.
 #
-#   K    2Q  depth     wall     core-s  speedup  core-s delta
-#   0    72   178   1191.7 s     13,211   1.00x        --
-#   8    72   178    559.4 s     14,492   2.13x     +9.7%
-#   32   72   178    504.2 s     18,832   2.36x    +42.5%
+# Measured 2026-08-14 on square_heisenberg_N16 at msz=4 with 96 workers (job
+# 1025050). These are the GATE-DELETION PHASE's own figures, cut out of the
+# 250 ms CPU sampler with the pass timeline -- not sacct, which is the whole run
+# and lets LEAP's 10,400 core-seconds dilute this phase by a factor of four:
+#
+#   K   phase wall   core-s  mean cores   /112  speedup  core-s delta
+#   0      1010 s     2,856         2.8   2.5%    1.00x        --
+#   8       370 s     4,009        10.8   9.7%    2.73x     +40.4%
+#   32      318 s     8,353        26.3  23.5%    3.18x    +192.4%
+#
+# LEAP itself is untouched across the three (core-s +1.0%, wall 0.95x), so the
+# change really is isolated to this pass.
 #
 # Output is BIT-IDENTICAL at every K, which is what the cursor rollback buys: a
-# window whose baseline moved is discarded and RETRIED, never skipped.
+# window whose baseline moved is discarded and RETRIED, never skipped. The
+# invariant -- compute out of order, publish in search order -- does not mention
+# K, so a window that differs every round is equally safe.
 #
-# 8 rather than 32 because K=32 buys 11% more wall for 4.4x the wasted work, and
-# that waste is real core-seconds displacing other jobs. The ratio is the
-# mechanism's own prediction -- waste = acceptance x K, single-qudit acceptance
-# is 12.8% -- so it should carry to other circuits.
-#
-# 0 restores the original sequential loop verbatim.
-# 'auto' sizes the window from the free cores the manager broadcasts, re-read
-# once per window so a machine that empties or fills is tracked. An integer
-# pins the window; 0 restores the original sequential loop verbatim.
+# 'auto' sizes each window from the free cores the manager broadcasts, re-read
+# once per window so a machine that empties or fills is tracked, then capped by
+# _SCAN_LOOKAHEAD_CAP below. An integer pins the window. 0 restores the original
+# sequential loop verbatim.
 _SCAN_LOOKAHEAD_TEXT = os.environ.get('BQSKIT_SCAN_LOOKAHEAD', 'auto')
 _SCAN_LOOKAHEAD_AUTO = _SCAN_LOOKAHEAD_TEXT.strip().lower() == 'auto'
 _SCAN_LOOKAHEAD = 8 if _SCAN_LOOKAHEAD_AUTO else int(_SCAN_LOOKAHEAD_TEXT)
@@ -429,6 +432,9 @@ class ScanningGateRemovalPass(BasePass):
                     [target] * len(window),
                     shifted_cycles,
                     qudits,
+                    cost_hints=[
+                        float(4 ** circuit_copy.num_qudits)
+                    ] * len(window),
                     **instantiate_options,
                 )
                 _window_elapsed = (
