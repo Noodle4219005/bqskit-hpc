@@ -2313,25 +2313,6 @@ class LEAPSynthesisPass(SynthesisPass):
                         else:
                             node_results = []
                     circuits.extend(node_results)
-            elif leapwaste_enabled:
-                _t_stall1 = time.perf_counter()
-                t_map_start = time.time()
-                map_future = get_runtime().map(
-                    Circuit.instantiate,
-                    successors,
-                    target=utry,
-                    cost_hints=[
-                        float(4 ** circuit.num_qudits)
-                        for circuit in successors
-                    ],
-                    **instantiate_options,
-                )
-                map_id = getattr(map_future, '_bqprof_leapwaste_map_id', None)
-                circuits = await map_future
-                t_map_end = time.time()
-                record_spec_metric(
-                    'critical_stall_s', time.perf_counter() - _t_stall1,
-                )
             elif self.async_drain:
                 # Consume results as they arrive instead of at a barrier.
                 #
@@ -2429,8 +2410,19 @@ class LEAPSynthesisPass(SynthesisPass):
                         best_costs[owner] = candidate_cost
                         circuits[owner] = candidate
             else:
+                # The plain path. The leapwaste timing lives INSIDE it, guarded,
+                # rather than in a sibling elif -- a probe that is its own branch
+                # shadows every branch below it, which is exactly what happened
+                # here: `elif leapwaste_enabled` sat above async_drain and
+                # parallel_multistart from 2026-08-12 to 2026-08-14, so setting
+                # BQPROF_LEAPWASTE_DIR silently disabled parallel multistart on
+                # the successor dispatch while the arm banner still printed the
+                # flag. An instrument must never be able to change what it
+                # measures.
                 _t_stall2 = time.perf_counter()
-                circuits = await get_runtime().map(
+                if leapwaste_enabled:
+                    t_map_start = time.time()
+                _map_future = get_runtime().map(
                     Circuit.instantiate,
                     successors,
                     target=utry,
@@ -2440,6 +2432,13 @@ class LEAPSynthesisPass(SynthesisPass):
                     ],
                     **instantiate_options,
                 )
+                if leapwaste_enabled:
+                    map_id = getattr(
+                        _map_future, '_bqprof_leapwaste_map_id', None,
+                    )
+                circuits = await _map_future
+                if leapwaste_enabled:
+                    t_map_end = time.time()
                 record_spec_metric(
                     'critical_stall_s', time.perf_counter() - _t_stall2,
                 )
