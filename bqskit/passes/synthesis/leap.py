@@ -1675,6 +1675,11 @@ class LEAPSynthesisPass(SynthesisPass):
                         share = max(float(s), float(measured_idle))
                         record_spec_metric('width_from_measured')
                         record_spec_metric('idle_seen_sum', measured_idle)
+                        # Which term won the max. `s` winning means the round
+                        # is already wider than the free machine, so no K can
+                        # help -- that is a supply fact, not a policy one.
+                        if float(s) >= float(measured_idle):
+                            record_spec_metric('bind_round_width')
                     else:
                         share = max(
                             float(s),
@@ -1723,15 +1728,38 @@ class LEAPSynthesisPass(SynthesisPass):
                             value_k = 1.0 + math.log(
                                 _SPEC_VALUE_FLOOR,
                             ) / math.log(p)
+                        # Count the guard, not the evaluation. The old
+                        # `value_capped` fired on every round the branch ran,
+                        # so it could not say whether the value throttle ever
+                        # actually bound -- and that left the real limiter
+                        # unidentified across three arms of job 1025442.
+                        _share_pre = share
                         share = min(share, max(float(s), value_k * s))
                         record_spec_metric('value_capped')
+                        record_spec_metric('share_pre_value_sum', _share_pre)
+                        record_spec_metric('share_post_value_sum', share)
+                        if share < _share_pre - 1e-9:
+                            record_spec_metric('bind_value_floor')
+                            record_spec_metric(
+                                'value_removed_sum', _share_pre - share,
+                            )
+                    _k_from_share = 1 + int((share - s) // s)
                     effective_k = max(
                         1,
-                        min(
-                            self.expand_k_max,
-                            1 + int((share - s) // s),
-                        ),
+                        min(self.expand_k_max, _k_from_share),
                     )
+                    # Three mutually exclusive outcomes, so exactly one
+                    # counter moves per round and the shares add to 1.
+                    if _k_from_share > self.expand_k_max:
+                        record_spec_metric('bind_expand_k_max')
+                    elif effective_k <= 1:
+                        record_spec_metric('bind_k_is_one')
+                    else:
+                        record_spec_metric('bind_share')
+                    record_spec_metric('effective_k_sum', effective_k)
+                    record_spec_metric('round_width_sum', s)
+                    if s > 0:
+                        record_spec_metric('rounds_with_width')
             else:
                 effective_k = self.expand_k
 
