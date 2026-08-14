@@ -44,10 +44,6 @@ _logger = logging.getLogger(__name__)
 # it is.
 _FOREACH_PROF_DIR = os.environ.get('BQPROF_FOREACH_DIR')
 
-_SKIP_2Q_BELOW = int(os.environ.get('BQSKIT_SKIP_2Q_BELOW', '0'))
-if _SKIP_2Q_BELOW < 0:
-    raise ValueError('BQSKIT_SKIP_2Q_BELOW must be nonnegative.')
-
 _FOREACH_FH_STATE: dict[str, Any] = {'pid': None, 'fh': None}
 
 
@@ -328,10 +324,7 @@ class ForEachBlockPass(BasePass):
                 n2q_per_block.append(
                     sum(1 for o in block_circuit if o.num_qudits >= 2),
                 )
-        dispatch_idx = [
-            i for i, n2q in enumerate(n2q_per_block)
-            if n2q >= _SKIP_2Q_BELOW
-        ]
+        dispatch_idx = list(range(len(blocks)))
         n_dispatch = len(dispatch_idx)
         if n_dispatch > 0:
             future = get_runtime().map(
