@@ -213,6 +213,14 @@ class ServerBase:
         self._pool_seq = 0
         self._pool_cursor = 0
 
+        # Declared here, unconditionally, for the reason job 1024323 taught:
+        # an undeclared counter is not a missing statistic, it is a KeyError or
+        # an AttributeError that propagates out and kills the run while Slurm
+        # still reports COMPLETED 0:0.
+        self._pool_drains = 0
+        self._pool_depth_sum = 0
+        self._pool_depth_max = 0
+
         self._cpu_snapshot: tuple[float, float] | None = None
         """Previous (busy, total) jiffies, for the free-core measurement."""
 
@@ -617,6 +625,19 @@ class ServerBase:
         """Shutdown the node and release resources."""
         # Stop running
         _logger.info('Shutting down node.')
+        # At INFO because it answers a standing question rather than tracing a
+        # run: max depth 1 means the pool never held a backlog, and therefore
+        # that ordering it -- LPT, heaviest-first, anything -- cannot change a
+        # placement. Emitted before `running = False` so a node killed by
+        # SIGTERM mid-shutdown has already said it.
+        if self._pool_drains:
+            _logger.info(
+                'pool depth: %d drains, mean %.2f, max %d, %d left undrained',
+                self._pool_drains,
+                self._pool_depth_sum / self._pool_drains,
+                self._pool_depth_max,
+                len(self._pool),
+            )
         self.running = False
 
         # Instruct employees to shutdown
@@ -720,6 +741,24 @@ class ServerBase:
         """
         if not self._pool:
             return
+        # Pool depth on entry. This decides whether "heaviest task first" can
+        # do anything at all: LPT reorders a BACKLOG, and job 1023530 measured
+        # it at 0.997x for the reason that no backlog ever formed -- 21 blocks
+        # against 112 workers, all placed by the first drain, so there was no
+        # order to change. Two things have changed since: parallel multistart
+        # submits M tasks per block, and BQSKIT_SCAN_LOOKAHEAD submits up to 32,
+        # so a single block can now offer 32 at once.
+        #
+        # If _pool_depth_max stays at 1 the question is closed for good. If it
+        # runs deep, the next step is NOT switching LPT on -- cost_hint is set
+        # in exactly one place (foreach.py, for blocks), so every inner task
+        # carries 0.0 and LPT would sort ~30 items while leaving the other 99%
+        # tied. Populating cost_hint for the inner tasks comes first.
+        self._pool_drains += 1
+        _depth_in = len(self._pool)
+        self._pool_depth_sum += _depth_in
+        if _depth_in > self._pool_depth_max:
+            self._pool_depth_max = _depth_in
         batches: dict[int, tuple[RuntimeEmployee, list[RuntimeTask]]] = {}
         progress = True
         while self._pool and progress:
