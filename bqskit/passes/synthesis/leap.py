@@ -2213,14 +2213,19 @@ class LEAPSynthesisPass(SynthesisPass):
                 # applies.
                 _k_eff = effective_k
                 if _SPEC_CONTROL:
-                    _free = self._measured_idle_workers()
-                    _rwnd = (
-                        max(1.0, (_free - _SPEC_HEADROOM) / _s)
-                        if _free is not None else float('inf')
-                    )
-                    _k_eff = int(max(1.0, min(
-                        float(effective_k), _k_ctl, _rwnd,
-                    )))
+                    # Fill rate alone. There is no receive window any more:
+                    # sizing K from the CURRENT free-core count reproduces the
+                    # pre-overshoot behaviour exactly, because speculation is
+                    # meant to fill the trough that happens AFTER the round
+                    # starts, and the round-start reading cannot see it. Job
+                    # 1025749 measured that directly -- rwnd = (50 - 4)/5.9 =
+                    # 7.8 bound before the congestion window ever did, k_ctl
+                    # settled at 8.99, and k_ctl_exhausted stayed 0.
+                    #
+                    # What remains is the one signal that is about the
+                    # mechanism rather than the machine: can the frontier still
+                    # supply? Slow start on that, stop when it cannot.
+                    _k_eff = int(max(1.0, min(float(effective_k), _k_ctl)))
                     record_spec_metric('k_ctl_sum', _k_ctl)
                     record_spec_metric('k_ctl_rounds')
                 _budget = max(0, (_k_eff * _s) - _s - _in_flight)
