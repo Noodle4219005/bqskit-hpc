@@ -58,10 +58,49 @@ _SCAN_FH_STATE: dict[str, Any] = {'pid': None, 'fh': None}
 # is 12.8% -- so it should carry to other circuits.
 #
 # 0 restores the original sequential loop verbatim.
-_SCAN_LOOKAHEAD = int(os.environ.get('BQSKIT_SCAN_LOOKAHEAD', '8'))
+# 'auto' sizes the window from the free cores the manager broadcasts, re-read
+# once per window so a machine that empties or fills is tracked. An integer
+# pins the window; 0 restores the original sequential loop verbatim.
+_SCAN_LOOKAHEAD_TEXT = os.environ.get('BQSKIT_SCAN_LOOKAHEAD', 'auto')
+_SCAN_LOOKAHEAD_AUTO = _SCAN_LOOKAHEAD_TEXT.strip().lower() == 'auto'
+_SCAN_LOOKAHEAD = 8 if _SCAN_LOOKAHEAD_AUTO else int(_SCAN_LOOKAHEAD_TEXT)
 
 if _SCAN_LOOKAHEAD < 0:
-    raise ValueError('BQSKIT_SCAN_LOOKAHEAD must be non-negative.')
+    raise ValueError('BQSKIT_SCAN_LOOKAHEAD must be non-negative or "auto".')
+
+# Same value and the same reason as leap.py:216 -- a reading older than this
+# describes a machine that has since changed, and acting on it is worse than
+# falling back to the constant.
+_SCAN_OCCUPANCY_STALE_AFTER = 1.0
+
+
+def _scan_free_cores() -> int | None:
+    """Free CORES on this node right now, or None when unknown.
+
+    Mirrors ``LEAPSynthesisPass._measured_idle_workers``. None means the
+    reading is absent or stale -- an attached run has no manager broadcasting
+    at all -- and the caller must then use the fixed window, never zero.
+    Reading absent-as-zero would silently turn speculation off wherever the
+    broadcast does not reach, which is exactly the opt-in-default trap this
+    branch keeps falling into.
+    """
+    try:
+        cache = get_runtime().get_cache()
+    except Exception:
+        return None
+    entry = cache.get('__bqskit_occupancy__')
+    if not entry:
+        return None
+    try:
+        if len(entry) >= 4:
+            _idle, _total, free, stamp = entry[:4]
+        else:
+            free, _total, stamp = entry[:3]
+    except (TypeError, ValueError):
+        return None
+    if time.monotonic() - stamp > _SCAN_OCCUPANCY_STALE_AFTER:
+        return None
+    return int(free)
 
 
 def _try_removal(
@@ -315,12 +354,40 @@ class ScanningGateRemovalPass(BasePass):
             # re-instantiating an already obsolete circuit.
             _probe['speculations_used'] = 0
             _probe['speculations_discarded'] = 0
+            # Declared before the loop, unconditionally, because an undeclared
+            # key is not a missing statistic -- it is a KeyError that propagates
+            # out of the pass and kills the compile. That is how all four arms
+            # of job 1024323 died after 2:17:20 while exiting COMPLETED 0:0.
+            _probe['window_from_measured'] = 0
+            _probe['window_from_fixed'] = 0
+            _probe['free_cores_seen_sum'] = 0
+            _probe['window_size_sum'] = 0
             next_candidate = 0
             while next_candidate < len(candidates):
                 window_start = next_candidate
-                window = candidates[
-                    next_candidate:next_candidate + _SCAN_LOOKAHEAD
-                ]
+                # Window size is free to change between rounds without moving
+                # the output. The invariant is "compute out of order, publish
+                # in search order": answers are consumed in the original greedy
+                # order and an accepted removal rolls the cursor back so the
+                # rest of the window is RETRIED, not skipped. That holds for any
+                # K, including a K that differs every round.
+                _k = _SCAN_LOOKAHEAD
+                if _SCAN_LOOKAHEAD_AUTO:
+                    _free = _scan_free_cores()
+                    if _free is None:
+                        _probe['window_from_fixed'] += 1
+                    else:
+                        # max, not the reading alone: several blocks scan
+                        # concurrently under ForEachBlockPass, so a node-wide
+                        # reading is not this block's private share -- but the
+                        # measured ceiling is the window, not the machine.
+                        # Even K=32 left this phase at 23.5% of 112 cores
+                        # (job 1025050), so erring high is what fills it.
+                        _k = max(_SCAN_LOOKAHEAD, _free)
+                        _probe['window_from_measured'] += 1
+                        _probe['free_cores_seen_sum'] += _free
+                        _probe['window_size_sum'] += _k
+                window = candidates[next_candidate:next_candidate + _k]
                 next_candidate += len(window)
 
                 # A candidate's stored cycle belongs to the original circuit.
