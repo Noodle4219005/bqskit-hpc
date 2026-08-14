@@ -239,6 +239,35 @@ _SPEC_VALUE_FLOOR = float(os.environ.get('BQSKIT_SPEC_VALUE_FLOOR', '0.02'))
 # path -- which is the point, and also the risk: see the delayed-task
 # starvation this codebase already hit once when the worker queue became a
 # priority queue.
+# Congestion control for K, in the TCP sense: a window that grows while the
+# frontier still supplies work and stops when it does not.
+#
+# The thresholds are the three measured points of job 1025637, one job, three
+# arms, identical output 2Q 72 / depth 178:
+#
+#   arm    K     fill rate   speculative hit   wall
+#   o8    19.8      46.5%         15.5%        430 s   <- best
+#   o32   37.6      12.4%         14.2%        452 s
+#   kmax 445.4       2.3%          3.2%        648 s   <- 1.5x worse
+#
+# kmax is a TCP with a receive window and no congestion window: it grew to the
+# cap, then 1,218,285 requests found 27,960 nodes and the coordinator spent the
+# run peeking instead of searching. Occupancy was HIGHER there than in o8 --
+# which is why fill rate, not occupancy, is the control signal.
+#
+# Two departures from TCP, both from measurement:
+#   1. A low fill rate is frontier exhaustion, not congestion. Backing off does
+#      not make the frontier grow, so there is no multiplicative decrease --
+#      growth simply stops until the SEARCH advances.
+#   2. Widening K costs coordinator serial time (peek is O(frontier) and runs
+#      in the block's own coroutine), so growth is more expensive here than a
+#      larger cwnd is for a TCP sender. Hence the conservative start at one
+#      round's width.
+_SPEC_CONTROL = os.environ.get('BQSKIT_SPEC_CONTROL', '1') != '0'
+_SPEC_FILL_GROW = float(os.environ.get('BQSKIT_SPEC_FILL_GROW', '0.40'))
+_SPEC_FILL_HOLD = float(os.environ.get('BQSKIT_SPEC_FILL_HOLD', '0.20'))
+_SPEC_HEADROOM = int(os.environ.get('BQSKIT_SPEC_HEADROOM', '4'))
+
 _SPEC_OVERSHOOT_TEXT = os.environ.get('BQSKIT_SPEC_OVERSHOOT', '1.0')
 _SPEC_UNBOUNDED = _SPEC_OVERSHOOT_TEXT.strip().lower() == 'max'
 _SPEC_OVERSHOOT = 1.0 if _SPEC_UNBOUNDED else float(_SPEC_OVERSHOOT_TEXT)
@@ -1517,6 +1546,13 @@ class LEAPSynthesisPass(SynthesisPass):
         best_dist = self.cost.calc_cost(initial_layer, utry)
         best_circ = initial_layer
         best_layer = 0
+
+        # Congestion window for speculation. Starts at one round's width -- the
+        # most conservative value that still speculates at all -- and grows only
+        # while the frontier is still supplying new nodes.
+        _k_ctl = 1.0
+        _fill_ema: float | None = None
+        _k_probe_allowed = True
         best_dists = [best_dist]
 
         # Counted for the aggregate probe only. Local, never on self: the
@@ -2164,7 +2200,25 @@ class LEAPSynthesisPass(SynthesisPass):
                 _s = max(1, round(succ_ema)) if succ_ema else len(successors)
                 _s = max(1, _s)
                 _in_flight = sum(f.n_tasks for f in speculation_flights)
-                _budget = max(0, (effective_k * _s) - _s - _in_flight)
+
+                # Receive window: never ask for more than the machine holds,
+                # less a headroom so a critical batch never queues behind
+                # speculation. `free` is None on an attached run with no
+                # manager broadcasting, and then only the congestion window
+                # applies.
+                _k_eff = effective_k
+                if _SPEC_CONTROL:
+                    _free = self._measured_idle_workers()
+                    _rwnd = (
+                        max(1.0, (_free - _SPEC_HEADROOM) / _s)
+                        if _free is not None else float('inf')
+                    )
+                    _k_eff = int(max(1.0, min(
+                        float(effective_k), _k_ctl, _rwnd,
+                    )))
+                    record_spec_metric('k_ctl_sum', _k_ctl)
+                    record_spec_metric('k_ctl_rounds')
+                _budget = max(0, (_k_eff * _s) - _s - _in_flight)
                 if _budget > 0:
                     queued_keys: set[_CircuitStructureKey] = set()
                     for _flight in speculation_flights:
@@ -2196,7 +2250,7 @@ class LEAPSynthesisPass(SynthesisPass):
                     # finds work, not by whether the machine looks full.
                     record_spec_metric('budget_requested', _budget)
                     record_spec_metric('budget_rounds')
-                    _peek = len(speculation_memo) + effective_k * 2 + 8
+                    _peek = len(speculation_memo) + _k_eff * 2 + 8
                     for _, circuit, _ in frontier.peek(_peek):
                         if _acc >= _budget:
                             break
@@ -2223,6 +2277,28 @@ class LEAPSynthesisPass(SynthesisPass):
                         queued_keys.add(structure_key)
                         next_keys.append(structure_key)
                         next_batches.append(node_successors)
+
+                    if _SPEC_CONTROL and _budget > 0:
+                        # Slow start while the frontier still supplies, then
+                        # linear, then stop. No multiplicative decrease: a low
+                        # fill rate is exhaustion, not congestion, and backing
+                        # off does not refill the frontier -- only an advance
+                        # does, which is what _k_probe_allowed gates.
+                        _fill = _acc / float(_budget)
+                        _fill_ema = (
+                            _fill if _fill_ema is None
+                            else 0.7 * _fill_ema + 0.3 * _fill
+                        )
+                        if _k_probe_allowed:
+                            if _fill_ema >= _SPEC_FILL_GROW:
+                                _k_ctl = min(_k_ctl * 2.0, float(effective_k))
+                            elif _fill_ema >= _SPEC_FILL_HOLD:
+                                _k_ctl = min(_k_ctl + 1.0, float(effective_k))
+                            else:
+                                # Exhausted at this depth. Hold until the
+                                # search advances and refills the frontier.
+                                _k_probe_allowed = False
+                                record_spec_metric('k_ctl_exhausted')
 
                     if next_batches:
                         # Count NODES speculated on, matching what a timely
@@ -2575,6 +2651,12 @@ class LEAPSynthesisPass(SynthesisPass):
                     best_dist = dist
                     best_circ = circuit
                     best_layer = layer + 1
+                    # The frontier genuinely changed, so a window that had run
+                    # dry may find work again. This is the re-probe TCP does on
+                    # a timer and this system must do on search progress: a low
+                    # fill rate means the frontier is exhausted at that depth,
+                    # and only an advance refills it.
+                    _k_probe_allowed = True
 
                     if self.check_leap_condition(
                         layer + 1,
