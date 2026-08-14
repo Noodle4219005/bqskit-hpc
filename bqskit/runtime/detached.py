@@ -362,6 +362,7 @@ class DetachedServer(ServerBase):
         # Record a task has been completed
         employee = self.get_employee_responsible_for(result.completed_by)
         employee.num_tasks -= 1
+        self._drain_pool()
 
         # Check if the result is for a client
         if result.return_address.worker_id == -1:

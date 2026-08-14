@@ -229,6 +229,7 @@ class Manager(ServerBase):
                 p = cast(Tuple[int, Optional[RuntimeAddress]], payload)
                 num_idle, read_receipt = p
                 self.handle_waiting(conn, num_idle, read_receipt)
+                self._drain_pool()
                 self.update_upstream_idle_workers()
 
             elif msg == RuntimeMessage.UPDATE:
@@ -347,6 +348,7 @@ class Manager(ServerBase):
         # Record a task has been completed
         employee = self.get_employee_responsible_for(result.completed_by)
         employee.num_tasks -= 1
+        self._drain_pool()
         # Forward result to final destination
         if self.is_my_worker(result.return_address.worker_id):
             self.send_result_down(result)
@@ -359,7 +361,7 @@ class Manager(ServerBase):
 
     def update_upstream_idle_workers(self) -> None:
         """Update the total number of idle workers upstream."""
-        _idle = self.num_idle_workers
+        _idle = self.pooled_idle_workers()
         if _idle != self.last_num_idle_sent_up:
             self.last_num_idle_sent_up = _idle
             payload = (_idle, self.most_recent_read_submit)

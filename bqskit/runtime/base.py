@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import abc
 import functools
+import heapq
 import logging
 import os
 import random
@@ -207,6 +208,10 @@ class ServerBase:
 
         self.conn_to_employee_dict: dict[Connection, RuntimeEmployee] = {}
         """Used to find the employee associated with a message."""
+
+        self._pool: list[tuple[int, int, RuntimeTask]] = []
+        self._pool_seq = 0
+        self._pool_cursor = 0
 
         self._cpu_snapshot: tuple[float, float] | None = None
         """Previous (busy, total) jiffies, for the free-core measurement."""
@@ -705,29 +710,87 @@ class ServerBase:
 
         return assignments
 
+    def _drain_pool(self) -> None:
+        """Hand pooled tasks to employees, preferring three levels in order.
+
+        Tasks retain their service class first, then prefer the employee that
+        owns their parent, and finally any other employee with an idle worker.
+        A task is delivered only when its recipient has an idle worker; this is
+        the difference between one shared pool and N private queues.
+        """
+        if not self._pool:
+            return
+        batches: dict[int, tuple[RuntimeEmployee, list[RuntimeTask]]] = {}
+        progress = True
+        while self._pool and progress:
+            progress = False
+            _cls, _seq, task = heapq.heappop(self._pool)
+            target = None
+            owner = None
+            if self.is_my_worker(task.return_address.worker_id):
+                owner = self.get_employee_responsible_for(
+                    task.return_address.worker_id,
+                )
+                if owner.num_idle_workers > 0:
+                    target = owner
+            if target is None:
+                # Round-robin from a rotating cursor rather than a scan from
+                # employee 0: a fixed start biases every placement toward the
+                # low-numbered employees, which is the imbalance the pool is
+                # here to remove.
+                n = len(self.employees)
+                for offset in range(n):
+                    e = self.employees[(self._pool_cursor + offset) % n]
+                    if e is owner:
+                        continue
+                    if e.num_idle_workers > 0:
+                        target = e
+                        self._pool_cursor = (
+                            self._pool_cursor + offset + 1
+                        ) % n
+                        break
+            if target is None:
+                # Nobody has room; put it back and stop.
+                heapq.heappush(self._pool, (_cls, _seq, task))
+                break
+            batches.setdefault(id(target), (target, []))[1].append(task)
+            target.num_idle_workers -= 1
+            target.num_tasks += 1
+            progress = True
+
+        # Coalesce before touching the wire. The relay is one select() loop per
+        # level, so a drain that places many tasks avoids one pickle per task.
+        # Order within a batch is preserved, so service-class ordering survives.
+        for employee, batch in batches.values():
+            if len(batch) == 1:
+                self.outgoing.put(
+                    (employee.conn, RuntimeMessage.SUBMIT, batch[0]),
+                )
+            else:
+                self.outgoing.put(
+                    (employee.conn, RuntimeMessage.SUBMIT_BATCH, batch),
+                )
+            # Same read-receipt accounting assign_tasks does: without it a
+            # WAITING that races an in-flight placement is credited as idle
+            # twice.
+            employee.submit_cache.append((batch[0].unique_id, len(batch)))
+
+        self.num_idle_workers = sum(
+            e.num_idle_workers for e in self.employees
+        )
+
+    def pooled_idle_workers(self) -> int:
+        """Return idle capacity to advertise upward, net of backlog."""
+        return max(0, self.num_idle_workers - len(self._pool))
+
     def schedule_tasks(self, tasks: Sequence[RuntimeTask]) -> None:
-        """Schedule tasks between this node's employees."""
+        """Add tasks to the shared pool and dispatch any that fit."""
         if len(tasks) == 0:
             return
-        assignments = zip(self.employees, self.assign_tasks(tasks))
-        sorted_assignments = sorted(
-            assignments,
-            key=lambda x: x[0].num_idle_workers,
-            reverse=True,
-        )  # Employees with the most idle workers get assignments first
-        for e, assignment in sorted_assignments:
-            num_tasks = len(assignment)
-
-            if num_tasks == 0:
-                continue
-
-            self.outgoing.put((e.conn, RuntimeMessage.SUBMIT_BATCH, assignment))
-
-            e.num_tasks += num_tasks
-            e.num_idle_workers -= min(num_tasks, e.num_idle_workers)
-            e.submit_cache.append((assignment[0].unique_id, num_tasks))
-
-        self.num_idle_workers = sum(e.num_idle_workers for e in self.employees)
+        for task in tasks:
+            self._pool_seq += 1
+            heapq.heappush(self._pool, (task.priority, self._pool_seq, task))
+        self._drain_pool()
 
     def send_result_down(self, result: RuntimeResult) -> None:
         """Send the `result` to the appropriate employee."""
@@ -785,6 +848,7 @@ class ServerBase:
         employee.num_idle_workers = adjusted_idle_count
         self.num_idle_workers += (adjusted_idle_count - old_count)
         assert 0 <= self.num_idle_workers <= self.total_workers
+        self._drain_pool()
         self.broadcast_occupancy()
 
     def broadcast_occupancy(self) -> None:
