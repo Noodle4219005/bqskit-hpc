@@ -2225,7 +2225,17 @@ class LEAPSynthesisPass(SynthesisPass):
                     # What remains is the one signal that is about the
                     # mechanism rather than the machine: can the frontier still
                     # supply? Slow start on that, stop when it cannot.
-                    _k_eff = int(max(1.0, min(float(effective_k), _k_ctl)))
+                    # expand_k_max, not effective_k. effective_k IS the old
+                    # occupancy formula -- 1 + (share - s)//s with share from
+                    # the round-start free-core reading -- so leaving it in the
+                    # min keeps the very sizing the controller replaces. Job
+                    # 1025761 measured it: fill rate 93%, k_ctl_exhausted 0,
+                    # rwnd already removed, and K still pinned at 8.8 because
+                    # effective_k was 8.5. expand_k_max is the fuse; the fill
+                    # rate is the control.
+                    _k_eff = int(max(1.0, min(
+                        float(self.expand_k_max), _k_ctl,
+                    )))
                     record_spec_metric('k_ctl_sum', _k_ctl)
                     record_spec_metric('k_ctl_rounds')
                 _budget = max(0, (_k_eff * _s) - _s - _in_flight)
@@ -2293,7 +2303,7 @@ class LEAPSynthesisPass(SynthesisPass):
                         # read -- but a window too small to ask is starving by
                         # definition, and treating "could not measure" as "do
                         # not grow" is the bootstrap deadlock this arm hit.
-                        _k_ctl = max(2.0, min(_k_ctl * 2.0, float(effective_k)))
+                        _k_ctl = max(2.0, min(_k_ctl * 2.0, float(self.expand_k_max)))
                     elif _SPEC_CONTROL and _budget > 0:
                         # Slow start while the frontier still supplies, then
                         # linear, then stop. No multiplicative decrease: a low
@@ -2307,9 +2317,9 @@ class LEAPSynthesisPass(SynthesisPass):
                         )
                         if _k_probe_allowed:
                             if _fill_ema >= _SPEC_FILL_GROW:
-                                _k_ctl = min(_k_ctl * 2.0, float(effective_k))
+                                _k_ctl = min(_k_ctl * 2.0, float(self.expand_k_max))
                             elif _fill_ema >= _SPEC_FILL_HOLD:
-                                _k_ctl = min(_k_ctl + 1.0, float(effective_k))
+                                _k_ctl = min(_k_ctl + 1.0, float(self.expand_k_max))
                             else:
                                 # Exhausted at this depth. Hold until the
                                 # search advances and refills the frontier.
