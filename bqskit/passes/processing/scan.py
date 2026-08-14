@@ -39,7 +39,26 @@ _logger = logging.getLogger(__name__)
 # what it would COST.
 _SCAN_PROBE_DIR = os.environ.get('BQPROF_SCAN_DIR')
 _SCAN_FH_STATE: dict[str, Any] = {'pid': None, 'fh': None}
-_SCAN_LOOKAHEAD = int(os.environ.get('BQSKIT_SCAN_LOOKAHEAD', '0'))
+# How many undecided candidates to dispatch against the current baseline before
+# consuming the answers in the original greedy order. Measured 2026-08-14 on
+# square_heisenberg_N16 at msz=4 with 96 workers (job 1025050), against the
+# sequential loop this replaces:
+#
+#   K    2Q  depth     wall     core-s  speedup  core-s delta
+#   0    72   178   1191.7 s     13,211   1.00x        --
+#   8    72   178    559.4 s     14,492   2.13x     +9.7%
+#   32   72   178    504.2 s     18,832   2.36x    +42.5%
+#
+# Output is BIT-IDENTICAL at every K, which is what the cursor rollback buys: a
+# window whose baseline moved is discarded and RETRIED, never skipped.
+#
+# 8 rather than 32 because K=32 buys 11% more wall for 4.4x the wasted work, and
+# that waste is real core-seconds displacing other jobs. The ratio is the
+# mechanism's own prediction -- waste = acceptance x K, single-qudit acceptance
+# is 12.8% -- so it should carry to other circuits.
+#
+# 0 restores the original sequential loop verbatim.
+_SCAN_LOOKAHEAD = int(os.environ.get('BQSKIT_SCAN_LOOKAHEAD', '8'))
 
 if _SCAN_LOOKAHEAD < 0:
     raise ValueError('BQSKIT_SCAN_LOOKAHEAD must be non-negative.')
