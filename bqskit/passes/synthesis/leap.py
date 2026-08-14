@@ -220,6 +220,29 @@ _OCCUPANCY_STALE_AFTER = 1.0
 # cores are free. Warmup exists because a hit rate estimated from three samples
 # would swing K wildly early in a synthesis.
 _SPEC_VALUE_FLOOR = float(os.environ.get('BQSKIT_SPEC_VALUE_FLOOR', '0.02'))
+
+# Deliberately overshoot the free-core reading when sizing K.
+#
+# Measured 2026-08-14 (job 1025535): the ONLY thing binding K is `share`, which
+# is the occupancy broadcast. bind_share fired 1362 of 1362 rounds; the cap, the
+# round width and k=1 fired zero times, and the value floor 3.5%. Mean free
+# cores 50.2 of 96, mean round width 5.9, mean K 7.98 -- and 1 + (50.2-5.9)/5.9
+# = 8.5 reproduces that, so the sizer is doing exactly what it says.
+#
+# That is a closed loop: K is sized to fill the idle cores, the tasks it
+# dispatches consume them, and the system settles at "just full, never more".
+# 9 blocks x K 8 = 72 tasks against 96 workers, so the pool never holds a
+# backlog and anything that ORDERS the pool has nothing to order.
+#
+# 1.0 keeps that behaviour exactly. Above 1.0 the pool is deliberately
+# oversubscribed and the service-class ordering starts carrying the critical
+# path -- which is the point, and also the risk: see the delayed-task
+# starvation this codebase already hit once when the worker queue became a
+# priority queue.
+_SPEC_OVERSHOOT = float(os.environ.get('BQSKIT_SPEC_OVERSHOOT', '1.0'))
+
+if _SPEC_OVERSHOOT < 1.0:
+    raise ValueError('BQSKIT_SPEC_OVERSHOOT must be >= 1.0.')
 _SPEC_VALUE_WARMUP = int(os.environ.get('BQSKIT_SPEC_VALUE_WARMUP', '32'))
 
 # Scheduling counters that are not memo events but must still reach the task-log
@@ -1672,9 +1695,14 @@ class LEAPSynthesisPass(SynthesisPass):
                     # policy switch, no hysteresis to tune.
                     measured_idle = self._measured_idle_workers()
                     if measured_idle is not None:
-                        share = max(float(s), float(measured_idle))
+                        share = max(
+                            float(s),
+                            float(measured_idle) * _SPEC_OVERSHOOT,
+                        )
                         record_spec_metric('width_from_measured')
                         record_spec_metric('idle_seen_sum', measured_idle)
+                        if _SPEC_OVERSHOOT > 1.0:
+                            record_spec_metric('overshoot_rounds')
                         # Which term won the max. `s` winning means the round
                         # is already wider than the free machine, so no K can
                         # help -- that is a supply fact, not a policy one.
