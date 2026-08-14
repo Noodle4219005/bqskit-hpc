@@ -239,10 +239,25 @@ _SPEC_VALUE_FLOOR = float(os.environ.get('BQSKIT_SPEC_VALUE_FLOOR', '0.02'))
 # path -- which is the point, and also the risk: see the delayed-task
 # starvation this codebase already hit once when the worker queue became a
 # priority queue.
-_SPEC_OVERSHOOT = float(os.environ.get('BQSKIT_SPEC_OVERSHOOT', '1.0'))
+_SPEC_OVERSHOOT_TEXT = os.environ.get('BQSKIT_SPEC_OVERSHOOT', '1.0')
+_SPEC_UNBOUNDED = _SPEC_OVERSHOOT_TEXT.strip().lower() == 'max'
+_SPEC_OVERSHOOT = 1.0 if _SPEC_UNBOUNDED else float(_SPEC_OVERSHOOT_TEXT)
 
 if _SPEC_OVERSHOOT < 1.0:
-    raise ValueError('BQSKIT_SPEC_OVERSHOOT must be >= 1.0.')
+    raise ValueError('BQSKIT_SPEC_OVERSHOOT must be >= 1.0 or "max".')
+
+# 'max' removes BOTH ceilings, not one. Measured 2026-08-14 (job 1025549):
+# overshoot 8 predicted K=68 from the idle reading but delivered K=20.5,
+# because the value throttle -- share = min(share, value_k * s) -- bound
+# second. Raising only the first ceiling therefore stops early, which is why
+# that sweep never found a turning point: wall was still falling at K=20.5
+# (490.8 -> 427.6 s, LEAP occupancy 61% -> 82%, output identical).
+#
+# With both removed, K is bounded by the only thing left: how many NEW frontier
+# nodes the peek can find. The code below records that a K=32 window requested
+# 31 nodes and found 1.03 new ones per round -- a 3.3% fill rate falling as
+# 1/(K-1) -- so the frontier, not the machine and not a constant, is the real
+# ceiling. Asking for more than it has costs a peek, not a task.
 _SPEC_VALUE_WARMUP = int(os.environ.get('BQSKIT_SPEC_VALUE_WARMUP', '32'))
 
 # Scheduling counters that are not memo events but must still reach the task-log
@@ -1695,9 +1710,13 @@ class LEAPSynthesisPass(SynthesisPass):
                     # policy switch, no hysteresis to tune.
                     measured_idle = self._measured_idle_workers()
                     if measured_idle is not None:
-                        share = max(
-                            float(s),
-                            float(measured_idle) * _SPEC_OVERSHOOT,
+                        share = (
+                            float(self.expand_k_max) * float(s)
+                            if _SPEC_UNBOUNDED else
+                            max(
+                                float(s),
+                                float(measured_idle) * _SPEC_OVERSHOOT,
+                            )
                         )
                         record_spec_metric('width_from_measured')
                         record_spec_metric('idle_seen_sum', measured_idle)
@@ -1736,7 +1755,7 @@ class LEAPSynthesisPass(SynthesisPass):
                     # p is estimated from this block's own timely hits. Timely,
                     # not eventual: only a hit that arrives before the critical
                     # path needs it has shortened anything.
-                    if _spec_issued >= _SPEC_VALUE_WARMUP:
+                    if _spec_issued >= _SPEC_VALUE_WARMUP and not _SPEC_UNBOUNDED:
                         p = _spec_hits / _spec_issued
                         if p <= 0.0:
                             value_k = 2.0
@@ -2170,6 +2189,13 @@ class LEAPSynthesisPass(SynthesisPass):
                     # cache lives for the whole synthesis and an unused
                     # speculation on an otherwise idle worker costs nothing
                     # but memory, which is not the scarce resource here.
+                    # Fill rate is the only ceiling left once both share
+                    # ceilings are bypassed: a window wider than the frontier
+                    # can supply costs a peek, not a task. Recorded as
+                    # requested vs found so K is judged by whether it still
+                    # finds work, not by whether the machine looks full.
+                    record_spec_metric('budget_requested', _budget)
+                    record_spec_metric('budget_rounds')
                     _peek = len(speculation_memo) + effective_k * 2 + 8
                     for _, circuit, _ in frontier.peek(_peek):
                         if _acc >= _budget:
@@ -2193,6 +2219,7 @@ class LEAPSynthesisPass(SynthesisPass):
                         if _acc + len(node_successors) > _budget:
                             break
                         _acc += len(node_successors)
+                        record_spec_metric('budget_found', len(node_successors))
                         queued_keys.add(structure_key)
                         next_keys.append(structure_key)
                         next_batches.append(node_successors)
