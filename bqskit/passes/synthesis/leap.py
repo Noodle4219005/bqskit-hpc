@@ -268,9 +268,48 @@ _SPEC_FILL_GROW = float(os.environ.get('BQSKIT_SPEC_FILL_GROW', '0.40'))
 _SPEC_FILL_HOLD = float(os.environ.get('BQSKIT_SPEC_FILL_HOLD', '0.20'))
 _SPEC_HEADROOM = int(os.environ.get('BQSKIT_SPEC_HEADROOM', '4'))
 
-_SPEC_OVERSHOOT_TEXT = os.environ.get('BQSKIT_SPEC_OVERSHOOT', '1.0')
+_SPEC_OVERSHOOT_TEXT = os.environ.get('BQSKIT_SPEC_OVERSHOOT', '8.0')
 _SPEC_UNBOUNDED = _SPEC_OVERSHOOT_TEXT.strip().lower() == 'max'
-_SPEC_OVERSHOOT = 1.0 if _SPEC_UNBOUNDED else float(_SPEC_OVERSHOOT_TEXT)
+_SPEC_OVERSHOOT_AUTO = _SPEC_OVERSHOOT_TEXT.strip().lower() == 'auto'
+_SPEC_OVERSHOOT = (
+    1.0 if (_SPEC_UNBOUNDED or _SPEC_OVERSHOOT_AUTO)
+    else float(_SPEC_OVERSHOOT_TEXT)
+)
+
+# What overshoot actually does, and therefore what "auto" has to target.
+#
+# K comes from min(capacity, value): capacity is measured_idle * overshoot and
+# value is value_k * s, with value_k derived from the block's own speculative
+# hit rate. Overshoot does NOT set K. It sets how high capacity proposes,
+# and therefore WHICH of the two terms ends up binding:
+#
+#   arm   idle  capacity  after value    K     value bound in    wall
+#   o1    49.1      49.8         49.3   7.90            2.6%   490.8 s
+#   o8    21.9     171.1        109.6  20.60           37.1%   427.6 s
+#   o32   23.9     748.0        161.5  37.77           95.6%   451.7 s
+#   (square_heisenberg_N16, msz=4, 96 workers, jobs 1025549 and 1025637)
+#
+# At overshoot 1 capacity binds and K is too small. At 32 the value term is
+# saturated -- it fires on 95.6% of rounds and is the only thing holding K
+# down. At 8 the two are balanced, and that is the fastest arm.
+#
+# So the criterion is not a value of K and not a fill rate. It is: THE VALUE
+# TERM SHOULD BE THE BINDING CONSTRAINT, AND NOT YET SATURATED. That is a
+# guard counter this pass already records, bind_value_floor, and targeting it
+# tunes one term so that the OTHER term does the deciding -- unlike
+# BQSKIT_SPEC_CONTROL, which replaces the model rather than feeding it.
+#
+# The band is wide because the measured basin is wide: overshoot 2, 4 and 8
+# gave 439.9 / 439.3 / 427.6 s, a 2.9% spread inside this circuit's 4.3% wall
+# noise floor. Only the ends carry signal.
+_SPEC_OS_BIND_LO = float(os.environ.get('BQSKIT_SPEC_OS_BIND_LO', '0.25'))
+_SPEC_OS_BIND_HI = float(os.environ.get('BQSKIT_SPEC_OS_BIND_HI', '0.60'))
+_SPEC_OS_WINDOW = int(os.environ.get('BQSKIT_SPEC_OS_WINDOW', '16'))
+# A fuse, not a policy -- the same role expand_k_max plays for K. Both
+# feedbacks already push back on a large overshoot (idle collapses as the
+# machine fills, value_k falls as the hit rate drops), so this only bounds a
+# pathological block.
+_SPEC_OS_FUSE = float(os.environ.get('BQSKIT_SPEC_OS_FUSE', '64.0'))
 
 if _SPEC_OVERSHOOT < 1.0:
     raise ValueError('BQSKIT_SPEC_OVERSHOOT must be >= 1.0 or "max".')
@@ -1557,6 +1596,12 @@ class LEAPSynthesisPass(SynthesisPass):
         # no-speculation baseline and 2.6x slower than a static window.
         _k_ctl = 2.0
         _k_ssthresh = float('inf')
+        # Start at 1 -- "fill the machine once" -- and let the bind fraction
+        # walk it up. Starting at the measured 8 would assume the answer this
+        # is meant to derive; the cost of walking is ~64 rounds of 1,362.
+        _overshoot = 1.0 if _SPEC_OVERSHOOT_AUTO else _SPEC_OVERSHOOT
+        _os_rounds = 0
+        _os_bound = 0
         _fill_ema: float | None = None
         _k_probe_allowed = True
         best_dists = [best_dist]
@@ -1757,12 +1802,13 @@ class LEAPSynthesisPass(SynthesisPass):
                             if _SPEC_UNBOUNDED else
                             max(
                                 float(s),
-                                float(measured_idle) * _SPEC_OVERSHOOT,
+                                float(measured_idle) * _overshoot,
                             )
                         )
                         record_spec_metric('width_from_measured')
                         record_spec_metric('idle_seen_sum', measured_idle)
-                        if _SPEC_OVERSHOOT > 1.0:
+                        record_spec_metric('overshoot_sum', _overshoot)
+                        if _overshoot > 1.0:
                             record_spec_metric('overshoot_rounds')
                         # Which term won the max. `s` winning means the round
                         # is already wider than the free machine, so no K can
@@ -1827,11 +1873,32 @@ class LEAPSynthesisPass(SynthesisPass):
                         record_spec_metric('value_capped')
                         record_spec_metric('share_pre_value_sum', _share_pre)
                         record_spec_metric('share_post_value_sum', share)
+                        _os_rounds += 1
                         if share < _share_pre - 1e-9:
+                            _os_bound += 1
                             record_spec_metric('bind_value_floor')
                             record_spec_metric(
                                 'value_removed_sum', _share_pre - share,
                             )
+                        if _SPEC_OVERSHOOT_AUTO and _os_rounds >= _SPEC_OS_WINDOW:
+                            _frac = _os_bound / _os_rounds
+                            if _frac < _SPEC_OS_BIND_LO:
+                                # Capacity is still binding, so the value term
+                                # never gets to speak. Propose higher.
+                                _overshoot = min(
+                                    _overshoot * 2.0, _SPEC_OS_FUSE,
+                                )
+                                record_spec_metric('overshoot_raised')
+                            elif _frac > _SPEC_OS_BIND_HI:
+                                # Value is doing all the work and is saturated,
+                                # which is the o32 shape: K past the useful
+                                # range with the cap the only thing holding it.
+                                _overshoot = max(1.0, _overshoot / 2.0)
+                                record_spec_metric('overshoot_lowered')
+                            else:
+                                record_spec_metric('overshoot_held')
+                            _os_rounds = 0
+                            _os_bound = 0
                     _k_from_share = 1 + int((share - s) // s)
                     effective_k = max(
                         1,
