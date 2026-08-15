@@ -97,23 +97,31 @@ _SCAN_OCCUPANCY_STALE_AFTER = 1.0
 #
 # 32 rather than 8 because dispatch still overlaps the waste -- k32 was the
 # fastest arm measured. The cap is where the curve was still improving.
-# 32, reverted from 4096 on 2026-08-16.
+# 4096: a fuse, not a policy. Reverted to 32 and back again on 2026-08-16;
+# the flip-flop is recorded here because the criterion, not the number, is the
+# thing worth keeping.
 #
-# The cap was demoted to a fuse because with the barrier gone it looked inert:
-# job 1026188 gave wall 362.6 s capped against 355.4 s uncapped, 2.0% against
-# a 4.3% noise floor. That judged it on WALL. On the deletion phase's
-# core-seconds the same job says the opposite:
+# The useful work in this pass is a CONSTANT. Every candidate is solved exactly
+# once, 3,556 of them on square_heisenberg, and no window size changes that.
+# Job 1026188's deletion phase:
 #
-#   arm         deletion wall   core-seconds   dispatched   discarded
-#   map32            297.4 s          9,665        8,790       59.5%
-#   drain32          223.1 s          9,107        8,305       57.2%
-#   drainfree        214.3 s         10,550        9,745       63.5%
+#   arm         wall     core-s   occupancy   discarded   useful occ   USEFUL core-s
+#   map32     297.4 s     9,665       29.0%       59.5%        11.7%          3,910
+#   drain32   223.1 s     9,107       36.4%       57.2%        15.6%          3,899
+#   drainfree 214.3 s    10,550       44.0%       63.5%        16.0%          3,850
 #
-# Uncapping buys 4.1% of wall for 15.8% more computation, because the useful
-# window is 1/p = 4.7 candidates and everything past it is dispatched only to
-# be discarded. A cap is inert only against an objective that does not count
-# the work.
-_SCAN_LOOKAHEAD_CAP = int(os.environ.get('BQSKIT_SCAN_LOOKAHEAD_CAP', '32'))
+# The last column is flat. So K buys nothing except how fast the fixed useful
+# work gets through and how much waste is dispatched alongside it. Against an
+# energy objective the cap belongs at 32 (9,107 vs 10,550 core-seconds).
+# Against a PARALLELISM objective it belongs off: 44.0% occupancy against
+# 36.4%, the best useful occupancy of the three, and the shortest wall.
+#
+# The project objective is parallelism, so the fuse stays open. What this does
+# NOT do is raise the ceiling: 3,850 useful core-seconds on 112 cores is 34.6 s
+# of perfectly packed work inside a 214 s phase. The remaining 6.2x is
+# dependency -- every accepted removal forces a new baseline -- and no window
+# size reaches it.
+_SCAN_LOOKAHEAD_CAP = int(os.environ.get('BQSKIT_SCAN_LOOKAHEAD_CAP', '4096'))
 
 # Consume the window in index order AS ANSWERS ARRIVE instead of awaiting the
 # whole map. The consumption loop already stops at the first accepted removal,
