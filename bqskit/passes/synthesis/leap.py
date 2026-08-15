@@ -221,24 +221,6 @@ _OCCUPANCY_STALE_AFTER = 1.0
 # would swing K wildly early in a synthesis.
 _SPEC_VALUE_FLOOR = float(os.environ.get('BQSKIT_SPEC_VALUE_FLOOR', '0.02'))
 
-# Deliberately overshoot the free-core reading when sizing K.
-#
-# Measured 2026-08-14 (job 1025535): the ONLY thing binding K is `share`, which
-# is the occupancy broadcast. bind_share fired 1362 of 1362 rounds; the cap, the
-# round width and k=1 fired zero times, and the value floor 3.5%. Mean free
-# cores 50.2 of 96, mean round width 5.9, mean K 7.98 -- and 1 + (50.2-5.9)/5.9
-# = 8.5 reproduces that, so the sizer is doing exactly what it says.
-#
-# That is a closed loop: K is sized to fill the idle cores, the tasks it
-# dispatches consume them, and the system settles at "just full, never more".
-# 9 blocks x K 8 = 72 tasks against 96 workers, so the pool never holds a
-# backlog and anything that ORDERS the pool has nothing to order.
-#
-# 1.0 keeps that behaviour exactly. Above 1.0 the pool is deliberately
-# oversubscribed and the service-class ordering starts carrying the critical
-# path -- which is the point, and also the risk: see the delayed-task
-# starvation this codebase already hit once when the worker queue became a
-# priority queue.
 # Congestion control for K, in the TCP sense: a window that grows while the
 # frontier still supplies work and stops when it does not.
 #
@@ -268,7 +250,25 @@ _SPEC_FILL_GROW = float(os.environ.get('BQSKIT_SPEC_FILL_GROW', '0.40'))
 _SPEC_FILL_HOLD = float(os.environ.get('BQSKIT_SPEC_FILL_HOLD', '0.20'))
 _SPEC_HEADROOM = int(os.environ.get('BQSKIT_SPEC_HEADROOM', '4'))
 
-_SPEC_OVERSHOOT_TEXT = os.environ.get('BQSKIT_SPEC_OVERSHOOT', '4.0')
+# Deliberately overshoot the free-core reading when sizing K.
+#
+# Measured 2026-08-14 (job 1025535): the ONLY thing binding K is `share`, which
+# is the occupancy broadcast. bind_share fired 1362 of 1362 rounds; the cap, the
+# round width and k=1 fired zero times, and the value floor 3.5%. Mean free
+# cores 50.2 of 96, mean round width 5.9, mean K 7.98 -- and 1 + (50.2-5.9)/5.9
+# = 8.5 reproduces that, so the sizer is doing exactly what it says.
+#
+# That is a closed loop: K is sized to fill the idle cores, the tasks it
+# dispatches consume them, and the system settles at "just full, never more".
+# 9 blocks x K 8 = 72 tasks against 96 workers, so the pool never holds a
+# backlog and anything that ORDERS the pool has nothing to order.
+#
+# 1.0 keeps that behaviour exactly. Above 1.0 the pool is deliberately
+# oversubscribed and the service-class ordering starts carrying the critical
+# path -- which is the point, and also the risk: see the delayed-task
+# starvation this codebase already hit once when the worker queue became a
+# priority queue.
+_SPEC_OVERSHOOT_TEXT = os.environ.get('BQSKIT_SPEC_OVERSHOOT', 'auto')
 _SPEC_UNBOUNDED = _SPEC_OVERSHOOT_TEXT.strip().lower() == 'max'
 _SPEC_OVERSHOOT_AUTO = _SPEC_OVERSHOOT_TEXT.strip().lower() == 'auto'
 _SPEC_OVERSHOOT = (
@@ -287,23 +287,51 @@ _SPEC_OVERSHOOT = (
 # Measured landscape (square_heisenberg_N16, msz=4, 96 workers, jobs 1025549
 # and 1025637; wall noise floor 4.3%):
 #
-#   overshoot   K     idle   K*s/idle   wall      vs the best
-#       1      7.90   49.1      0.95   490.8 s      +14.1%
-#       2     11.09   36.9      1.78   439.9 s       +2.3%
-#       4     14.66   28.1      3.09   439.3 s       +2.2%
-#       8     20.60   21.9      5.56   430.0 s        best (n=3)
+#   overshoot   K     idle   K*s/idle   wall      vs the best   spec   hit rate
+#       1      7.85   48.9      0.95   490.8 s      +14.1%      6,393    17.4%
+#       2     11.03   36.7      1.78   439.9 s       +2.3%      7,182    16.3%
+#       4     14.57   28.0      3.09   439.3 s       +2.2%      7,608    15.4%
+#       8     20.48   21.8      5.56   430.0 s        best      8,088    14.6%
 #      32     37.77   23.9      9.34   451.7 s       +5.0%
 #     max    448.00   17.1        --   647.6 s      +50.6%
 #
-# The default is 4, not the 8 that measured best. The only statistically
-# supported claim is "somewhere in [2, 8]" -- 8 beats 4 by 2.2% against a 4.3%
-# noise floor -- and inside that range the risk is asymmetric: one step above 8
-# is already outside the noise band, two steps below 8 are still inside it. 4
-# is the geometric centre with the asymmetry accounted for.
+# THE DEFAULT IS 'auto'. It was the fixed 4 until 2026-08-16, justified as the
+# risk-weighted centre of "somewhere in [2, 8]". Two things measured since say
+# that reasoning picked the wrong half of the range:
+#
+#   1. The wall saturates at 2, not 8. 2 -> 4 is -0.14% and 4 -> 8 is -2.7%,
+#      both inside the 4.3% noise floor; only 1 -> 2 (-10.4%) is real. So the
+#      whole [2, 8] band is one point as far as wall is concerned.
+#   2. The hit rate falls monotonically across it, 17.4% -> 14.6%, with no
+#      turning point. Going 1 -> 8 dispatches 1,695 more speculative tasks and
+#      buys 71 more timely hits: 23.9 tasks per marginal hit. Above 2 the extra
+#      overshoot is bought with core-seconds and paid for in nothing.
+#
+# So the cheap end of a flat wall band is the right place to sit, and `auto`
+# lands there on its own: contention_ema measured 2.44-3.07 on both circuits.
+#
+# The deeper reason to prefer it over ANY constant is that the constant is the
+# gain of a feedback loop, not a setting. capacity = measured_idle * overshoot,
+# and measured_idle is itself a function of how much speculation is already
+# outstanding -- it read 48.9 at overshoot 1 and 21.8 at overshoot 8, a 2.2x
+# swing driven by nothing but its own output. That loop has no damping, so a
+# small timing perturbation amplifies: five arms whose LEAP search was
+# byte-identical (8 synths, 1,370 iterations, s = 5.92) spread 128.7 to 153.8 s
+# of LEAP wall, 19%.
+#
+# contention_ema is the one input measured NOT to drift with its own output:
+# across overshoot 1 to 8 -- K 7.85 to 20.48, a 2.6x range -- it moved only
+# 3.07 to 2.62, 15%. Feeding K from it lowers the loop gain instead of setting
+# it by hand. It does not remove the loop, because measured_idle is still the
+# other factor; it stops the gain from being a constant chosen on one circuit.
 _SPEC_OS_FUSE = float(os.environ.get('BQSKIT_SPEC_OS_FUSE', '64.0'))
 
+# 'auto' and 'max' both park _SPEC_OVERSHOOT at 1.0 and steer elsewhere, so
+# this only ever validates an explicit numeric override.
 if _SPEC_OVERSHOOT < 1.0:
-    raise ValueError('BQSKIT_SPEC_OVERSHOOT must be >= 1.0 or "max".')
+    raise ValueError(
+        'BQSKIT_SPEC_OVERSHOOT must be >= 1.0, "auto" or "max".',
+    )
 
 # 'max' removes BOTH ceilings, not one. Measured 2026-08-14 (job 1025549):
 # overshoot 8 predicted K=68 from the idle reading but delivered K=20.5,
@@ -502,6 +530,14 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'iterations': 0,
             'synth_calls': 0,
             'prefix_formed': 0,
+            # Why the prefix heuristic did not fire. Two independent gates and
+            # only the split assigns causality: prefix_formed = 0 alone cannot
+            # say whether the regression predicted no improvement or whether
+            # the layer distance was short. Requested by the upstream report.
+            'prefix_checked': 0,
+            'prefix_blocked_delta': 0,
+            'prefix_blocked_layers': 0,
+            'prefix_layers_added_sum': 0,
             'terminated': 0,
             'sum_n_after_win': 0,
             'n_after_win_count': 0,
@@ -1593,6 +1629,12 @@ class LEAPSynthesisPass(SynthesisPass):
         # no-speculation baseline and 2.6x slower than a static window.
         _k_ctl = 2.0
         _k_ssthresh = float('inf')
+        # Under 'auto' -- the default -- this is the warmup value, held until
+        # the first critical batch gives contention_ema something to measure.
+        # 1.0 is not an arbitrary floor: contention_ema itself starts at 1.0,
+        # so the two agree and the first rounds behave exactly as they would
+        # with no overshoot at all. Speculation ramps up as evidence arrives
+        # rather than starting from a number nobody has checked yet.
         _overshoot = 1.0 if _SPEC_OVERSHOOT_AUTO else _SPEC_OVERSHOOT
         _fill_ema: float | None = None
         _k_probe_allowed = True
@@ -3039,6 +3081,20 @@ class LEAPSynthesisPass(SynthesisPass):
         )
 
         layers_added = new_layer - last_prefix_layer
+        # Attribution, not a decision. `min_prefix_size` is NOT an absolute
+        # depth: it is the distance since the LAST prefix, and only coincides
+        # with depth on the first one because last_prefix_layer starts at 0.
+        # Measured prefix_formed = 59/21,937 on adder_8 and 0/1,370 on
+        # square_heisenberg at optimization_level 3, where the stock constant
+        # is min_prefix_size=7 (compile.py:1083/1789), but that number alone
+        # does not say WHICH of the two conjuncts blocked it.
+        if 'prefix_checked' in _LEAPWASTE_AGG_STATE:
+            _LEAPWASTE_AGG_STATE['prefix_checked'] += 1
+            _LEAPWASTE_AGG_STATE['prefix_layers_added_sum'] += layers_added
+            if delta >= 0:
+                _LEAPWASTE_AGG_STATE['prefix_blocked_delta'] += 1
+            elif layers_added < self.effective_min_prefix_size:
+                _LEAPWASTE_AGG_STATE['prefix_blocked_layers'] += 1
         return delta < 0 and layers_added >= self.effective_min_prefix_size
 
     @property
