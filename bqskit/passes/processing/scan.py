@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from typing import Any
@@ -11,6 +12,8 @@ from typing import Callable
 from bqskit.compiler.basepass import BasePass
 from bqskit.compiler.passdata import PassData
 from bqskit.ir.circuit import Circuit
+from bqskit.ir.gates.constant.cz import CZGate
+from bqskit.ir.gates.parameterized.rz import RZGate
 from bqskit.ir.operation import Operation
 from bqskit.qis.unitary.unitarymatrix import UnitaryMatrix
 from bqskit.ir.opt.cost.functions import HilbertSchmidtResidualsGenerator
@@ -138,6 +141,61 @@ _SCAN_LOOKAHEAD_CAP = int(os.environ.get('BQSKIT_SCAN_LOOKAHEAD_CAP', '4096'))
 # dispatched was thrown away. On the block that owned the phase (142 ops,
 # 174-245 s) the advance was 3.84, so it waited on 64 answers to use 4.
 _SCAN_DRAIN = os.environ.get('BQSKIT_SCAN_DRAIN', '1') != '0'
+
+
+_MARK_GAUGE = os.environ.get('BQSKIT_MARK_GAUGE', '1') != '0'
+_GAUGE_TOL = float(os.environ.get('BQSKIT_GAUGE_TOL', '1e-12'))
+_TWO_PI = 2.0 * math.pi
+
+
+def _gauge_partner(
+    circuit: Circuit,
+    cycle: int,
+    qudit: int,
+) -> tuple[int, int, float] | None:
+    """Can the RZ at (cycle, qudit) be deleted by pure algebra?
+
+    Returns (partner_cycle, partner_qudit, new_angle) when the deletion is an
+    exact identity, or None when it needs the numerical solver.
+
+    TWO CASES, and both delete EXACTLY ONE gate, which is what lets this be a
+    marked accept rather than a rewrite:
+
+      angle == 0 (mod 2 pi)   RZ(2 pi) is -I, a global phase, and the cost
+                              BQSKit judges by is |Tr(U1' U2)|-based, so a
+                              global phase is invisible. Returns the gate
+                              itself as its own partner.
+
+      RZ .. CZ* .. RZ         CZ is diagonal and so is RZ, so they commute
+                              exactly. The angle folds into the next RZ on
+                              this qudit, reachable across any number of CZs.
+
+    NOT handled, deliberately: SX SX -> X and X X -> I. Those REWRITE a
+    surviving gate rather than deleting one, so they cannot be expressed as
+    "the scan accepts this candidate", and expressing them would forfeit the
+    equivalence argument. Measured cost of that choice on the block that owns
+    square_heisenberg's deletion phase: zero. Its 52 SX are exactly 26 runs x
+    2, so no two SX are ever adjacent and no X gate exists.
+    """
+    op = circuit[cycle, qudit]
+    if not isinstance(op.gate, RZGate):
+        return None
+    theta = float(op.params[0])
+    if abs((theta + math.pi) % _TWO_PI - math.pi) <= _GAUGE_TOL:
+        return (cycle, qudit, 0.0)
+    for c in range(cycle + 1, circuit.num_cycles):
+        try:
+            nxt = circuit[c, qudit]
+        except (IndexError, KeyError):
+            continue
+        if nxt is None:
+            continue
+        if isinstance(nxt.gate, CZGate):
+            continue        # diagonal: RZ passes straight through
+        if isinstance(nxt.gate, RZGate):
+            return (c, qudit, float(nxt.params[0]) + theta)
+        return None         # SX, X, anything else: does not commute
+    return None
 
 
 def _scan_free_cores() -> int | None:
@@ -433,8 +491,62 @@ class ScanningGateRemovalPass(BasePass):
             _probe['accept_index_sum'] = 0
             _probe['windows_with_accept'] = 0
             _probe['window_latency_sum'] = 0.0
+            _probe['gauge_free'] = 0       # accepted with no dispatch at all
+            _probe['gauge_in_window'] = 0  # dispatched, then accepted unread
+            _probe['gauge_zero'] = 0       # the angle itself vanished
+            def _take_gauge(cursor: int) -> int:
+                """Accept leading algebraically-certain candidates for free.
+
+                This is the whole point of marking rather than pre-fusing. The
+                scan would have accepted these anyway -- they are exact
+                identities, so d*(C \\ g) = d*(C) -- and accepting them here
+                leaves the SAME structure and the SAME parameter count that a
+                solved acceptance would have left. Since instantiate reseeds
+                from the pass seed and draws 2*pi*random(num_params), and since
+                RandomStartGenerator discards the carried parameters, every
+                subsequent candidate then sees a bit-identical starting point.
+                The decisions after this are therefore identical to stock,
+                except where stock's local solver would have produced a false
+                negative on a gate that is provably removable -- and there this
+                is the correct answer and stock is the wrong one.
+
+                Only the HEAD is taken. A marked candidate deeper in a window
+                cannot be consumed before the ones ahead of it are decided,
+                because an earlier acceptance changes the baseline and may
+                invalidate the identity.
+                """
+                nonlocal circuit_copy
+                while cursor < len(candidates):
+                    _cy, _op = candidates[cursor]
+                    _sh = (
+                        circuit.num_cycles - circuit_copy.num_cycles
+                        if self.start_from_left else 0
+                    )
+                    _q = _op.location[0]
+                    hit = _gauge_partner(circuit_copy, _cy - _sh, _q)
+                    if hit is None:
+                        return cursor
+                    _pc, _pq, _new = hit
+                    if (_pc, _pq) == (_cy - _sh, _q):
+                        _probe['gauge_zero'] += 1
+                    else:
+                        _partner = circuit_copy[_pc, _pq]
+                        circuit_copy.replace_gate(
+                            (_pc, _pq), _partner.gate,
+                            _partner.location, [_new],
+                        )
+                    circuit_copy.pop((_cy - _sh, _q))
+                    _probe['gauge_free'] += 1
+                    _probe['speculations_used'] += 1
+                    cursor += 1
+                return cursor
+
             next_candidate = 0
             while next_candidate < len(candidates):
+                if _MARK_GAUGE:
+                    next_candidate = _take_gauge(next_candidate)
+                    if next_candidate >= len(candidates):
+                        break
                 window_start = next_candidate
                 # Window size is free to change between rounds without moving
                 # the output. The invariant is "compute out of order, publish
