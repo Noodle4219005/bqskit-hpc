@@ -133,6 +133,12 @@ class Manager(ServerBase):
 
         # Track info on sent messages to reduce redundant messages:
         self.last_num_idle_sent_up = self.total_workers
+        # Tasks accepted from above since the last upward idle report. The
+        # boss DECREMENTS its copy of our idle count on every placement
+        # (base.py, _drain_pool), so a report suppressed as "unchanged" leaves
+        # the boss believing a number we already spent. See
+        # update_upstream_idle_workers.
+        self._submits_since_report = 0
 
         # The boss's total worker count, used as the denominator when deciding
         # how much of a batch to retain. Defaults to this node's own total so
@@ -163,12 +169,18 @@ class Manager(ServerBase):
             if msg == RuntimeMessage.SUBMIT:
                 rtask = cast(RuntimeTask, payload)
                 self.most_recent_read_submit = rtask.unique_id
+                self._submits_since_report += 1
                 self.schedule_tasks([rtask])
+                # No report here on purpose: accepting a task does not change
+                # how many workers are idle. What it DOES change is the boss's
+                # copy, and the counter above is what carries that fact to the
+                # next report.
                 # self.update_upstream_idle_workers()
 
             elif msg == RuntimeMessage.SUBMIT_BATCH:
                 rtasks = cast(List[RuntimeTask], payload)
                 self.most_recent_read_submit = rtasks[0].unique_id
+                self._submits_since_report += len(rtasks)
                 self.schedule_tasks(rtasks)
                 # self.update_upstream_idle_workers()
 
@@ -360,10 +372,44 @@ class Manager(ServerBase):
             self.outgoing.put((self.upstream, RuntimeMessage.RESULT, result))
 
     def update_upstream_idle_workers(self) -> None:
-        """Update the total number of idle workers upstream."""
+        """Update the total number of idle workers upstream.
+
+        The suppression below used to compare only against our own last-sent
+        value, and that is the wrong reference: the boss does not merely
+        REMEMBER what we told it, it DECREMENTS that copy on every placement
+        (base.py, _drain_pool: `target.num_idle_workers -= 1`). So an
+        unchanged local value does not mean an unchanged remote one.
+
+        The failure needs nothing exotic -- steady-state turnover is enough:
+
+          worker A idles      -> pooled_idle 1, last 0, send 1
+          boss sets 1, places 1 task, decrements its copy to 0
+          A takes the task    -> pooled_idle 0
+          worker B idles      -> pooled_idle 1, last 1  -> SUPPRESSED
+          boss still believes 0, places nothing, B stays idle
+
+        and it recovers only when the aggregate happens to land on a different
+        number. With 96 workers cycling, that aggregate sits on small repeated
+        values most of the time, so most of the repeats were lost placements.
+
+        Measured consequence on adder_8 (job 1026254): the server's pool holds
+        a median of 909 tasks -- p10 818, never dry -- through intervals where
+        only 24 of 112 cores are computing, while draining at the same rate as
+        when the machine is full. And because a queued task still counts in
+        LEAP's `_in_flight`, that stall propagates straight into speculation:
+        79% of A* rounds issued no speculation at all, not for want of trying
+        but because the previous allowance was still sitting in the queue.
+
+        `_submits_since_report` is the missing term. If the boss has sent us
+        anything since our last report it has spent credit it will not get
+        back on its own, so the report must go out even when our own number is
+        unchanged. The read receipt already in the payload lets the boss
+        subtract whatever crossed in flight, so re-reporting is safe.
+        """
         _idle = self.pooled_idle_workers()
-        if _idle != self.last_num_idle_sent_up:
+        if _idle != self.last_num_idle_sent_up or self._submits_since_report:
             self.last_num_idle_sent_up = _idle
+            self._submits_since_report = 0
             payload = (_idle, self.most_recent_read_submit)
             m = (self.upstream, RuntimeMessage.WAITING, payload)
             self.outgoing.put(m)
