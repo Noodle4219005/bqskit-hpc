@@ -268,7 +268,7 @@ _SPEC_FILL_GROW = float(os.environ.get('BQSKIT_SPEC_FILL_GROW', '0.40'))
 _SPEC_FILL_HOLD = float(os.environ.get('BQSKIT_SPEC_FILL_HOLD', '0.20'))
 _SPEC_HEADROOM = int(os.environ.get('BQSKIT_SPEC_HEADROOM', '4'))
 
-_SPEC_OVERSHOOT_TEXT = os.environ.get('BQSKIT_SPEC_OVERSHOOT', '8.0')
+_SPEC_OVERSHOOT_TEXT = os.environ.get('BQSKIT_SPEC_OVERSHOOT', '4.0')
 _SPEC_UNBOUNDED = _SPEC_OVERSHOOT_TEXT.strip().lower() == 'max'
 _SPEC_OVERSHOOT_AUTO = _SPEC_OVERSHOOT_TEXT.strip().lower() == 'auto'
 _SPEC_OVERSHOOT = (
@@ -276,62 +276,30 @@ _SPEC_OVERSHOOT = (
     else float(_SPEC_OVERSHOOT_TEXT)
 )
 
-# What overshoot actually does, and therefore what "auto" has to target.
+# Overshoot is dimensionless: capacity is measured_idle * overshoot and
+# K ~ capacity / s, so K * s / idle IS the overshoot. It asks for "this many
+# outstanding speculative tasks per free core", which is why it survives a
+# change of machine size, of block width (s = C(w,2) moves and K moves with
+# it) and of topology. The value term, which uses the block's own measured hit
+# rate, is what adapts it to a different circuit -- at overshoot 8 it removed
+# 31% of the proposal here and 71% at overshoot 32.
 #
-# K comes from min(capacity, value): capacity is measured_idle * overshoot and
-# value is value_k * s, with value_k derived from the block's own speculative
-# hit rate. Overshoot does NOT set K. It sets how high capacity proposes,
-# and therefore WHICH of the two terms ends up binding:
+# Measured landscape (square_heisenberg_N16, msz=4, 96 workers, jobs 1025549
+# and 1025637; wall noise floor 4.3%):
 #
-#   arm   idle  capacity  after value    K     value bound in    wall
-#   o1    49.1      49.8         49.3   7.90            2.6%   490.8 s
-#   o8    21.9     171.1        109.6  20.60           37.1%   427.6 s
-#   o32   23.9     748.0        161.5  37.77           95.6%   451.7 s
-#   (square_heisenberg_N16, msz=4, 96 workers, jobs 1025549 and 1025637)
+#   overshoot   K     idle   K*s/idle   wall      vs the best
+#       1      7.90   49.1      0.95   490.8 s      +14.1%
+#       2     11.09   36.9      1.78   439.9 s       +2.3%
+#       4     14.66   28.1      3.09   439.3 s       +2.2%
+#       8     20.60   21.9      5.56   430.0 s        best (n=3)
+#      32     37.77   23.9      9.34   451.7 s       +5.0%
+#     max    448.00   17.1        --   647.6 s      +50.6%
 #
-# At overshoot 1 capacity binds and K is too small. At 32 the value term is
-# saturated -- it fires on 95.6% of rounds and is the only thing holding K
-# down. At 8 the two are balanced, and that is the fastest arm.
-#
-# So the criterion is not a value of K and not a fill rate. It is: THE VALUE
-# TERM SHOULD BE THE BINDING CONSTRAINT, AND NOT YET SATURATED. That is a
-# guard counter this pass already records, bind_value_floor, and targeting it
-# tunes one term so that the OTHER term does the deciding -- unlike
-# BQSKIT_SPEC_CONTROL, which replaces the model rather than feeding it.
-#
-# The band is wide because the measured basin is wide: overshoot 2, 4 and 8
-# gave 439.9 / 439.3 / 427.6 s, a 2.9% spread inside this circuit's 4.3% wall
-# noise floor. Only the ends carry signal.
-_SPEC_OS_BIND_LO = float(os.environ.get('BQSKIT_SPEC_OS_BIND_LO', '0.25'))
-_SPEC_OS_BIND_HI = float(os.environ.get('BQSKIT_SPEC_OS_BIND_HI', '0.60'))
-#
-# TWO window sizes, because the first version chattered. Job 1026201 measured
-# overshoot=auto converging to a mean of 7.89 against the hand-tuned 8.00 --
-# the derivation holds -- but it cost 8.5% wall with raised/held/lowered =
-# 36/15/25. Twenty-five reversals is not convergence; 7.89 was the mean of a
-# sawtooth.
-#
-# The band is only about one standard deviation wide at a 16-round window. At
-# the measured operating point p = 0.354, sd = sqrt(.354*.646/16) = 0.119 and
-# the near edge 0.25 sits 0.87 sd away, so roughly one window in five reads
-# "too low" by chance alone. The controller was reacting to sampling noise.
-#
-# Requiring the near edge to sit at least 2 sd out gives the trim window
-# directly, with no constant to choose:
-#
-#   2 * sqrt(0.35 * 0.65 / n) <= 0.10   =>   n >= 91
-#
-# So: double every 16 rounds until the fraction lands in the band once -- the
-# warmup from 1.0 to 8.0 is three doublings -- and after that trim by 25% on a
-# 96-round window. Same slow-start / congestion-avoidance shape that fixed the
-# K controller's overshoot, and for the same reason.
-_SPEC_OS_WINDOW = int(os.environ.get('BQSKIT_SPEC_OS_WINDOW', '16'))
-_SPEC_OS_TRIM_WINDOW = int(os.environ.get('BQSKIT_SPEC_OS_TRIM_WINDOW', '96'))
-_SPEC_OS_TRIM = float(os.environ.get('BQSKIT_SPEC_OS_TRIM', '1.25'))
-# A fuse, not a policy -- the same role expand_k_max plays for K. Both
-# feedbacks already push back on a large overshoot (idle collapses as the
-# machine fills, value_k falls as the hit rate drops), so this only bounds a
-# pathological block.
+# The default is 4, not the 8 that measured best. The only statistically
+# supported claim is "somewhere in [2, 8]" -- 8 beats 4 by 2.2% against a 4.3%
+# noise floor -- and inside that range the risk is asymmetric: one step above 8
+# is already outside the noise band, two steps below 8 are still inside it. 4
+# is the geometric centre with the asymmetry accounted for.
 _SPEC_OS_FUSE = float(os.environ.get('BQSKIT_SPEC_OS_FUSE', '64.0'))
 
 if _SPEC_OVERSHOOT < 1.0:
@@ -1619,13 +1587,7 @@ class LEAPSynthesisPass(SynthesisPass):
         # no-speculation baseline and 2.6x slower than a static window.
         _k_ctl = 2.0
         _k_ssthresh = float('inf')
-        # Start at 1 -- "fill the machine once" -- and let the bind fraction
-        # walk it up. Starting at the measured 8 would assume the answer this
-        # is meant to derive; the cost of walking is ~64 rounds of 1,362.
         _overshoot = 1.0 if _SPEC_OVERSHOOT_AUTO else _SPEC_OVERSHOOT
-        _os_rounds = 0
-        _os_bound = 0
-        _os_in_band = False
         _fill_ema: float | None = None
         _k_probe_allowed = True
         best_dists = [best_dist]
@@ -1819,6 +1781,26 @@ class LEAPSynthesisPass(SynthesisPass):
                     # formula degenerates on its own: saturated means idle ~ 0
                     # means k = 1 means no speculation. No threshold, no
                     # policy switch, no hysteresis to tune.
+                    if _SPEC_OVERSHOOT_AUTO:
+                        # "How many times slower than my own best batch am I
+                        # running?" -- which is exactly how many generations of
+                        # outstanding work it takes to keep this block's share
+                        # of the machine fed. contention_ema is already
+                        # computed, already smoothed, and already recorded.
+                        #
+                        # Two earlier autos steered on bind_value_floor, a
+                        # Bernoulli proportion, and both failed on its sampling
+                        # variance: v1 chattered (36/15/25 raise/hold/lower,
+                        # +8.5% wall) and v2 latched out of warmup on a short
+                        # in-band reading and froze at 2.49 (+6.6%). A ratio of
+                        # two wall times has no such band to fall out of.
+                        #
+                        # And it does not drift with its own output: measured
+                        # 2.44 to 3.33 across overshoot 1 to unbounded, K 7.9
+                        # to 448. That is the property a K input must have.
+                        _overshoot = max(
+                            1.0, min(contention_ema, _SPEC_OS_FUSE),
+                        )
                     measured_idle = self._measured_idle_workers()
                     if measured_idle is not None:
                         share = (
@@ -1897,58 +1879,11 @@ class LEAPSynthesisPass(SynthesisPass):
                         record_spec_metric('value_capped')
                         record_spec_metric('share_pre_value_sum', _share_pre)
                         record_spec_metric('share_post_value_sum', share)
-                        _os_rounds += 1
                         if share < _share_pre - 1e-9:
-                            _os_bound += 1
                             record_spec_metric('bind_value_floor')
                             record_spec_metric(
                                 'value_removed_sum', _share_pre - share,
                             )
-                        _os_window = (
-                            _SPEC_OS_TRIM_WINDOW if _os_in_band
-                            else _SPEC_OS_WINDOW
-                        )
-                        if _SPEC_OVERSHOOT_AUTO and _os_rounds >= _os_window:
-                            _frac = _os_bound / _os_rounds
-                            _step = _SPEC_OS_TRIM if _os_in_band else 2.0
-                            if _frac < _SPEC_OS_BIND_LO:
-                                # Capacity is still binding, so the value term
-                                # never gets to speak. Propose higher.
-                                _overshoot = min(
-                                    _overshoot * _step, _SPEC_OS_FUSE,
-                                )
-                                record_spec_metric('overshoot_raised')
-                            elif _frac > _SPEC_OS_BIND_HI:
-                                # Value is doing all the work and is saturated,
-                                # which is the o32 shape: K past the useful
-                                # range with the cap the only thing holding it.
-                                _overshoot = max(1.0, _overshoot / _step)
-                                record_spec_metric('overshoot_lowered')
-                            elif _os_rounds >= _SPEC_OS_TRIM_WINDOW:
-                                # In band, and measured over a window long
-                                # enough to mean it. Latching on a SHORT window
-                                # was the v2 defect: at a 16-round window the
-                                # reading has sd 0.12, so overshoot 2 lands
-                                # inside [0.25, 0.60] by chance, latches, and
-                                # then only ever moves by 25% per 96 rounds.
-                                # Job 1026229 converged to 2.49 with a bind
-                                # fraction of 17.0% -- below the band it was
-                                # supposedly holding inside.
-                                _os_in_band = True
-                                record_spec_metric('overshoot_held')
-                            else:
-                                # In band on a short window: promote to the long
-                                # window and re-measure rather than latch. No
-                                # new constant -- it is the same 2 sd rule that
-                                # set the trim window in the first place.
-                                # No `continue` here: this block sits inside
-                                # the A* round body, so skipping the rest of it
-                                # would skip the search itself. The counter
-                                # reset below is reached on the normal path.
-                                _os_in_band = True
-                                record_spec_metric('overshoot_promoted')
-                            _os_rounds = 0
-                            _os_bound = 0
                     _k_from_share = 1 + int((share - s) // s)
                     effective_k = max(
                         1,
