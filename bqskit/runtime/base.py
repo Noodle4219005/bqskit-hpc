@@ -222,6 +222,16 @@ class ServerBase:
         # an AttributeError that propagates out and kills the run while Slurm
         # still reports COMPLETED 0:0.
         self._pool_drains = 0
+        # Placement stalls: a drain that ended with tasks still pooled and
+        # nowhere to put them. Recorded WITH the idle count this level
+        # believed at that moment, because the three explanations are only
+        # distinguishable together:
+        #   blocked, believed idle == 0   -> the credit is spent or stale
+        #   blocked, believed idle  > 0   -> eligibility rejected every target
+        #   never blocked                 -> supply, and no placement fix helps
+        self._pool_blocked = 0
+        self._pool_blocked_depth_sum = 0
+        self._pool_blocked_idle_sum = 0
         self._pool_depth_sum = 0
         self._pool_depth_max = 0
         # How often the owner-first branch could fire, and did. The owner is
@@ -777,7 +787,8 @@ class ServerBase:
         if self._pool_drains % _POOL_STAT_EVERY == 0:
             _logger.info(
                 'pool: %d drains, depth mean %.2f max %d, '
-                'owner %d/%d (%.1f%%)',
+                'owner %d/%d (%.1f%%), blocked %d (%.1f%%) '
+                'at depth %.1f believing %.2f idle',
                 self._pool_drains,
                 self._pool_depth_sum / self._pool_drains,
                 self._pool_depth_max,
@@ -785,6 +796,10 @@ class ServerBase:
                 self._pool_owner_eligible,
                 100.0 * self._pool_owner_hit
                 / max(1, self._pool_owner_eligible),
+                self._pool_blocked,
+                100.0 * self._pool_blocked / self._pool_drains,
+                self._pool_blocked_depth_sum / max(1, self._pool_blocked),
+                self._pool_blocked_idle_sum / max(1, self._pool_blocked),
             )
         batches: dict[int, tuple[RuntimeEmployee, list[RuntimeTask]]] = {}
         progress = True
@@ -820,6 +835,11 @@ class ServerBase:
             if target is None:
                 # Nobody has room; put it back and stop.
                 heapq.heappush(self._pool, (_cls, _cost, _seq, task))
+                self._pool_blocked += 1
+                self._pool_blocked_depth_sum += len(self._pool)
+                self._pool_blocked_idle_sum += sum(
+                    e.num_idle_workers for e in self.employees
+                )
                 break
             batches.setdefault(id(target), (target, []))[1].append(task)
             target.num_idle_workers -= 1
