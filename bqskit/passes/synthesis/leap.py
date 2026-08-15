@@ -304,7 +304,30 @@ _SPEC_OVERSHOOT = (
 # noise floor. Only the ends carry signal.
 _SPEC_OS_BIND_LO = float(os.environ.get('BQSKIT_SPEC_OS_BIND_LO', '0.25'))
 _SPEC_OS_BIND_HI = float(os.environ.get('BQSKIT_SPEC_OS_BIND_HI', '0.60'))
+#
+# TWO window sizes, because the first version chattered. Job 1026201 measured
+# overshoot=auto converging to a mean of 7.89 against the hand-tuned 8.00 --
+# the derivation holds -- but it cost 8.5% wall with raised/held/lowered =
+# 36/15/25. Twenty-five reversals is not convergence; 7.89 was the mean of a
+# sawtooth.
+#
+# The band is only about one standard deviation wide at a 16-round window. At
+# the measured operating point p = 0.354, sd = sqrt(.354*.646/16) = 0.119 and
+# the near edge 0.25 sits 0.87 sd away, so roughly one window in five reads
+# "too low" by chance alone. The controller was reacting to sampling noise.
+#
+# Requiring the near edge to sit at least 2 sd out gives the trim window
+# directly, with no constant to choose:
+#
+#   2 * sqrt(0.35 * 0.65 / n) <= 0.10   =>   n >= 91
+#
+# So: double every 16 rounds until the fraction lands in the band once -- the
+# warmup from 1.0 to 8.0 is three doublings -- and after that trim by 25% on a
+# 96-round window. Same slow-start / congestion-avoidance shape that fixed the
+# K controller's overshoot, and for the same reason.
 _SPEC_OS_WINDOW = int(os.environ.get('BQSKIT_SPEC_OS_WINDOW', '16'))
+_SPEC_OS_TRIM_WINDOW = int(os.environ.get('BQSKIT_SPEC_OS_TRIM_WINDOW', '96'))
+_SPEC_OS_TRIM = float(os.environ.get('BQSKIT_SPEC_OS_TRIM', '1.25'))
 # A fuse, not a policy -- the same role expand_k_max plays for K. Both
 # feedbacks already push back on a large overshoot (idle collapses as the
 # machine fills, value_k falls as the hit rate drops), so this only bounds a
@@ -1602,6 +1625,7 @@ class LEAPSynthesisPass(SynthesisPass):
         _overshoot = 1.0 if _SPEC_OVERSHOOT_AUTO else _SPEC_OVERSHOOT
         _os_rounds = 0
         _os_bound = 0
+        _os_in_band = False
         _fill_ema: float | None = None
         _k_probe_allowed = True
         best_dists = [best_dist]
@@ -1880,22 +1904,33 @@ class LEAPSynthesisPass(SynthesisPass):
                             record_spec_metric(
                                 'value_removed_sum', _share_pre - share,
                             )
-                        if _SPEC_OVERSHOOT_AUTO and _os_rounds >= _SPEC_OS_WINDOW:
+                        _os_window = (
+                            _SPEC_OS_TRIM_WINDOW if _os_in_band
+                            else _SPEC_OS_WINDOW
+                        )
+                        if _SPEC_OVERSHOOT_AUTO and _os_rounds >= _os_window:
                             _frac = _os_bound / _os_rounds
+                            _step = _SPEC_OS_TRIM if _os_in_band else 2.0
                             if _frac < _SPEC_OS_BIND_LO:
                                 # Capacity is still binding, so the value term
                                 # never gets to speak. Propose higher.
                                 _overshoot = min(
-                                    _overshoot * 2.0, _SPEC_OS_FUSE,
+                                    _overshoot * _step, _SPEC_OS_FUSE,
                                 )
                                 record_spec_metric('overshoot_raised')
                             elif _frac > _SPEC_OS_BIND_HI:
                                 # Value is doing all the work and is saturated,
                                 # which is the o32 shape: K past the useful
                                 # range with the cap the only thing holding it.
-                                _overshoot = max(1.0, _overshoot / 2.0)
+                                _overshoot = max(1.0, _overshoot / _step)
                                 record_spec_metric('overshoot_lowered')
                             else:
+                                # First time in band ends the warmup. From here
+                                # the estimate is taken over 96 rounds and the
+                                # step is 25%, so a reversal means the operating
+                                # point moved rather than that the sample was
+                                # short.
+                                _os_in_band = True
                                 record_spec_metric('overshoot_held')
                             _os_rounds = 0
                             _os_bound = 0
