@@ -493,6 +493,7 @@ class ScanningGateRemovalPass(BasePass):
             _probe['window_latency_sum'] = 0.0
             _probe['gauge_free'] = 0       # accepted with no dispatch at all
             _probe['gauge_in_window'] = 0  # dispatched, then accepted unread
+            _probe['gauge_in_window'] = 0  # dispatched, then accepted unread
             _probe['gauge_zero'] = 0       # the angle itself vanished
             def _take_gauge(cursor: int) -> int:
                 """Accept leading algebraically-certain candidates for free.
@@ -647,6 +648,47 @@ class ScanningGateRemovalPass(BasePass):
 
                 for index in range(len(window)):
                     cycle, op = window[index]
+                    # Second gauge site, and the one that lifts the coverage.
+                    #
+                    # _take_gauge only consumes the HEAD of the candidate list,
+                    # because a later candidate's identity can be invalidated
+                    # by an earlier acceptance. Inside a window that objection
+                    # disappears: circuit_copy does not change until an accept,
+                    # and an accept BREAKS out of this loop, so the baseline
+                    # here is exactly the one the window was built from and the
+                    # identity check is valid for any index.
+                    #
+                    # Checked BEFORE waiting, so a hit skips the wait as well
+                    # as the result. The dispatch itself is already spent -- the
+                    # window went out before this loop -- and that is accepted:
+                    # those tasks ran on cores that were idle anyway, and the
+                    # objective here is parallelism rather than energy.
+                    #
+                    # Measured coverage of head-only on square_heisenberg_N16:
+                    # 61 of the ~136 sites the S - L model predicts, so 45%.
+                    if _MARK_GAUGE:
+                        _hq = op.location[0]
+                        _hc = cycle - idx_shift
+                        _hit = _gauge_partner(circuit_copy, _hc, _hq)
+                        if _hit is not None:
+                            _pc, _pq, _new = _hit
+                            if (_pc, _pq) == (_hc, _hq):
+                                _probe['gauge_zero'] += 1
+                            else:
+                                _pt = circuit_copy[_pc, _pq]
+                                circuit_copy.replace_gate(
+                                    (_pc, _pq), _pt.gate, _pt.location, [_new],
+                                )
+                            circuit_copy.pop((_hc, _hq))
+                            _probe['gauge_in_window'] += 1
+                            _probe['speculations_used'] += 1
+                            _probe['speculations_discarded'] += (
+                                len(window) - index - 1
+                            )
+                            _probe['accept_index_sum'] += index
+                            _probe['windows_with_accept'] += 1
+                            next_candidate = window_start + index + 1
+                            break
                     # Pull from whichever future still owes this index. The
                     # head map holds index 0 and nothing else, so there is no
                     # ambiguity and no wait-any needed.
