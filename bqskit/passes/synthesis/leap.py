@@ -1861,9 +1861,23 @@ class LEAPSynthesisPass(SynthesisPass):
                         )
                         record_spec_metric('width_from_measured')
                         record_spec_metric('idle_seen_sum', measured_idle)
+                        # overshoot_rounds counts EVERY round the sum sees, so
+                        # overshoot_sum / overshoot_rounds is the mean its name
+                        # promises. It used to be gated on `> 1.0` while the
+                        # sum was not, which is exactly the sampling-rate bug
+                        # this codebase keeps rediscovering: harmless while the
+                        # default was a fixed 4.0 (every round cleared the
+                        # gate, so the two counts agreed at 1,362) and biased
+                        # high the moment the default became 'auto', because
+                        # auto's warmup rounds sit at exactly 1.0 -- counted in
+                        # the numerator, dropped from the denominator.
                         record_spec_metric('overshoot_sum', _overshoot)
+                        record_spec_metric('overshoot_rounds')
+                        # Kept separately because under 'auto' it is a real
+                        # signal rather than a tautology: how much of the run
+                        # was above the floor at all.
                         if _overshoot > 1.0:
-                            record_spec_metric('overshoot_rounds')
+                            record_spec_metric('overshoot_above_one')
                         # Which term won the max. `s` winning means the round
                         # is already wider than the free machine, so no K can
                         # help -- that is a supply fact, not a policy one.
