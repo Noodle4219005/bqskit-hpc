@@ -1556,6 +1556,7 @@ class LEAPSynthesisPass(SynthesisPass):
         # with _k_ctl pinned at 1.00 and spec_tasks 0, which is the
         # no-speculation baseline and 2.6x slower than a static window.
         _k_ctl = 2.0
+        _k_ssthresh = float('inf')
         _fill_ema: float | None = None
         _k_probe_allowed = True
         best_dists = [best_dist]
@@ -2316,13 +2317,35 @@ class LEAPSynthesisPass(SynthesisPass):
                             else 0.7 * _fill_ema + 0.3 * _fill
                         )
                         if _k_probe_allowed:
-                            if _fill_ema >= _SPEC_FILL_GROW:
-                                _k_ctl = min(_k_ctl * 2.0, float(self.expand_k_max))
+                            if (
+                                _fill_ema >= _SPEC_FILL_GROW
+                                and _k_ctl < _k_ssthresh
+                            ):
+                                # Slow start, but only below ssthresh. Doubling
+                                # all the way to exhaustion overshoots by a
+                                # factor of ~18: job 1025957 climbed to k_ctl
+                                # 366 with fill 4.4% and hit rate 3.3%, which
+                                # reproduces the unbounded arm exactly.
+                                _k_ctl = min(
+                                    _k_ctl * 2.0, float(self.expand_k_max),
+                                )
                             elif _fill_ema >= _SPEC_FILL_HOLD:
-                                _k_ctl = min(_k_ctl + 1.0, float(self.expand_k_max))
+                                _k_ctl = min(
+                                    _k_ctl + 1.0, float(self.expand_k_max),
+                                )
                             else:
-                                # Exhausted at this depth. Hold until the
-                                # search advances and refills the frontier.
+                                # Halve and remember. I argued against a
+                                # multiplicative decrease on the grounds that a
+                                # low fill rate is frontier exhaustion rather
+                                # than congestion, so backing off cannot refill
+                                # the frontier. True, and beside the point:
+                                # STAYING at a K the frontier cannot fill costs
+                                # peek time and wasted speculation every round.
+                                # Job 1025957 froze 55 times and re-armed on
+                                # every best_dist improvement, doubling up from
+                                # an already-too-high value each time.
+                                _k_ssthresh = max(2.0, _k_ctl / 2.0)
+                                _k_ctl = _k_ssthresh
                                 _k_probe_allowed = False
                                 record_spec_metric('k_ctl_exhausted')
 
