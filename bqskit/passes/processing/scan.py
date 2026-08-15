@@ -97,6 +97,22 @@ _SCAN_OCCUPANCY_STALE_AFTER = 1.0
 # fastest arm measured. The cap is where the curve was still improving.
 _SCAN_LOOKAHEAD_CAP = int(os.environ.get('BQSKIT_SCAN_LOOKAHEAD_CAP', '32'))
 
+# Consume the window in index order AS ANSWERS ARRIVE instead of awaiting the
+# whole map. The consumption loop already stops at the first accepted removal,
+# so awaiting every result made a block wait on the slowest of K when it only
+# ever needed the first ~1/p of them, where p is the acceptance rate.
+#
+# That barrier is the entire reason K needed a cap. A cap is a constant fitted
+# to one circuit's acceptance rate; without the barrier an unconsumed
+# speculation costs only the cores it happened to occupy, which the runtime's
+# service classes already ration in favour of critical work.
+#
+# Measured on job 1025050 (square_heisenberg_N16, msz=4): the window advances
+# 11.81 candidates per round against a mean K of 64.7, and 69.3% of everything
+# dispatched was thrown away. On the block that owned the phase (142 ops,
+# 174-245 s) the advance was 3.84, so it waited on 64 answers to use 4.
+_SCAN_DRAIN = os.environ.get('BQSKIT_SCAN_DRAIN', '1') != '0'
+
 
 def _scan_free_cores() -> int | None:
     """Free CORES on this node right now, or None when unknown.
@@ -386,6 +402,11 @@ class ScanningGateRemovalPass(BasePass):
             _probe['window_from_fixed'] = 0
             _probe['free_cores_seen_sum'] = 0
             _probe['window_size_sum'] = 0
+            _probe['windows_cancelled'] = 0
+            _probe['tasks_cancelled'] = 0
+            _probe['accept_index_sum'] = 0
+            _probe['windows_with_accept'] = 0
+            _probe['window_latency_sum'] = 0.0
             next_candidate = 0
             while next_candidate < len(candidates):
                 window_start = next_candidate
@@ -425,8 +446,9 @@ class ScanningGateRemovalPass(BasePass):
                 shifted_cycles = [cycle - idx_shift for cycle, _ in window]
                 qudits = [op.location[0] for _, op in window]
 
-                _t_window = time.perf_counter() if _probe_on else 0.0
-                working_copies: list[Circuit] = await get_runtime().map(
+                _t_window = time.perf_counter()
+                _t_prev = _t_window
+                _future = get_runtime().map(
                     _try_removal,
                     [circuit_copy] * len(window),
                     [target] * len(window),
@@ -437,13 +459,26 @@ class ScanningGateRemovalPass(BasePass):
                     ] * len(window),
                     **instantiate_options,
                 )
+                # Index order of CONSUMPTION is what the output depends on, and
+                # it is unchanged below. Only the waiting differs: _SCAN_DRAIN
+                # pulls answers as they land, the old path blocks until all K
+                # are in.
+                _arrived: dict[int, Circuit] = {}
+                _outstanding = len(window)
+                if not _SCAN_DRAIN:
+                    _arrived = dict(enumerate(await _future))
+                    _outstanding = 0
                 _window_elapsed = (
                     time.perf_counter() - _t_window if _probe_on else 0.0
                 )
 
-                for index, ((cycle, op), working_copy) in enumerate(
-                    zip(window, working_copies),
-                ):
+                for index in range(len(window)):
+                    cycle, op = window[index]
+                    while index not in _arrived and _outstanding > 0:
+                        for _i, _r in await get_runtime().next(_future):
+                            _arrived[_i] = _r
+                            _outstanding -= 1
+                    working_copy = _arrived.pop(index)
                     _logger.debug(
                         f'Attempting removal of operation at cycle {cycle}.',
                     )
@@ -457,12 +492,18 @@ class ScanningGateRemovalPass(BasePass):
                     if _probe_on:
                         _arity = 'multi' if op.num_qudits >= 2 else '1q'
                         _probe[f'attempts_{_arity}'] += 1
-                        # Runtime.map exposes one elapsed time for the whole
-                        # window, not one worker time per candidate. Splitting
-                        # it preserves the pass-wall total while the two
-                        # speculation counters record which candidate work
-                        # was actually published and which was thrown away.
-                        _inst_elapsed = _window_elapsed / len(window)
+                        # Draining gives a real per-candidate figure: the
+                        # marginal wait since the previous candidate was
+                        # consumed. It sums to the window latency instead of
+                        # assuming a uniform split, which is what the old path
+                        # had to do -- Runtime.map exposes one elapsed time for
+                        # the whole window, not one worker time per candidate.
+                        if _SCAN_DRAIN:
+                            _t_now = time.perf_counter()
+                            _inst_elapsed = _t_now - _t_prev
+                            _t_prev = _t_now
+                        else:
+                            _inst_elapsed = _window_elapsed / len(window)
                         _probe[f'inst_seconds_{_arity}'] += _inst_elapsed
                         if _removed:
                             _probe[f'removed_{_arity}'] += 1
@@ -510,12 +551,26 @@ class ScanningGateRemovalPass(BasePass):
                         # BQSKIT_SCAN_LOOKAHEAD=0, which is the one property
                         # this whole change exists to preserve.
                         next_candidate = window_start + index + 1
+                        _probe['accept_index_sum'] += index
+                        _probe['windows_with_accept'] += 1
                         # All remaining answers were instantiated from the
                         # old circuit. A removal shrinks the reachable set, so
                         # even disjoint-looking gates cannot be safely reused:
                         # two individually removable RZ gates can fail when
                         # removed together. Start the next window afresh.
                         break
+
+                # Whatever is still in flight belongs to a window that has
+                # already been decided. Cancelling returns those cores now
+                # rather than at the end of the phase, and it is the half of
+                # the barrier fix that the runtime, not the pass, pays for.
+                if _outstanding > 0:
+                    get_runtime().cancel(_future)
+                    _probe['windows_cancelled'] += 1
+                    _probe['tasks_cancelled'] += _outstanding
+                _probe['window_latency_sum'] += (
+                    time.perf_counter() - _t_window
+                )
 
             if _probe_on:
                 _probe['pass_seconds'] = round(
