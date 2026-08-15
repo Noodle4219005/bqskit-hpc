@@ -97,13 +97,23 @@ _SCAN_OCCUPANCY_STALE_AFTER = 1.0
 #
 # 32 rather than 8 because dispatch still overlaps the waste -- k32 was the
 # fastest arm measured. The cap is where the curve was still improving.
-# A fuse, not a policy. Job 1026188 measured that with the barrier gone the cap
-# is inert: drain at cap 32 gave wall 362.6 s / scan 793 s / worst block
-# 129.5 s, and drain uncapped gave 355.4 s / 802 s / 139.9 s -- a 2.0% wall
-# difference against this circuit's 4.3% noise floor, for 17% more dispatch.
-# Over-sizing the window is nearly free once nobody waits on it, so the value
-# is set high enough that the measured free-core count is what binds.
-_SCAN_LOOKAHEAD_CAP = int(os.environ.get('BQSKIT_SCAN_LOOKAHEAD_CAP', '4096'))
+# 32, reverted from 4096 on 2026-08-16.
+#
+# The cap was demoted to a fuse because with the barrier gone it looked inert:
+# job 1026188 gave wall 362.6 s capped against 355.4 s uncapped, 2.0% against
+# a 4.3% noise floor. That judged it on WALL. On the deletion phase's
+# core-seconds the same job says the opposite:
+#
+#   arm         deletion wall   core-seconds   dispatched   discarded
+#   map32            297.4 s          9,665        8,790       59.5%
+#   drain32          223.1 s          9,107        8,305       57.2%
+#   drainfree        214.3 s         10,550        9,745       63.5%
+#
+# Uncapping buys 4.1% of wall for 15.8% more computation, because the useful
+# window is 1/p = 4.7 candidates and everything past it is dispatched only to
+# be discarded. A cap is inert only against an objective that does not count
+# the work.
+_SCAN_LOOKAHEAD_CAP = int(os.environ.get('BQSKIT_SCAN_LOOKAHEAD_CAP', '32'))
 
 # Consume the window in index order AS ANSWERS ARRIVE instead of awaiting the
 # whole map. The consumption loop already stops at the first accepted removal,
