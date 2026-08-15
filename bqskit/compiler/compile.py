@@ -66,6 +66,7 @@ from bqskit.passes.measure import RestoreMeasurements
 from bqskit.passes.noop import NOOPPass
 from bqskit.passes.partitioning.quick import QuickPartitioner
 from bqskit.passes.partitioning.single import GroupSingleQuditGatePass
+from bqskit.passes.processing.nativefuse import NativePhaseFusionPass
 from bqskit.passes.processing.scan import ScanningGateRemovalPass
 from bqskit.passes.retarget.auto import AutoRebase2QuditGatePass
 from bqskit.passes.retarget.general import GeneralSQDecomposition
@@ -1411,6 +1412,27 @@ def build_gate_deletion_optimization_workflow(
 ) -> Workflow:
     """Build standard workflow for circuit gate deletion optimization."""
     workflow: list[BasePass] = [LogPass('Attempting to delete gates.')]
+
+    # Algebraic pre-deletion, before anything numerical touches the circuit.
+    #
+    # ZXZXZDecomposition expands every single-qudit run into RZ-SX-RZ-SX-RZ
+    # unconditionally, and gate deletion then runs AFTER that expansion, so it
+    # pays a full re-instantiation per candidate to rediscover phase-gauge
+    # redundancy that RZ/CZ commutation settles by inspection. Measured on the
+    # block that owns the deletion phase of square_heisenberg_N16 (129.5 s of
+    # 176 s): 34 accepted removals, every one of them an RZ, none an SX.
+    #
+    # This matters for WALL and not only for gate count, because the deletion
+    # wall is (accepted removals + 1) x window latency -- W - A was 0, 1 or 2
+    # on every large block measured -- so each removal the algebra takes is one
+    # fewer serial baseline change.
+    #
+    # Whole circuit rather than per block: RZ commutes through CZ regardless of
+    # partition boundaries, so this also catches gauge that spans two blocks,
+    # which no per-block canonicalisation can. It is O(n) either way. Inside
+    # the iterated core, because each round's scan creates new adjacencies.
+    if os.environ.get('BQSKIT_ALGEBRAIC_PREDELETE', '1') != '0':
+        workflow.append(NativePhaseFusionPass())
 
     # MEASURED AND REFUTED 2026-08-11. Kept, off by default, because the
     # proposal is an obvious one and someone will make it again.
