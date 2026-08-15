@@ -78,6 +78,14 @@ class Frontier:
         )
         heapq.heappush(self._frontier, elem)
 
+    def peek_value(self) -> float | None:
+        """The smallest key currently queued, or None when empty.
+
+        O(1): heapq keeps the minimum at index 0. Exposed so a caller can ask
+        whether the next pop is already decided without popping it.
+        """
+        return self._frontier[0].cost if self._frontier else None
+
     def pop(self) -> tuple[Circuit, Any]:
         """Pop the top circuit."""
         elem = heapq.heappop(self._frontier)

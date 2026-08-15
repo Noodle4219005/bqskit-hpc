@@ -535,6 +535,12 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             # cannot proceed without. Wall clock alone cannot separate "the
             # search got faster" from "the search waited less"; this can.
             'critical_stall_s': 0.0,
+            # Early-pop feasibility. Declared rather than left to
+            # self-registration so they do not land in undeclared_metrics,
+            # which is where a TYPO is supposed to show up.
+            'earlypop_rounds': 0,
+            'earlypop_provable': 0,
+            'earlypop_slack_sum': 0.0,
             # Work split. Dispatched tasks are also the communication volume:
             # every task ships a Circuit to a worker and receives one back, so
             # these counts are message counts, and the op sums are a payload
@@ -1989,6 +1995,49 @@ class LEAPSynthesisPass(SynthesisPass):
                     frontier.topk_costs(1)[0] if _LTRACE_DIR else 0.0
                 )
                 top_circuit, top_layer = frontier.pop()
+
+                # ==================== EARLY-POP FEASIBILITY PROBE =========
+                # Measurement only -- nothing below reads this.
+                #
+                # The A* key is 10*HS_distance + n2q (astar.py:72-79, factors
+                # 10.0 and 1.0 by default, and leap.py:714 takes the default).
+                # HS distance is >= 0 and SimpleLayerGenerator.gen_successors
+                # appends exactly one two_qudit_gate per edge, so EVERY
+                # successor of this node has n2q exactly one greater. That
+                # gives an admissible lower bound on the key of a successor
+                # that has not come back yet:
+                #
+                #     LB = n2q(popped) + 1
+                #
+                # So the next pop can be proved safe -- exactly, no
+                # approximation -- while this round's successors are still in
+                # flight, whenever the frontier's current minimum is at or
+                # below LB. That would let the next round dispatch before this
+                # one's batch lands, which is the only exact way found to
+                # attack the A* barrier: critical stall is 0.730 s per round
+                # over 21,937 rounds on adder_8 (job 1026254).
+                #
+                # The scan-style alternative -- consume in index order, exit on
+                # the first success, cancel the rest -- is also exact but
+                # measured worthless here: only 0.6% of rounds end in a
+                # success, against 21% acceptance in the deletion scan, and
+                # n_after_win totals 140 successors out of 84,078 critical
+                # tasks (0.17%).
+                #
+                # What is NOT known is how often the bound actually fires, and
+                # that is what this counts. No behaviour change either way.
+                if aggregate_enabled:
+                    _pk = frontier.peek_value()
+                    if _pk is not None:
+                        _n2q = sum(
+                            top_circuit.count(g) for g in top_circuit.gate_set
+                            if g.num_qudits > 1
+                        )
+                        record_spec_metric('earlypop_rounds')
+                        if _pk <= float(_n2q) + 1.0:
+                            record_spec_metric('earlypop_provable')
+                        record_spec_metric('earlypop_slack_sum', _pk - _n2q)
+                # ==========================================================
                 if _LTRACE_DIR:
                     _logical_trace({
                         'event': 'pop',
