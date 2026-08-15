@@ -16,6 +16,8 @@ from bqskit.qis.unitary.unitarymatrix import UnitaryMatrix
 from bqskit.ir.opt.cost.functions import HilbertSchmidtResidualsGenerator
 from bqskit.ir.opt.cost.generator import CostFunctionGenerator
 from bqskit.runtime import get_runtime
+from bqskit.runtime.task import PRIORITY_CRITICAL
+from bqskit.runtime.task import PRIORITY_SPECULATIVE
 from bqskit.utils.typing import is_real_number
 _logger = logging.getLogger(__name__)
 
@@ -454,25 +456,60 @@ class ScanningGateRemovalPass(BasePass):
 
                 _t_window = time.perf_counter()
                 _t_prev = _t_window
-                _future = get_runtime().map(
+                # Head and tail go out at DIFFERENT service classes.
+                #
+                # Candidate 0 is the only one certain to be consumed: candidate
+                # i is read iff no j < i was accepted, so P(read i) = (1-p)^i
+                # and the measured 1/p here is 4.7. Everything after the head
+                # is a bet.
+                #
+                # This pass never set task_priority at all, so Runtime.map's
+                # default put the whole window -- up to the cap, and the cap is
+                # now a fuse -- into PRIORITY_CRITICAL, the same service class
+                # as every other block's head. With 16 blocks scanning at once
+                # that is a head-of-line inversion: block A's candidate 0 queues
+                # behind block B's candidate 30, which B will almost certainly
+                # throw away. LEAP has passed task_priority through since
+                # speculation was added; the scan was the one caller that did
+                # not.
+                #
+                # Two maps rather than one because task_priority applies to a
+                # whole batch. Both are dispatched before either is awaited, so
+                # this costs no extra round trip.
+                _fut_head = get_runtime().map(
                     _try_removal,
-                    [circuit_copy] * len(window),
-                    [target] * len(window),
-                    shifted_cycles,
-                    qudits,
-                    cost_hints=[
-                        float(4 ** circuit_copy.num_qudits)
-                    ] * len(window),
+                    [circuit_copy], [target],
+                    shifted_cycles[:1], qudits[:1],
+                    task_priority=PRIORITY_CRITICAL,
+                    cost_hints=[float(4 ** circuit_copy.num_qudits)],
                     **instantiate_options,
                 )
+                _n_tail = len(window) - 1
+                _fut_tail = get_runtime().map(
+                    _try_removal,
+                    [circuit_copy] * _n_tail,
+                    [target] * _n_tail,
+                    shifted_cycles[1:],
+                    qudits[1:],
+                    task_priority=PRIORITY_SPECULATIVE,
+                    cost_hints=[
+                        float(4 ** circuit_copy.num_qudits)
+                    ] * _n_tail,
+                    **instantiate_options,
+                ) if _n_tail > 0 else None
                 # Index order of CONSUMPTION is what the output depends on, and
                 # it is unchanged below. Only the waiting differs: _SCAN_DRAIN
                 # pulls answers as they land, the old path blocks until all K
                 # are in.
                 _arrived: dict[int, Circuit] = {}
+                _tail_out = _n_tail
                 _outstanding = len(window)
                 if not _SCAN_DRAIN:
-                    _arrived = dict(enumerate(await _future))
+                    _arrived = {0: (await _fut_head)[0]}
+                    if _fut_tail is not None:
+                        for _i, _r in enumerate(await _fut_tail):
+                            _arrived[_i + 1] = _r
+                    _tail_out = 0
                     _outstanding = 0
                 _window_elapsed = (
                     time.perf_counter() - _t_window if _probe_on else 0.0
@@ -480,10 +517,21 @@ class ScanningGateRemovalPass(BasePass):
 
                 for index in range(len(window)):
                     cycle, op = window[index]
-                    while index not in _arrived and _outstanding > 0:
-                        for _i, _r in await get_runtime().next(_future):
-                            _arrived[_i] = _r
-                            _outstanding -= 1
+                    # Pull from whichever future still owes this index. The
+                    # head map holds index 0 and nothing else, so there is no
+                    # ambiguity and no wait-any needed.
+                    while index not in _arrived:
+                        if index == 0:
+                            for _i, _r in await get_runtime().next(_fut_head):
+                                _arrived[0] = _r
+                                _outstanding -= 1
+                        elif _tail_out > 0:
+                            for _i, _r in await get_runtime().next(_fut_tail):
+                                _arrived[_i + 1] = _r
+                                _tail_out -= 1
+                                _outstanding -= 1
+                        else:
+                            break
                     working_copy = _arrived.pop(index)
                     _logger.debug(
                         f'Attempting removal of operation at cycle {cycle}.',
@@ -570,8 +618,8 @@ class ScanningGateRemovalPass(BasePass):
                 # already been decided. Cancelling returns those cores now
                 # rather than at the end of the phase, and it is the half of
                 # the barrier fix that the runtime, not the pass, pays for.
-                if _outstanding > 0:
-                    get_runtime().cancel(_future)
+                if _tail_out > 0 and _fut_tail is not None:
+                    get_runtime().cancel(_fut_tail)
                     _probe['windows_cancelled'] += 1
                     _probe['tasks_cancelled'] += _outstanding
                 _probe['window_latency_sum'] += (

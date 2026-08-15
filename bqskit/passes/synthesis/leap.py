@@ -1924,14 +1924,29 @@ class LEAPSynthesisPass(SynthesisPass):
                                 # range with the cap the only thing holding it.
                                 _overshoot = max(1.0, _overshoot / _step)
                                 record_spec_metric('overshoot_lowered')
-                            else:
-                                # First time in band ends the warmup. From here
-                                # the estimate is taken over 96 rounds and the
-                                # step is 25%, so a reversal means the operating
-                                # point moved rather than that the sample was
-                                # short.
+                            elif _os_rounds >= _SPEC_OS_TRIM_WINDOW:
+                                # In band, and measured over a window long
+                                # enough to mean it. Latching on a SHORT window
+                                # was the v2 defect: at a 16-round window the
+                                # reading has sd 0.12, so overshoot 2 lands
+                                # inside [0.25, 0.60] by chance, latches, and
+                                # then only ever moves by 25% per 96 rounds.
+                                # Job 1026229 converged to 2.49 with a bind
+                                # fraction of 17.0% -- below the band it was
+                                # supposedly holding inside.
                                 _os_in_band = True
                                 record_spec_metric('overshoot_held')
+                            else:
+                                # In band on a short window: promote to the long
+                                # window and re-measure rather than latch. No
+                                # new constant -- it is the same 2 sd rule that
+                                # set the trim window in the first place.
+                                # No `continue` here: this block sits inside
+                                # the A* round body, so skipping the rest of it
+                                # would skip the search itself. The counter
+                                # reset below is reached on the normal path.
+                                _os_in_band = True
+                                record_spec_metric('overshoot_promoted')
                             _os_rounds = 0
                             _os_bound = 0
                     _k_from_share = 1 + int((share - s) // s)
