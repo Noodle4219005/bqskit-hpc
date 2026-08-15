@@ -229,6 +229,14 @@ class ServerBase:
         #   blocked, believed idle == 0   -> the credit is spent or stale
         #   blocked, believed idle  > 0   -> eligibility rejected every target
         #   never blocked                 -> supply, and no placement fix helps
+        # The worker -> boss hop. handle_waiting discounts a report by the
+        # tasks sent since the reporter's read receipt, so a worker that says
+        # "I am idle" can be recorded as busy. That is correct when a task is
+        # genuinely in flight to it and wrong if the discount outlives the
+        # flight, and only counting tells those apart.
+        self._waiting_msgs = 0
+        self._waiting_zeroed = 0
+        self._waiting_unaccounted_sum = 0
         self._pool_blocked = 0
         self._pool_blocked_depth_sum = 0
         self._pool_blocked_idle_sum = 0
@@ -788,7 +796,8 @@ class ServerBase:
             _logger.info(
                 'pool: %d drains, depth mean %.2f max %d, '
                 'owner %d/%d (%.1f%%), blocked %d (%.1f%%) '
-                'at depth %.1f believing %.2f idle',
+                'at depth %.1f believing %.2f idle; '
+                'waiting %d msgs, %d zeroed (%.1f%%), unaccounted mean %.2f',
                 self._pool_drains,
                 self._pool_depth_sum / self._pool_drains,
                 self._pool_depth_max,
@@ -800,6 +809,10 @@ class ServerBase:
                 100.0 * self._pool_blocked / self._pool_drains,
                 self._pool_blocked_depth_sum / max(1, self._pool_blocked),
                 self._pool_blocked_idle_sum / max(1, self._pool_blocked),
+                self._waiting_msgs,
+                self._waiting_zeroed,
+                100.0 * self._waiting_zeroed / max(1, self._waiting_msgs),
+                self._waiting_unaccounted_sum / max(1, self._waiting_msgs),
             )
         batches: dict[int, tuple[RuntimeEmployee, list[RuntimeTask]]] = {}
         progress = True
@@ -938,6 +951,10 @@ class ServerBase:
         employee = self.conn_to_employee_dict[conn]
         unaccounted_task = employee.get_num_of_tasks_sent_since(read_receipt)
         adjusted_idle_count = max(new_idle_count - unaccounted_task, 0)
+        self._waiting_msgs += 1
+        self._waiting_unaccounted_sum += unaccounted_task
+        if new_idle_count > 0 and adjusted_idle_count == 0:
+            self._waiting_zeroed += 1
 
         old_count = employee.num_idle_workers
         employee.num_idle_workers = adjusted_idle_count
