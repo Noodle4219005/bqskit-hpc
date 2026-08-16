@@ -131,6 +131,13 @@ class JointPhaseFrameRetargetPass(BasePass):
 
             stats['runs'] += 1
             u = ru @ _rz(f)          # the frame applies first
+            # Both sides charge the frame, because a carried frame is a gate
+            # that must still be emitted somewhere -- it is deferred, not free.
+            # Charging only the incoming one made the guard too permissive: a
+            # four-gate run with no incoming frame passed as "4 emitted <= 4
+            # consumed" while also carrying a fifth out, so the circuit grew by
+            # one per run. The saving from carrying appears on the NEXT run,
+            # whose n_old then includes the frame it absorbs.
             n_old = len(ops) + (1 if abs(f) > _TOL else 0)
 
             def put_back() -> None:
@@ -159,7 +166,7 @@ class JointPhaseFrameRetargetPass(BasePass):
                 # u == RZ(gamma) X. X RZ(a) == RZ(-a) X lets the leading
                 # rotation cross to the far side and join the trailing one.
                 gamma = _wrap(cmath.phase(u[1, 0]) - cmath.phase(u[0, 1]))
-                n_new = 1 + (0 if keep_frame else int(abs(gamma) > _TOL))
+                n_new = 1 + int(abs(gamma) > _TOL)
                 if n_new > n_old:
                     put_back()
                     return
@@ -175,9 +182,10 @@ class JointPhaseFrameRetargetPass(BasePass):
                 return
 
             lam, theta, phi = _zxzxz_angles(u)
-            n_new = 2 + int(abs(lam) > _TOL) + int(abs(theta) > _TOL)
-            if not keep_frame:
-                n_new += int(abs(phi) > _TOL)
+            n_new = (
+                2 + int(abs(lam) > _TOL) + int(abs(theta) > _TOL)
+                + int(abs(phi) > _TOL)
+            )
             if n_new > n_old:
                 put_back()
                 return
