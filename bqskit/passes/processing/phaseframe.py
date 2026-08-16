@@ -20,54 +20,28 @@ from bqskit.ir.gates.parameterized.rz import RZGate
 _logger = logging.getLogger(__name__)
 
 # ==================== HPC: joint phase-frame retargeting ===========================
-# The whole of this module. ZXZXZDecomposition decomposes each single-qudit run
-# independently and emits RZ-SX-RZ-SX-RZ unconditionally; both halves lose
-# gates that exact algebra can see.
-#
-# Independence. Two locally-minimal decompositions meeting across a CZ still
-# carry one redundant rotation, because CZ is diagonal and so commutes with RZ
-# on either incident wire:
-#
-#     [... RZ(c)] CZ_qr [RZ(a) ...]  ==  ... CZ_qr RZ(c + a) ...
-#
-# Unconditionality. The middle angle is the coordinate on the quotient
-# SU(2)/(U(1) x U(1)) and is degenerate in two places:
-#
-#     run is diagonal      -> zero gates needed, the run is a Z rotation
-#     run is anti-diagonal -> one gate needed, RZ(gamma) X
-#
-# A phase frame alone cannot reach the second point: folding a pending RZ into
-# a run leaves the middle angle unchanged, because that angle is invariant
-# under Z rotations on either side. Removing an SX therefore requires
-# re-deriving the run's unitary, which is why this pass does that rather than
-# merging already-emitted gates.
+# The whole of this module.
 _TWO_PI = 2.0 * math.pi
-
 # Strict on purpose: this pass does exact algebra, so it must never be the
-# reason a block drifts toward the success threshold. Anything looser is left
-# for the numerical scan to judge.
+# reason a block drifts toward the 1e-8 acceptance threshold. Anything between
+# this and 1e-8 is left for the numerical scan to judge.
 _TOL = float(os.environ.get('BQSKIT_FRAME_TOL', '1e-12'))
 
 
 def _wrap(a: float) -> float:
-    """Return `a` in (-pi, pi]."""
+    """Into (-pi, pi]."""
     return (a + math.pi) % _TWO_PI - math.pi
 
 
 def _rz(theta: float) -> np.ndarray:
-    """Return RZ(theta) as a 2x2 matrix, matching RZGate."""
+    """RZ(theta) as a 2x2, matching RZGate."""
     return np.diag(
         [np.exp(-0.5j * theta), np.exp(0.5j * theta)],
     ).astype(complex)
 
 
 def _zxzxz_angles(u: np.ndarray) -> tuple[float, float, float]:
-    """Return (lam, theta, phi) with u == RZ(phi) SX RZ(theta) SX RZ(lam).
-
-    The same formula as ZXZXZDecomposition, on a 2x2 rather than a Circuit,
-    because this pass needs it per run with the incoming frame already folded
-    in and that pass requires a single-qudit Circuit.
-    """
+    """(lam, theta, phi) with u == RZ(phi) SX RZ(theta) SX RZ(lam)."""
     u = np.linalg.det(u) ** (-0.5) * u
     i1 = cmath.phase(u[1, 1])
     i2 = cmath.phase(u[1, 0])
@@ -80,61 +54,126 @@ def _zxzxz_angles(u: np.ndarray) -> tuple[float, float, float]:
 class JointPhaseFrameRetargetPass(BasePass):
     """Re-emit every single-qudit run around the fixed diagonal skeleton.
 
-    Carries an unmaterialised Z phase along each wire, so the trailing rotation
-    of one run merges with the leading rotation of the next across any number
-    of intervening CZ gates, and re-derives each run's unitary so the two
-    degenerate cases cost fewer than five gates.
+    ZXZXZDecomposition decomposes each run independently and emits
+    RZ-SX-RZ-SX-RZ unconditionally. Both halves lose gates exact algebra sees.
 
-    This is not bit-identical to running without it. The circuit reaching a
-    later numerical pass is different, so that pass's seeded random starts
-    differ and it may accept a different set of the remaining gates. The
-    unitary is preserved exactly; the specific surviving gates are not.
+    INDEPENDENCE. Two locally-minimal decompositions meeting across a CZ still
+    carry one redundant rotation, because CZ is diagonal and so commutes with
+    RZ on either incident wire:
+
+        [... RZ(c)] CZ_qr [RZ(a) ...]  ==  ... CZ_qr RZ(c + a) ...
+
+    So a run's trailing rotation is never emitted; it is carried as an
+    unmaterialised frame until a non-diagonal gate seals it.
+
+    UNCONDITIONALITY. The middle angle is the coordinate on the quotient
+    SU(2)/(U(1) x U(1)) and is degenerate in two places:
+
+        run is diagonal      -> zero gates, the run IS a Z rotation
+        run is anti-diagonal -> one gate, RZ(gamma) X
+
+    A frame alone cannot reach the second: folding a pending RZ into a run
+    leaves the middle angle unchanged, since it is invariant under Z rotations
+    on either side. Removing an SX therefore needs the run's unitary
+    re-derived, which is why this pass does that rather than merging
+    already-emitted gates.
+
+    NEVER GROWS. A re-decomposition longer than what it replaces is rejected
+    and the original operations are put back. Without that guard a lone SX --
+    one gate -- comes back as RZ-SX-RZ-SX plus a frame, the pass grows the
+    circuit, and the enclosing ChangePredicate loop never converges.
+
+    NOT BIT-IDENTICAL to running without it: the circuit reaching a later
+    numerical pass differs, so that pass's seeded random starts differ and it
+    may accept a different set of the remaining gates. The unitary is preserved
+    exactly; the specific surviving gates are not.
     """
 
     async def run(self, circuit: Circuit, data: PassData) -> None:
         """Perform the pass's operation, see :class:`BasePass` for more."""
+
         out = Circuit(circuit.num_qudits, circuit.radixes)
-        # pend[q] is the unitary owed on wire q and not yet emitted: a general
-        # SU(2) inside a run, collapsing to a pure Z rotation -- the frame --
-        # whenever a non-diagonal boundary forces a flush.
-        pend: dict[int, np.ndarray] = {}
+        # These three are kept SEPARATE on purpose. An earlier version folded
+        # the frame into the run's unitary and kept only a flag saying a frame
+        # had existed; when a re-decomposition was then rejected and the
+        # original operations put back, the frame's angle was unrecoverable and
+        # silently dropped, which changed the unitary.
+        frame: dict[int, float] = {}                    # owed Z angle
+        run_u: dict[int, np.ndarray] = {}               # run's own unitary
+        run_ops: dict[int, list[tuple[Any, ...]]] = {}  # its original ops
+
+        def n_sx(ops: list[tuple[Any, ...]]) -> int:
+            return sum(1 for g, _, _ in ops if isinstance(g, SqrtXGate))
 
         def seal(q: int, keep_frame: bool) -> None:
-            """Emit wire q's pending unitary.
+            """Emit wire q's pending frame and run."""
+            f = frame.pop(q, 0.0)
+            ru = run_u.pop(q, None)
+            ops = run_ops.pop(q, [])
 
-            keep_frame stops at the trailing Z rotation and leaves it pending.
-            That is the mechanism: a CZ cannot see a Z rotation, so carrying it
-            past one costs nothing and it merges with the next run.
-            """
-            u = pend.pop(q, None)
-            if u is None:
-                return
-
-            if abs(u[1, 0]) <= _TOL and abs(u[0, 1]) <= _TOL:
-                # Diagonal: the run is a Z rotation, so no gate is needed.
-                theta = _wrap(cmath.phase(u[1, 1]) - cmath.phase(u[0, 0]))
-                if abs(theta) <= _TOL:
+            if ru is None:
+                if abs(f) <= _TOL:
                     return
                 if keep_frame:
-                    pend[q] = _rz(theta)
+                    frame[q] = f
                     return
-                out.append_gate(RZGate(), (q,), [theta])
+                out.append_gate(RZGate(), (q,), [f])
+                return
+
+            u = ru @ _rz(f)          # the frame applies first
+            # Both sides charge the frame, because a carried frame is a gate
+            # that must still be emitted somewhere -- it is deferred, not free.
+            # Charging only the incoming one made the guard too permissive: a
+            # four-gate run with no incoming frame passed as "4 emitted <= 4
+            # consumed" while also carrying a fifth out, so the circuit grew by
+            # one per run. The saving from carrying appears on the NEXT run,
+            # whose n_old then includes the frame it absorbs.
+            n_old = len(ops) + (1 if abs(f) > _TOL else 0)
+
+            def put_back() -> None:
+                if abs(f) > _TOL:
+                    out.append_gate(RZGate(), (q,), [f])
+                for g, loc_, params_ in ops:
+                    if params_:
+                        out.append_gate(g, loc_, params_)
+                    else:
+                        out.append_gate(g, loc_)
+
+            if abs(u[1, 0]) <= _TOL and abs(u[0, 1]) <= _TOL:
+                theta = _wrap(cmath.phase(u[1, 1]) - cmath.phase(u[0, 0]))
+                if keep_frame:
+                    if abs(theta) > _TOL:
+                        frame[q] = theta
+                    return
+                if abs(theta) > _TOL:
+                    out.append_gate(RZGate(), (q,), [theta])
                 return
 
             if abs(u[0, 0]) <= _TOL and abs(u[1, 1]) <= _TOL:
-                # Anti-diagonal: u == RZ(gamma) X. X RZ(a) == RZ(-a) X is what
-                # lets the leading rotation cross to the far side and join the
-                # trailing one, leaving a single X.
+                # u == RZ(gamma) X. X RZ(a) == RZ(-a) X lets the leading
+                # rotation cross to the far side and join the trailing one.
                 gamma = _wrap(cmath.phase(u[1, 0]) - cmath.phase(u[0, 1]))
+                n_new = 1 + int(abs(gamma) > _TOL)
+                if n_new > n_old:
+                    put_back()
+                    return
                 out.append_gate(XGate(), (q,))
                 if keep_frame:
-                    pend[q] = _rz(gamma)
+                    if abs(gamma) > _TOL:
+                        frame[q] = gamma
                     return
                 if abs(gamma) > _TOL:
                     out.append_gate(RZGate(), (q,), [gamma])
                 return
 
             lam, theta, phi = _zxzxz_angles(u)
+            n_new = (
+                2 + int(abs(lam) > _TOL) + int(abs(theta) > _TOL)
+                + int(abs(phi) > _TOL)
+            )
+            if n_new > n_old:
+                put_back()
+                return
             if abs(lam) > _TOL:
                 out.append_gate(RZGate(), (q,), [lam])
             out.append_gate(SqrtXGate(), (q,))
@@ -142,7 +181,8 @@ class JointPhaseFrameRetargetPass(BasePass):
                 out.append_gate(RZGate(), (q,), [theta])
             out.append_gate(SqrtXGate(), (q,))
             if keep_frame:
-                pend[q] = _rz(phi)
+                if abs(phi) > _TOL:
+                    frame[q] = phi
                 return
             if abs(phi) > _TOL:
                 out.append_gate(RZGate(), (q,), [phi])
@@ -154,8 +194,11 @@ class JointPhaseFrameRetargetPass(BasePass):
             if gate.num_qudits == 1 and gate.radixes == (2,):
                 q = loc[0]
                 u = np.asarray(op.get_unitary().numpy, dtype=complex)
-                prev = pend.get(q)
-                pend[q] = u if prev is None else u @ prev
+                prev = run_u.get(q)
+                run_u[q] = u if prev is None else u @ prev
+                run_ops.setdefault(q, []).append(
+                    (gate, op.location, list(op.params) or None),
+                )
 
             elif isinstance(gate, CZGate):
                 # Diagonal, so a pending Z rotation passes straight through and
@@ -165,23 +208,27 @@ class JointPhaseFrameRetargetPass(BasePass):
                 out.append_gate(gate, op.location)
 
             else:
-                # Anything else is opaque: commit everything and copy it over.
                 for q in loc:
                     seal(q, keep_frame=False)
                 out.append_gate(gate, op.location, op.params)
 
-        for q in list(pend.keys()):
-            u = pend[q]
-            phase = _wrap(cmath.phase(u[1, 1]) - cmath.phase(u[0, 0]))
-            if (
-                abs(u[1, 0]) <= _TOL and abs(u[0, 1]) <= _TOL
-                and abs(phase) <= _TOL
-            ):
-                pend.pop(q)
-                continue
+        for q in set(list(frame.keys()) + list(run_u.keys())):
             seal(q, keep_frame=False)
 
-        circuit.become(out)
+        # STRICT IMPROVEMENT ONLY, or this pass never reaches a fixpoint under
+        # the enclosing ChangePredicate. That predicate hashes repr(op) for
+        # every operation, and repr of a parameterised gate contains its float
+        # parameters. Re-deriving a run's angles reproduces them only to within
+        # a few ulp, so an equal-length rewrite leaves the operation count
+        # identical while changing the hash -- the loop then runs forever on a
+        # circuit that is not actually changing. Measured: 103 rounds with the
+        # gate count pinned at 620 from round 5 onward.
+        #
+        # The cost is that a same-length rewrite is forgone even when its
+        # structure is better. Those are exactly the rewrites that drift, and
+        # they remove no gates.
+        if out.num_operations < circuit.num_operations:
+            circuit.become(out)
         _logger.debug(
             'JointPhaseFrame: %d operations.', circuit.num_operations,
         )
