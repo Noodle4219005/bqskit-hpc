@@ -1431,7 +1431,32 @@ def build_gate_deletion_optimization_workflow(
     # partition boundaries, so this also catches gauge that spans two blocks,
     # which no per-block canonicalisation can. It is O(n) either way. Inside
     # the iterated core, because each round's scan creates new adjacencies.
-    if os.environ.get('BQSKIT_ALGEBRAIC_PREDELETE', '1') != '0':
+    #
+    # OFF BY DEFAULT since 2026-08-16. There are two ways to spend the same
+    # algebraic insight and they are MUTUALLY EXCLUSIVE, not additive: this
+    # pass rewrites the circuit before the scan, which consumes every adjacent
+    # RZ pair, so ScanningGateRemovalPass's `_gauge_partner` marking finds
+    # nothing afterwards (its counters read exactly 0 with this on -- correct
+    # behaviour, and it silently made job 1026705's `stock` control arm a fuse
+    # arm). Measured on square_heisenberg_N16, msz=4, 96 workers, the three
+    # arms of job 1026668 plus the widened marking of 1026729:
+    #
+    #                  2Q  depth   scan s   numerical  free   dispatched
+    #   stock          72    178    792.9         226     0        9,784
+    #   mark (window)  72    178    682.0          90   136        8,410
+    #   fuse           72    172    812.7          89     0        7,423
+    #
+    # So fuse buys 3.4% of depth for 19% more scan seconds AND the loss of the
+    # equivalence argument: rewriting changes every later candidate's parameter
+    # count, hence its seeded random start, so the output can only be claimed
+    # to have the same unitary, never the same decisions. Marking leaves the
+    # parameter-count trajectory alone and is provably decision-identical --
+    # 90 numerical + 136 free = 226 = stock's numerical count, exactly.
+    #
+    # On this circuit the depth is not what decides: Qiskit L3 gets 141 here,
+    # so 172 and 178 both lose, and the 3.4% buys nothing while the proof does.
+    # Set BQSKIT_ALGEBRAIC_PREDELETE=1 to trade the proof back for the depth.
+    if os.environ.get('BQSKIT_ALGEBRAIC_PREDELETE', '0') != '0':
         workflow.append(NativePhaseFusionPass())
 
     # MEASURED AND REFUTED 2026-08-11. Kept, off by default, because the
