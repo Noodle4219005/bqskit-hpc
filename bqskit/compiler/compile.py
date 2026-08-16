@@ -67,6 +67,9 @@ from bqskit.passes.noop import NOOPPass
 from bqskit.passes.partitioning.quick import QuickPartitioner
 from bqskit.passes.partitioning.single import GroupSingleQuditGatePass
 from bqskit.passes.processing.nativefuse import NativePhaseFusionPass
+from bqskit.passes.processing.phaseframe import (
+    JointPhaseFrameRetargetPass,
+)
 from bqskit.passes.processing.scan import ScanningGateRemovalPass
 from bqskit.passes.retarget.auto import AutoRebase2QuditGatePass
 from bqskit.passes.retarget.general import GeneralSQDecomposition
@@ -1458,6 +1461,30 @@ def build_gate_deletion_optimization_workflow(
     # Set BQSKIT_ALGEBRAIC_PREDELETE=1 to trade the proof back for the depth.
     if os.environ.get('BQSKIT_ALGEBRAIC_PREDELETE', '0') != '0':
         workflow.append(NativePhaseFusionPass())
+
+    # Joint phase-frame retargeting: the strictly stronger form of the pass
+    # above. Both carry an unmaterialised Z phase along each wire and merge the
+    # boundary rotations that a CZ cannot see, and on generic runs they produce
+    # IDENTICAL circuits -- verified on random 4- and 6-qubit circuits, 92/92,
+    # 164/164 and 210/210 operations with matching gate histograms.
+    #
+    # The difference is that this one re-derives each run's unitary and
+    # re-decomposes it, so it can also use the two degenerate cases that
+    # ZXZXZDecomposition emits five gates for regardless:
+    #
+    #     run is diagonal      -> 0 gates (the whole run becomes frame)
+    #     run is anti-diagonal -> 1 gate  (X, plus frame)
+    #
+    # Measured on synthetic circuits with 25% and 100% degenerate runs: 116 vs
+    # 156 and 14 vs 96 operations against NativePhaseFusion, and 24 and 30 SX
+    # removed where fusion removes none -- fusion merges the gates it is given
+    # and cannot re-decompose a run.
+    #
+    # Whether real post-LEAP circuits contain degenerate runs AT ALL is the
+    # open question; on generic input this pass measures exactly like the one
+    # above. The runs_diagonal / runs_antidiag / sx_saved counters answer it.
+    if os.environ.get('BQSKIT_PHASE_FRAME', '0') != '0':
+        workflow.append(JointPhaseFrameRetargetPass())
 
     # MEASURED AND REFUTED 2026-08-11. Kept, off by default, because the
     # proposal is an obvious one and someone will make it again.
