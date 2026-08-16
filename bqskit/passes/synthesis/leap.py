@@ -268,7 +268,7 @@ _SPEC_HEADROOM = int(os.environ.get('BQSKIT_SPEC_HEADROOM', '4'))
 # path -- which is the point, and also the risk: see the delayed-task
 # starvation this codebase already hit once when the worker queue became a
 # priority queue.
-_SPEC_OVERSHOOT_TEXT = os.environ.get('BQSKIT_SPEC_OVERSHOOT', 'auto')
+_SPEC_OVERSHOOT_TEXT = os.environ.get('BQSKIT_SPEC_OVERSHOOT', '4.0')
 _SPEC_UNBOUNDED = _SPEC_OVERSHOOT_TEXT.strip().lower() == 'max'
 _SPEC_OVERSHOOT_AUTO = _SPEC_OVERSHOOT_TEXT.strip().lower() == 'auto'
 _SPEC_OVERSHOOT = (
@@ -295,35 +295,54 @@ _SPEC_OVERSHOOT = (
 #      32     37.77   23.9      9.34   451.7 s       +5.0%
 #     max    448.00   17.1        --   647.6 s      +50.6%
 #
-# THE DEFAULT IS 'auto'. It was the fixed 4 until 2026-08-16, justified as the
-# risk-weighted centre of "somewhere in [2, 8]". Two things measured since say
-# that reasoning picked the wrong half of the range:
+# THE DEFAULT IS 4.0. It was moved to 'auto' on 2026-08-16 and moved back the
+# same day, because a paired experiment refuted the reasoning that moved it.
 #
-#   1. The wall saturates at 2, not 8. 2 -> 4 is -0.14% and 4 -> 8 is -2.7%,
-#      both inside the 4.3% noise floor; only 1 -> 2 (-10.4%) is real. So the
-#      whole [2, 8] band is one point as far as wall is concerned.
-#   2. The hit rate falls monotonically across it, 17.4% -> 14.6%, with no
-#      turning point. Going 1 -> 8 dispatches 1,695 more speculative tasks and
-#      buys 71 more timely hits: 23.9 tasks per marginal hit. Above 2 the extra
-#      overshoot is bought with core-seconds and paid for in nothing.
+# The argument for auto was: wall saturates at overshoot 2 (2 -> 4 is -0.14%,
+# 4 -> 8 is -2.7%, both inside the 4.3% noise floor), the speculative HIT RATE
+# falls monotonically 17.4% -> 14.6% with no turning point, and 1 -> 8 costs
+# 1,695 extra dispatches for 71 extra hits -- 23.9 tasks per marginal hit. All
+# of those numbers are correct. The conclusion drawn from them was not.
 #
-# So the cheap end of a flat wall band is the right place to sit, and `auto`
-# lands there on its own: contention_ema measured 2.44-3.07 on both circuits.
+# Job 1026880, 8 paired arms alternating o4_i / auto_i so machine drift cancels
+# in the difference (auto measured 2.77-3.13 across the eight):
 #
-# The deeper reason to prefer it over ANY constant is that the constant is the
-# gain of a feedback loop, not a setting. capacity = measured_idle * overshoot,
-# and measured_idle is itself a function of how much speculation is already
-# outstanding -- it read 48.9 at overshoot 1 and 21.8 at overshoot 8, a 2.2x
-# swing driven by nothing but its own output. That loop has no damping, so a
-# small timing perturbation amplifies: five arms whose LEAP search was
-# byte-identical (8 synths, 1,370 iterations, s = 5.92) spread 128.7 to 153.8 s
-# of LEAP wall, 19%.
+#   LEAP core-seconds   +3.31%   2 sigma [+0.35,  +6.26]   auto WORSE
+#   LEAP phase wall     +9.24%   2 sigma [+4.30, +14.18]   auto WORSE
+#   timely hits        -11.9     2 sigma [-19.8,  -3.9]    auto WORSE
+#   whole-compile wall  +4.54%   2 sigma [+2.04,  +7.05]   auto WORSE
+#   scan phase wall     +1.18%   2 sigma [-1.33,  +3.69]   unresolved, as it
+#                                                          should be: overshoot
+#                                                          cannot reach the scan
 #
-# contention_ema is the one input measured NOT to drift with its own output:
-# across overshoot 1 to 8 -- K 7.85 to 20.48, a 2.6x range -- it moved only
-# 3.07 to 2.62, 15%. Feeding K from it lowers the loop gain instead of setting
-# it by hand. It does not remove the loop, because measured_idle is still the
-# other factor; it stops the gain from being a constant chosen on one circuit.
+# 2Q 72 / depth 178 on all sixteen arms, so this is purely about cost.
+#
+# WHY, and this is the part worth keeping. The speculation counters conserve
+# exactly:
+#
+#   eventual hits   1,302 -> 1,303   (+0.1%)   the same results DO get computed
+#   timely hits     1,176 -> 1,164   (-1.0%)
+#   late               126 ->   138   (+10.1%)  they just arrive too late
+#
+# timely + late is 1,302 on both arms. So a lower overshoot does not speculate
+# on the WRONG nodes -- it speculates on the right ones too LATE. Overshoot is
+# not buying speculation volume, it is buying LEAD TIME: a wider window asks
+# for a result one round earlier, and that round is the difference between a
+# result that is waiting when the search reaches it and one the critical path
+# has to block on. The discarded tasks are the PRICE of the lead time, not the
+# product, which is why "23.9 tasks per marginal hit" is a bargain and not
+# waste -- 12 late hits, 0.9% of all hits, cost 9.24% of the LEAP phase.
+#
+# The corollary is that hit RATE is the wrong statistic to steer on and the
+# absolute timely-hit COUNT is the right one. Rate falls with overshoot while
+# the count rises (1,113 -> 1,184 across the sweep); the count is what removes
+# work from the critical path.
+#
+# 'auto' is kept as an option because contention_ema remains the only input
+# measured not to drift with its own output (2.44-3.07 while K moves 2.6x), so
+# it is the right SIGNAL -- it was simply pointed at the wrong target. Steering
+# it to maximise lead time rather than to track contention is the open
+# question, and it needs a lead-time counter that does not exist yet.
 _SPEC_OS_FUSE = float(os.environ.get('BQSKIT_SPEC_OS_FUSE', '64.0'))
 
 # 'auto' and 'max' both park _SPEC_OVERSHOOT at 1.0 and steer elsewhere, so
