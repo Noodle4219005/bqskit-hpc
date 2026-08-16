@@ -99,6 +99,7 @@ class JointPhaseFrameRetargetPass(BasePass):
             'runs_kept': 0,       # re-decomposition rejected as longer
             'sx_saved': 0,
             'frames_crossed_cz': 0,
+            'no_op': 0,
         }
 
         out = Circuit(circuit.num_qudits, circuit.radixes)
@@ -233,8 +234,24 @@ class JointPhaseFrameRetargetPass(BasePass):
         for q in set(list(frame.keys()) + list(run_u.keys())):
             seal(q, keep_frame=False)
 
-        circuit.become(out)
-        stats['ops_out'] = circuit.num_operations
+        # STRICT IMPROVEMENT ONLY, or this pass never reaches a fixpoint under
+        # the enclosing ChangePredicate. That predicate hashes repr(op) for
+        # every operation, and repr of a parameterised gate contains its float
+        # parameters. Re-deriving a run's angles reproduces them only to within
+        # a few ulp, so an equal-length rewrite leaves the operation count
+        # identical while changing the hash -- the loop then runs forever on a
+        # circuit that is not actually changing. Measured: 103 rounds with the
+        # gate count pinned at 620 from round 5 onward.
+        #
+        # The cost is that a same-length rewrite is forgone even when its
+        # structure is better. Those are exactly the rewrites that drift, and
+        # they remove no gates.
+        stats['ops_out'] = out.num_operations
+        if out.num_operations < circuit.num_operations:
+            circuit.become(out)
+        else:
+            stats['ops_out'] = circuit.num_operations
+            stats['no_op'] = 1
         data['joint_phase_frame'] = stats
         # The question this pass exists to answer -- do real post-LEAP circuits
         # contain degenerate runs at all? -- lives in these counters, and
