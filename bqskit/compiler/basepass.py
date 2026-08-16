@@ -180,7 +180,7 @@ async def _sub_do_work(
     return circuit, data
 
 
-# ==================== HPC: sub-workflow operation =================================
+# ==================== HPC: sub-workflow operation ==================================
 async def _sub_do_work_with_op(
     workflow: Workflow,
     op: Operation,

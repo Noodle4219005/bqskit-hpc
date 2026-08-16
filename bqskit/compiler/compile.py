@@ -66,6 +66,10 @@ from bqskit.passes.measure import RestoreMeasurements
 from bqskit.passes.noop import NOOPPass
 from bqskit.passes.partitioning.quick import QuickPartitioner
 from bqskit.passes.partitioning.single import GroupSingleQuditGatePass
+from bqskit.passes.processing.nativefuse import NativePhaseFusionPass
+from bqskit.passes.processing.phaseframe import (
+    JointPhaseFrameRetargetPass,
+)
 from bqskit.passes.processing.scan import ScanningGateRemovalPass
 from bqskit.passes.retarget.auto import AutoRebase2QuditGatePass
 from bqskit.passes.retarget.general import GeneralSQDecomposition
@@ -1388,7 +1392,21 @@ def build_gate_deletion_optimization_workflow(
     """Build standard workflow for circuit gate deletion optimization."""
     workflow: list[BasePass] = [LogPass('Attempting to delete gates.')]
 
-    # ==================== HPC: pre-scan merge =======================================
+    # ==================== HPC: algebraic pre-deletion ==============================
+    # Fuse exact native identities before numerical deletion. It runs on the
+    # whole circuit because an RZ can commute through CZ across block bounds.
+    if os.environ.get('BQSKIT_ALGEBRAIC_PREDELETE', '0') != '0':
+        workflow.append(NativePhaseFusionPass())
+    # ===============================================================================
+
+    # ==================== HPC: joint phase-frame retargeting =======================
+    # Re-derive single-qudit runs while carrying RZ frames through CZ, so
+    # diagonal and anti-diagonal runs can use their exact shorter forms.
+    if os.environ.get('BQSKIT_PHASE_FRAME', '0') != '0':
+        workflow.append(JointPhaseFrameRetargetPass())
+    # ===============================================================================
+
+    # ==================== HPC: pre-scan merge ======================================
     # Keep replacements only when native re-decomposition shortens the run.
     if os.environ.get('BQSKIT_MERGE_BEFORE_SCAN') == '1':
         workflow += [
@@ -1419,19 +1437,11 @@ def build_gate_deletion_optimization_workflow(
         name='Gate Deletion Optimization',
     )
 
-    # ===================================================================================
+    # ===============================================================================
 
     if iterative:
-        # ChangePredicate stops only when the circuit stops changing AT ALL,
-        # including single-qudit reshuffles. Measured on qv_N060 (job 1022790):
-        # this loop runs 29 times and owns 90.7% of the wall, while total gates
-        # go 58457 -> 48083 -- and a prior measurement (job 1019430) found the
-        # scan succeeds on 2 of 4612 multi-qudit removal attempts, 0.04%. So
-        # nearly all of that wall buys single-qudit gates.
-        #
-        # GateCountPredicate('multi') is what the resynthesis loop already
-        # uses, and it stops as soon as the multi-qudit count stops falling --
-        # which is the quantity this project is judged on.
+        # Stop by multi-qudit count when requested; otherwise preserve the
+        # upstream change-based iteration semantics.
         deletion_predicate = os.environ.get('BQSKIT_DELETION_PREDICATE', '')
         if deletion_predicate == 'multi':
             predicate = GateCountPredicate('multi')

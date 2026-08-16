@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math  # HPC
 import os  # HPC
 import time  # HPC
 from typing import Any
@@ -10,17 +11,21 @@ from typing import Callable
 from bqskit.compiler.basepass import BasePass
 from bqskit.compiler.passdata import PassData
 from bqskit.ir.circuit import Circuit
+from bqskit.ir.gates.constant.cz import CZGate  # HPC
+from bqskit.ir.gates.parameterized.rz import RZGate  # HPC
 from bqskit.ir.operation import Operation
 from bqskit.ir.opt.cost.functions import HilbertSchmidtResidualsGenerator
 from bqskit.ir.opt.cost.generator import CostFunctionGenerator
 from bqskit.runtime import get_runtime  # HPC
+from bqskit.runtime.task import PRIORITY_CRITICAL  # HPC
+from bqskit.runtime.task import PRIORITY_SPECULATIVE  # HPC
 from bqskit.utils.typing import is_real_number
+
 _logger = logging.getLogger(__name__)
 
 # ==================== HPC: scan lookahead ==========================================
-# In auto mode, use the manager's free-core broadcast for each window.
-# The cap follows acceptance rate rather than machine capacity; zero restores
-# the original sequential loop.
+# Speculate against a shared baseline, then consume results in greedy order.
+# A rollback after acceptance retries the discarded tail on the new baseline.
 _SCAN_LOOKAHEAD_TEXT = os.environ.get('BQSKIT_SCAN_LOOKAHEAD', 'auto')
 _SCAN_LOOKAHEAD_AUTO = _SCAN_LOOKAHEAD_TEXT.strip().lower() == 'auto'
 _SCAN_LOOKAHEAD = 8 if _SCAN_LOOKAHEAD_AUTO else int(_SCAN_LOOKAHEAD_TEXT)
@@ -29,7 +34,52 @@ if _SCAN_LOOKAHEAD < 0:
     raise ValueError('BQSKIT_SCAN_LOOKAHEAD must be non-negative or "auto".')
 
 _SCAN_OCCUPANCY_STALE_AFTER = 1.0
-_SCAN_LOOKAHEAD_CAP = int(os.environ.get('BQSKIT_SCAN_LOOKAHEAD_CAP', '32'))
+# ===================================================================================
+
+# ==================== HPC: scan lookahead ==========================================
+# Limit an automatic window to avoid dispatching an unbounded stale tail.
+_SCAN_LOOKAHEAD_CAP = int(os.environ.get('BQSKIT_SCAN_LOOKAHEAD_CAP', '4096'))
+# ===================================================================================
+
+# ==================== HPC: scan drain ==============================================
+# Consume map results as they arrive; disabled mode retains batch waiting.
+_SCAN_DRAIN = os.environ.get('BQSKIT_SCAN_DRAIN', '1') != '0'
+# ===================================================================================
+
+# ==================== HPC: gauge marking ===========================================
+# Accept RZ identities without numerical instantiation while leaving the scan's
+# greedy deletion trajectory intact.
+_MARK_GAUGE = os.environ.get('BQSKIT_MARK_GAUGE', '1') != '0'
+_GAUGE_TOL = float(os.environ.get('BQSKIT_GAUGE_TOL', '1e-12'))
+_TWO_PI = 2.0 * math.pi
+
+
+def _gauge_partner(
+    circuit: Circuit,
+    cycle: int,
+    qudit: int,
+) -> tuple[int, int, float] | None:
+    """Return the RZ partner joined by diagonal CZ gates, if there is one."""
+    op = circuit[cycle, qudit]
+    if not isinstance(op.gate, RZGate):
+        return None
+    theta = float(op.params[0])
+    if abs((theta + math.pi) % _TWO_PI - math.pi) <= _GAUGE_TOL:
+        return (cycle, qudit, 0.0)
+    for c in range(cycle + 1, circuit.num_cycles):
+        try:
+            nxt = circuit[c, qudit]
+        except (IndexError, KeyError):
+            continue
+        if nxt is None:
+            continue
+        if isinstance(nxt.gate, CZGate):
+            continue  # RZ commutes through a diagonal CZ.
+        if isinstance(nxt.gate, RZGate):
+            return (c, qudit, float(nxt.params[0]) + theta)
+        return None
+    return None
+# ===================================================================================
 
 
 def _scan_free_cores() -> int | None:
@@ -65,7 +115,6 @@ def _try_removal(
     wc.pop((cycle, qudit))
     wc.instantiate(target, **kwargs)
     return wc
-# ===================================================================================
 
 
 class ScanningGateRemovalPass(BasePass):
@@ -130,6 +179,13 @@ class ScanningGateRemovalPass(BasePass):
                 % type(instantiate_options),
             )
 
+        # ==================== HPC: constant single-qudit filter ====================
+        # Read at construction so each pass observes its own environment.
+        if collection_filter is None and os.environ.get(
+            'BQSKIT_SKIP_CONSTANT_SQ',
+        ) == '1':
+            collection_filter = skip_incompensable_collection_filter
+        # ===========================================================================
         self.collection_filter = collection_filter or default_collection_filter
 
         if not callable(self.collection_filter):
@@ -158,9 +214,9 @@ class ScanningGateRemovalPass(BasePass):
         _logger.debug(f'Starting scanning gate removal on the {start}.')
 
         target = self.get_target(circuit, data)
-
         circuit_copy = circuit.copy()
         reverse_iter = not self.start_from_left
+
         # ==================== HPC: scan lookahead ==================================
         if _SCAN_LOOKAHEAD > 0:
             candidates: list[tuple[int, Operation]] = []
@@ -174,44 +230,151 @@ class ScanningGateRemovalPass(BasePass):
                     continue
                 candidates.append((cycle, op))
 
+            def _take_gauge(cursor: int) -> int:
+                """Accept leading algebraically-certain candidates."""
+                nonlocal circuit_copy
+                while cursor < len(candidates):
+                    cycle, op = candidates[cursor]
+                    shift = (
+                        circuit.num_cycles - circuit_copy.num_cycles
+                        if self.start_from_left else 0
+                    )
+                    qudit = op.location[0]
+                    hit = _gauge_partner(circuit_copy, cycle - shift, qudit)
+                    if hit is None:
+                        return cursor
+                    partner_cycle, partner_qudit, new_angle = hit
+                    if (partner_cycle, partner_qudit) != (
+                        cycle - shift,
+                        qudit,
+                    ):
+                        partner = circuit_copy[partner_cycle, partner_qudit]
+                        circuit_copy.replace_gate(
+                            (partner_cycle, partner_qudit),
+                            partner.gate,
+                            partner.location,
+                            [new_angle],
+                        )
+                    circuit_copy.pop((cycle - shift, qudit))
+                    cursor += 1
+                return cursor
+
             next_candidate = 0
             while next_candidate < len(candidates):
+                if _MARK_GAUGE:
+                    next_candidate = _take_gauge(next_candidate)
+                    if next_candidate >= len(candidates):
+                        break
                 window_start = next_candidate
-                _k = _SCAN_LOOKAHEAD
+                k = _SCAN_LOOKAHEAD
                 if _SCAN_LOOKAHEAD_AUTO:
-                    _free = _scan_free_cores()
-                    if _free is not None:
-                        _k = max(
+                    free = _scan_free_cores()
+                    if free is not None:
+                        k = max(
                             _SCAN_LOOKAHEAD,
-                            min(_free, _SCAN_LOOKAHEAD_CAP),
+                            min(free, _SCAN_LOOKAHEAD_CAP),
                         )
-                window = candidates[next_candidate:next_candidate + _k]
+                window = candidates[next_candidate:next_candidate + k]
                 next_candidate += len(window)
 
-                # A candidate's stored cycle belongs to the original circuit.
-                # Calculate its shift once from the shared baseline so an
-                # unaccepted speculative removal cannot affect later choices.
-                idx_shift = 0
-                if self.start_from_left:
-                    idx_shift = circuit.num_cycles - circuit_copy.num_cycles
+                # A result's cycle is from the original circuit, so calculate
+                # the shift once from its shared baseline.
+                idx_shift = (
+                    circuit.num_cycles - circuit_copy.num_cycles
+                    if self.start_from_left else 0
+                )
                 shifted_cycles = [cycle - idx_shift for cycle, _ in window]
                 qudits = [op.location[0] for _, op in window]
 
-                working_copies: list[Circuit] = await get_runtime().map(
+                # ==================== HPC: QoS priority queue ======================
+                # The head is certain to be consumed; the tail is speculative.
+                # Dispatch both before waiting so priority does not add latency.
+                future_head = get_runtime().map(
                     _try_removal,
-                    [circuit_copy] * len(window),
-                    [target] * len(window),
-                    shifted_cycles,
-                    qudits,
-                    cost_hints=[
-                        float(4 ** circuit_copy.num_qudits)
-                    ] * len(window),
+                    [circuit_copy],
+                    [target],
+                    shifted_cycles[:1],
+                    qudits[:1],
+                    task_priority=PRIORITY_CRITICAL,
+                    cost_hints=[float(4 ** circuit_copy.num_qudits)],
                     **instantiate_options,
                 )
+                tail_count = len(window) - 1
+                future_tail = get_runtime().map(
+                    _try_removal,
+                    [circuit_copy] * tail_count,
+                    [target] * tail_count,
+                    shifted_cycles[1:],
+                    qudits[1:],
+                    task_priority=PRIORITY_SPECULATIVE,
+                    cost_hints=[
+                        float(4 ** circuit_copy.num_qudits)
+                    ] * tail_count,
+                    **instantiate_options,
+                ) if tail_count > 0 else None
+                # ===================================================================
 
-                for index, ((cycle, op), working_copy) in enumerate(
-                    zip(window, working_copies),
-                ):
+                # ==================== HPC: scan drain ==============================
+                # Preserve index-order consumption while allowing results to
+                # arrive independently of slower candidates in the same window.
+                arrived: dict[int, Circuit] = {}
+                tail_remaining = tail_count
+                if not _SCAN_DRAIN:
+                    arrived = {0: (await future_head)[0]}
+                    if future_tail is not None:
+                        for index, result in enumerate(await future_tail):
+                            arrived[index + 1] = result
+                    tail_remaining = 0
+                # ===================================================================
+
+                for index, (cycle, op) in enumerate(window):
+                    # ==================== HPC: gauge marking =======================
+                    # Check before waiting: the shared baseline remains valid
+                    # until an accepted result ends this window.
+                    if _MARK_GAUGE:
+                        qudit = op.location[0]
+                        shifted_cycle = cycle - idx_shift
+                        hit = _gauge_partner(
+                            circuit_copy,
+                            shifted_cycle,
+                            qudit,
+                        )
+                        if hit is not None:
+                            partner_cycle, partner_qudit, new_angle = hit
+                            if (partner_cycle, partner_qudit) != (
+                                shifted_cycle,
+                                qudit,
+                            ):
+                                partner = circuit_copy[
+                                    partner_cycle,
+                                    partner_qudit,
+                                ]
+                                circuit_copy.replace_gate(
+                                    (partner_cycle, partner_qudit),
+                                    partner.gate,
+                                    partner.location,
+                                    [new_angle],
+                                )
+                            circuit_copy.pop((shifted_cycle, qudit))
+                            next_candidate = window_start + index + 1
+                            break
+                    # ===============================================================
+
+                    while index not in arrived:
+                        if index == 0:
+                            for _index, result in await get_runtime().next(
+                                future_head,
+                            ):
+                                arrived[0] = result
+                        elif tail_remaining > 0 and future_tail is not None:
+                            for tail_index, result in await get_runtime().next(
+                                future_tail,
+                            ):
+                                arrived[tail_index + 1] = result
+                                tail_remaining -= 1
+                        else:
+                            break
+                    working_copy = arrived.pop(index)
                     _logger.debug(
                         f'Attempting removal of operation at cycle {cycle}.',
                     )
@@ -220,32 +383,32 @@ class ScanningGateRemovalPass(BasePass):
                     if self.cost(working_copy, target) < self.success_threshold:
                         _logger.debug('Successfully removed operation.')
                         circuit_copy = working_copy
-                        # Rewind after acceptance so the discarded tail is
-                        # retried rather than skipped; this preserves the
-                        # sequential greedy result.
+                        # Retry the discarded tail from the new baseline.
                         next_candidate = window_start + index + 1
                         break
+
+                # ==================== HPC: scan drain ==============================
+                # Remaining results were built from an obsolete baseline.
+                if tail_remaining > 0 and future_tail is not None:
+                    get_runtime().cancel(future_tail)
+                # ===================================================================
 
             circuit.become(circuit_copy)
             return
         # ===========================================================================
 
         for cycle, op in circuit.operations_with_cycles(reverse=reverse_iter):
-
             if not self.collection_filter(op):
                 _logger.debug(f'Skipping operation {op} at cycle {cycle}.')
                 continue
 
             _logger.debug(f'Attempting removal of operation at cycle {cycle}.')
             _logger.debug(f'Operation: {op}')
-
             working_copy = circuit_copy.copy()
 
-            # If removing gates from the left, we need to track index changes.
+            # Removing from the left changes subsequent cycle indices.
             if self.start_from_left:
-                idx_shift = circuit.num_cycles
-                idx_shift -= working_copy.num_cycles
-                cycle -= idx_shift
+                cycle -= circuit.num_cycles - working_copy.num_cycles
 
             working_copy.pop((cycle, op.location[0]))
             working_copy.instantiate(target, **instantiate_options)
@@ -255,6 +418,14 @@ class ScanningGateRemovalPass(BasePass):
                 circuit_copy = working_copy
 
         circuit.become(circuit_copy)
+
+
+# ==================== HPC: constant single-qudit filter ============================
+# A constant one-qudit gate has no free parameters to compensate its removal.
+def skip_incompensable_collection_filter(op: Operation) -> bool:
+    """Skip constant single-qudit gates from numerical deletion."""
+    return not (op.num_qudits == 1 and op.gate.num_params == 0)
+# ===================================================================================
 
 
 def default_collection_filter(op: Operation) -> bool:

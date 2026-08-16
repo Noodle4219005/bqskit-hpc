@@ -48,7 +48,34 @@ _SPEC_YIELD = (
 )
 # ===================================================================================
 
-# ==================== HPC: speculation memo =========================================
+# ==================== HPC: K congestion control ====================================
+# Grow speculation while the frontier supplies work, then stop probing when it
+# is exhausted; a new best result re-arms the controller.
+_SPEC_CONTROL = os.environ.get('BQSKIT_SPEC_CONTROL', '1') != '0'
+_SPEC_FILL_GROW = float(os.environ.get('BQSKIT_SPEC_FILL_GROW', '0.40'))
+_SPEC_FILL_HOLD = float(os.environ.get('BQSKIT_SPEC_FILL_HOLD', '0.20'))
+_SPEC_HEADROOM = int(os.environ.get('BQSKIT_SPEC_HEADROOM', '4'))
+# ===================================================================================
+
+# ==================== HPC: overshoot ===============================================
+# Size automatic speculation above free capacity when requested. Auto follows
+# contention, while max removes this capacity ceiling.
+_SPEC_OVERSHOOT_TEXT = os.environ.get('BQSKIT_SPEC_OVERSHOOT', '4.0')
+_SPEC_UNBOUNDED = _SPEC_OVERSHOOT_TEXT.strip().lower() == 'max'
+_SPEC_OVERSHOOT_AUTO = _SPEC_OVERSHOOT_TEXT.strip().lower() == 'auto'
+_SPEC_OVERSHOOT = (
+    1.0 if (_SPEC_UNBOUNDED or _SPEC_OVERSHOOT_AUTO)
+    else float(_SPEC_OVERSHOOT_TEXT)
+)
+_SPEC_OS_FUSE = float(os.environ.get('BQSKIT_SPEC_OS_FUSE', '64.0'))
+
+if _SPEC_OVERSHOOT < 1.0:
+    raise ValueError(
+        'BQSKIT_SPEC_OVERSHOOT must be >= 1.0, "auto" or "max".',
+    )
+# ===================================================================================
+
+# ==================== HPC: speculation memo ========================================
 _CircuitStructureKey = tuple[
     tuple[Gate, CircuitLocation, tuple[float, ...]],
     ...,
@@ -210,7 +237,7 @@ class LEAPSynthesisPass(SynthesisPass):
                 'Expected max_layer to be positive, got %d.' % int(max_layer),
             )
 
-        # ==================== HPC: ordered runahead ========================================
+        # ==================== HPC: ordered runahead ================================
         deepen_to = os.environ.get('BQSKIT_DEEPEN_TO')
         self.deepen_to: int | None = None
         if deepen_to is not None:
@@ -374,7 +401,7 @@ class LEAPSynthesisPass(SynthesisPass):
                     'BQSKIT_MIN_PREFIX_FRACTION must be in (0, 1], got '
                     f'{self.min_prefix_fraction}.',
                 )
-        # ===================================================================================
+        # ===========================================================================
         self.instantiate_options: dict[str, Any] = {
             'cost_fn_gen': self.cost,
         }
@@ -397,7 +424,7 @@ class LEAPSynthesisPass(SynthesisPass):
         if 'seed' not in instantiate_options:
             instantiate_options['seed'] = data.seed
 
-        # ==================== HPC: parallel multistart =====================================
+        # ==================== HPC: parallel multistart =============================
         def dispatch_batches(
             batches: list[list[Circuit]],
             task_priority: int = PRIORITY_CRITICAL,
@@ -499,8 +526,8 @@ class LEAPSynthesisPass(SynthesisPass):
                 offset = end
             return results
 
-        # ===================================================================================
-        # ==================== HPC: speculation memo =========================================
+        # ===========================================================================
+        # ==================== HPC: speculation memo ================================
         speculation_memo: dict[
             _CircuitStructureKey,
             _SpeculationMemoEntry,
@@ -520,6 +547,16 @@ class LEAPSynthesisPass(SynthesisPass):
         # it is other blocks competing for the same workers.
         fastest_batch_s: float | None = None
         contention_ema: float = 1.0
+
+        # ==================== HPC: K congestion control ============================
+        # Start above the no-speculation floor so the controller can measure
+        # frontier fill before an initial speculative batch is available.
+        k_ctl = 2.0
+        k_ssthresh = float('inf')
+        overshoot = 1.0 if _SPEC_OVERSHOOT_AUTO else _SPEC_OVERSHOOT
+        fill_ema: float | None = None
+        k_probe_allowed = True
+        # ===========================================================================
 
         def circuit_structure_key(circuit: Circuit) -> _CircuitStructureKey:
             """Return an exact identity for one instantiation input.
@@ -579,8 +616,8 @@ class LEAPSynthesisPass(SynthesisPass):
                 overflow.append((circuit, layer))
             return False
 
-        # ===================================================================================
-        # ==================== HPC: initial layer dispatch ==================================
+        # ===========================================================================
+        # ==================== HPC: initial layer dispatch ==========================
         # Begin the search with an initial layer
         frontier = Frontier(utry, self.heuristic_function)
         initial_layer = layer_gen.gen_initial_layer(utry, data)
@@ -669,7 +706,7 @@ class LEAPSynthesisPass(SynthesisPass):
                 get_runtime().cancel(prefetched_initial_future)
                 prefetched_initial_future = None
 
-        # ===================================================================================
+        # ===========================================================================
         # Track best circuit, initially the initial layer
         best_dist = self.cost.calc_cost(initial_layer, utry)
         best_circ = initial_layer
@@ -695,7 +732,7 @@ class LEAPSynthesisPass(SynthesisPass):
         # to avoid duplicate warnings
         warned_layers: list[int] = []
 
-        # ==================== HPC: ordered runahead ========================================
+        # ==================== HPC: ordered runahead ================================
         # Main loop.
         #
         # An emptied frontier used to mean the search was over, and the exit
@@ -770,37 +807,43 @@ class LEAPSynthesisPass(SynthesisPass):
             # occupancy broadcast is missing or stale.
             measured_idle: int | None = None
 
-            # K changes scheduling only; frontier pops remain ordered.
+            # ==================== HPC: overshoot ===================================
+            # K changes scheduling only; frontier pops remain ordered. Auto
+            # derives its lead from contention, while max removes capacity caps.
+            s = 1
             if self.expand_k_auto:
                 if succ_ema is None:
-                    # Nothing measured yet. Run serially rather than guess a
-                    # width and over-commit the pool on the first round.
                     effective_k = 1
                 else:
                     s = max(1, round(succ_ema))
-                    # Use fresh global capacity when available; a per-block
-                    # contention estimate cannot detect constant contention.
+                    if _SPEC_OVERSHOOT_AUTO:
+                        overshoot = max(
+                            1.0,
+                            min(contention_ema, _SPEC_OS_FUSE),
+                        )
                     measured_idle = self._measured_idle_workers()
                     if measured_idle is not None:
-                        share = max(float(s), float(measured_idle))
+                        share = (
+                            float(self.expand_k_max) * float(s)
+                            if _SPEC_UNBOUNDED else max(
+                                float(s),
+                                float(measured_idle) * overshoot,
+                            )
+                        )
                     else:
                         share = max(
                             float(s),
                             self.worker_width / max(1.0, contention_ema),
                         )
 
-                    # Timely hits bound useful depth; occupancy alone cannot.
-                    if _spec_issued >= _SPEC_VALUE_WARMUP:
+                    # Timely hits, not occupancy, bound useful speculation.
+                    if _spec_issued >= _SPEC_VALUE_WARMUP and not _SPEC_UNBOUNDED:
                         p = _spec_hits / _spec_issued
                         if p <= 0.0:
                             value_k = 2.0
                         elif p >= 1.0:
-                            # Avoid log(1) and leave an always-successful cap open.
                             value_k = float(self.expand_k_max)
                         else:
-                            # Largest d with p^d above the floor; the floor is
-                            # the point below which a speculative task is worth
-                            # less than the critical task it displaces.
                             value_k = 1.0 + math.log(
                                 _SPEC_VALUE_FLOOR,
                             ) / math.log(p)
@@ -814,6 +857,7 @@ class LEAPSynthesisPass(SynthesisPass):
                     )
             else:
                 effective_k = self.expand_k
+            # =======================================================================
 
             # A stalled block yields scarce capacity to still-improving blocks.
             if effective_k > 1 and _gap_ema is not None:
@@ -989,18 +1033,27 @@ class LEAPSynthesisPass(SynthesisPass):
                 _s = max(1, round(succ_ema)) if succ_ema else len(successors)
                 _s = max(1, _s)
                 _in_flight = sum(f.n_tasks for f in speculation_flights)
-                _budget = max(0, (effective_k * _s) - _s - _in_flight)
-                if _budget > 0:
+                # ==================== HPC: K congestion control ====================
+                # The controller uses frontier fill rather than a free-core
+                # reading, which only describes capacity before this round.
+                k_eff = effective_k
+                if _SPEC_CONTROL:
+                    k_eff = int(max(1.0, min(
+                        float(self.expand_k_max), k_ctl,
+                    )))
+                budget = max(0, (k_eff * _s) - _s - _in_flight)
+                # ===================================================================
+                acc = 0
+                if budget > 0:
                     queued_keys: set[_CircuitStructureKey] = set()
                     for _flight in speculation_flights:
                         queued_keys.update(_flight.keys)
                     next_keys: list[_CircuitStructureKey] = []
                     next_batches: list[list[Circuit]] = []
-                    _acc = 0
                     # Look past cached entries so refills add new work.
-                    _peek = len(speculation_memo) + effective_k * 2 + 8
-                    for _, circuit, _ in frontier.peek(_peek):
-                        if _acc >= _budget:
+                    peek = len(speculation_memo) + k_eff * 2 + 8
+                    for _, circuit, _ in frontier.peek(peek):
+                        if acc >= budget:
                             break
                         structure_key = circuit_structure_key(circuit)
                         memo_entry = speculation_memo.get(structure_key)
@@ -1017,14 +1070,43 @@ class LEAPSynthesisPass(SynthesisPass):
                         )
                         if not node_successors:
                             continue
-                        if _acc + len(node_successors) > _budget:
+                        if acc + len(node_successors) > budget:
                             break
-                        _acc += len(node_successors)
+                        acc += len(node_successors)
                         queued_keys.add(structure_key)
                         next_keys.append(structure_key)
                         next_batches.append(node_successors)
 
-                    if next_batches:
+                # Slow-start while the frontier supplies work, then grow
+                # linearly. Exhaustion freezes probing until search advances.
+                if _SPEC_CONTROL and budget <= 0 and k_probe_allowed:
+                    k_ctl = max(
+                        2.0,
+                        min(k_ctl * 2.0, float(self.expand_k_max)),
+                    )
+                elif _SPEC_CONTROL and budget > 0:
+                    fill = acc / float(budget)
+                    fill_ema = (
+                        fill if fill_ema is None
+                        else 0.7 * fill_ema + 0.3 * fill
+                    )
+                    if k_probe_allowed:
+                        if fill_ema >= _SPEC_FILL_GROW and k_ctl < k_ssthresh:
+                            k_ctl = min(
+                                k_ctl * 2.0,
+                                float(self.expand_k_max),
+                            )
+                        elif fill_ema >= _SPEC_FILL_HOLD:
+                            k_ctl = min(
+                                k_ctl + 1.0,
+                                float(self.expand_k_max),
+                            )
+                        else:
+                            k_ssthresh = max(2.0, k_ctl / 2.0)
+                            k_ctl = k_ssthresh
+                            k_probe_allowed = False
+
+                if next_batches:
                         # Count NODES speculated on, matching what a timely
                         # hit is counted against: one node's speculation either
                         # gets used before the critical path reaches it, or it
@@ -1035,7 +1117,7 @@ class LEAPSynthesisPass(SynthesisPass):
                         )
                         speculation_flights.append(_SpeculationFlight(
                             _future, next_keys, next_batches, _owners,
-                            epoch, current_max_layer, _acc,
+                            epoch, current_max_layer, acc,
                         ))
             iteration += 1
 
@@ -1205,7 +1287,10 @@ class LEAPSynthesisPass(SynthesisPass):
                     best_circ = circuit
                     best_layer = layer + 1
 
-                    # ==================== HPC: prefix commit ==============================
+                    # Re-probe after search progress refills the frontier.
+                    k_probe_allowed = True
+
+                    # ==================== HPC: prefix commit =======================
                     if self.check_leap_condition(
                         layer + 1,
                         best_dist,
@@ -1228,7 +1313,7 @@ class LEAPSynthesisPass(SynthesisPass):
                         })
                         last_prefix_layer = layer + 1
                         add_child(circuit, layer + 1)
-                    # ===================================================================================
+                    # ===============================================================
                 if self.store_partial_solutions:
                     if layer not in psols:
                         psols[layer] = []
@@ -1252,7 +1337,7 @@ class LEAPSynthesisPass(SynthesisPass):
                 )
                 warned_layers.append(layer)
 
-        # ===================================================================================
+        # ===========================================================================
         _logger.warning('Frontier emptied.')
         _logger.warning(
             'Returning best known circuit with %d layer%s and cost: %e.'
