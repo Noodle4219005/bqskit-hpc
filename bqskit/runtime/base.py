@@ -570,9 +570,69 @@ class ServerBase:
 
             self.outgoing.task_done()
 
+    def _start_placement_probe(self) -> None:
+        """Sample (pool depth, idle workers) on a FIXED PERIOD, off-thread.
+
+        Placement idle is defined as: work is available AND capacity is
+        available AND the two have not been matched. That is a conjunction of
+        two live quantities, so it can only be measured by reading both at the
+        same instant, on a clock that has nothing to do with either.
+
+        Two earlier attempts measured proxies instead and both were invalid.
+        `_pool_blocked` counts drains that ended with no employee holding an
+        idle worker -- but that is the loop's own exit condition, so it fires
+        whenever the pool is deeper than the free capacity, and the companion
+        `_pool_blocked_idle_sum` is then identically zero by construction, not
+        by observation. The other read was taken inside the drain, which is
+        triggered by the very events being measured.
+
+        This thread samples on its own clock, so `both_positive` is the honest
+        quantity: the fraction of samples in which tasks were queued while
+        workers sat idle.
+        """
+        _dir = os.environ.get('BQPROF_PLACEMENT_DIR')
+        if not _dir:
+            return
+        import json as _json
+        import threading as _th
+
+        period = float(os.environ.get('BQPROF_PLACEMENT_PERIOD', '0.05'))
+        path = f'{_dir}/placement_{os.getpid()}.jsonl'
+
+        def _loop() -> None:
+            n = both = pool_pos = idle_pos = 0
+            depth_sum = idle_sum = 0
+            t0 = time.time()
+            with open(path, 'w') as fh:
+                while self.running:
+                    time.sleep(period)
+                    depth = len(self._pool)
+                    idle = self.num_idle_workers
+                    n += 1
+                    depth_sum += depth
+                    idle_sum += idle
+                    pool_pos += depth > 0
+                    idle_pos += idle > 0
+                    both += (depth > 0 and idle > 0)
+                    if n % 200 == 0:
+                        fh.write(_json.dumps({
+                            't': round(time.time() - t0, 2), 'samples': n,
+                            'pool_positive': pool_pos, 'idle_positive': idle_pos,
+                            'both_positive': both,
+                            'depth_mean': round(depth_sum / n, 3),
+                            'idle_mean': round(idle_sum / n, 3),
+                            'total_workers': self.total_workers,
+                        }) + '\n')
+                        fh.flush()
+
+        t = _th.Thread(target=_loop, daemon=True, name='placement-probe')
+        t.start()
+        _logger.info('placement probe on, period %.3fs -> %s', period, path)
+
     def run(self) -> None:
         """Main loop."""
         _logger.info(f'{self.__class__.__name__} running...')
+        self._start_placement_probe()
 
         try:
             while self.running:
