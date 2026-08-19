@@ -724,12 +724,19 @@ class Worker:
         # Remove task
         self._tasks.pop(task.return_address, None)
 
-        # Cancel any open tasks
-        for mailbox_id in self._active_task.owned_mailboxes:
+        # Cancel any open tasks.
+        #
+        # Iterate over a COPY. cancel() removes from owned_mailboxes, and
+        # mutating the list being walked makes the loop skip the next entry.
+        for mailbox_id in list(self._active_task.owned_mailboxes):
             # If task is complete, simply discard result
             if mailbox_id in self._mailboxes:
                 if self._mailboxes[mailbox_id].ready:
                     self._mailboxes.pop(mailbox_id)
+                    # Drop the ownership record too. Popping the mailbox while
+                    # leaving its id here is what produced the dangling id that
+                    # a later cancel() then indexed, killing the worker.
+                    self._active_task.owned_mailboxes.remove(mailbox_id)
                     continue
 
             # Otherwise send a cancel message
@@ -823,15 +830,28 @@ class Worker:
         *args: Any,
         task_name: Sequence[str | None] | str | None = None,
         log_context: Sequence[dict[str, str]] | dict[str, str] = {},
-        task_priority: int = PRIORITY_CRITICAL,
+        task_priority: Sequence[int] | int = PRIORITY_CRITICAL,
         cost_hints: Sequence[float] | None = None,
         **kwargs: Any,
     ) -> RuntimeFuture:
         """Map `fn` over the input arguments distributed across the runtime.
 
-        `task_priority` selects the worker's service class for every task in
-        the batch. See `RuntimeTask.priority`; the `task_` prefix keeps it out
-        of the **kwargs that are forwarded to `fn`.
+        `task_priority` selects the worker's service class. It may be a single
+        value for the whole batch, or one value per task -- the same
+        scalar-or-sequence shape `task_name`, `log_context` and `cost_hints`
+        already use. Per-task is what lets a caller mix urgencies in ONE map,
+        which matters because this runtime has no wait-any across futures: a
+        caller that needs some of its tasks demoted cannot simply issue a
+        second, lower-priority map and harvest it opportunistically.
+
+        NO ESCALATION BY SPAWNING. A task's effective priority is the LEAST
+        urgent of what it asked for and what its parent already has, so a
+        demoted subtree stays demoted. Without this the demotion is cosmetic:
+        ForEachBlockPass could dispatch a redundant block copy at low
+        priority, and that copy's own LEAP would immediately dispatch its
+        instantiate tasks at PRIORITY_CRITICAL and compete with real work
+        anyway. See `RuntimeTask.priority`; the `task_` prefix keeps it out of
+        the **kwargs that are forwarded to `fn`.
         """
         assert self._active_task is not None
 
@@ -873,6 +893,17 @@ class Worker:
         if len(fnargs) == 0:
             raise RuntimeError('Unable to map 0 tasks.')
 
+        if isinstance(task_priority, int):
+            task_priority = [task_priority] * len(fnargs)
+        elif len(task_priority) != len(fnargs):
+            raise ValueError(
+                f'task_priority has length {len(task_priority)}, but '
+                f'{len(fnargs)} tasks were created.',
+            )
+        # Larger number == less urgent, so max() is the demotion.
+        _parent_priority = self._active_task.priority
+        task_priority = [max(p, _parent_priority) for p in task_priority]
+
         if cost_hints is None:
             cost_hints = [0.0] * len(fnargs)
         elif len(cost_hints) != len(fnargs):
@@ -899,7 +930,7 @@ class Worker:
                 self._active_task.max_logging_depth,
                 task_name[i],
                 {**self._active_task.log_context, **log_context[i]},
-                task_priority,
+                task_priority[i],
                 cost_hints[i],
             )
             for i, fnarg in enumerate(fnargs)
@@ -931,11 +962,20 @@ class Worker:
         return x
 
     def cancel(self, future: RuntimeFuture) -> None:
-        """Cancel all tasks associated with `future`."""
+        """Cancel all tasks associated with `future`.
+
+        Tolerates a mailbox that is already gone. Indexing it unguarded
+        raised KeyError inside the worker loop, which killed the worker and
+        reached the client as "Server connection unexpectedly closed" --
+        6 of 48 benchmark cells on 2026-08-19, in both arms.
+        """
         assert self._active_task is not None
-        num_slots = self._mailboxes[future.mailbox_id].expected_num_results
-        self._active_task.owned_mailboxes.remove(future.mailbox_id)
-        self._mailboxes.pop(future.mailbox_id)
+        mailbox = self._mailboxes.pop(future.mailbox_id, None)
+        if future.mailbox_id in self._active_task.owned_mailboxes:
+            self._active_task.owned_mailboxes.remove(future.mailbox_id)
+        if mailbox is None:
+            return
+        num_slots = mailbox.expected_num_results
         addrs = [
             RuntimeAddress(self._id, future.mailbox_id, slot_id)
             for slot_id in range(num_slots)

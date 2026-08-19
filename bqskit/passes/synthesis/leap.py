@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import math
 import os
 import time
 from typing import Any
+from typing import Iterator
 from typing import NamedTuple
 
 import numpy as np
@@ -167,6 +169,67 @@ _LTRACE_DIR = os.environ.get('BQPROF_LTRACE')
 # plateaued is a stuck search, and no amount of parallelism fixes the second.
 _BLOCKPROF_DIR = os.environ.get('BQPROF_BLOCKPROF')
 
+# Record a LOWER BOUND on this block's 2Q count next to what LEAP actually
+# produced, so a run certifies its own output instead of needing the partition
+# reproduced offline. blockprof stores `target` as a hash, not a matrix, so
+# without this the bound cannot be recomputed after the fact.
+#
+# Two instruments, and they are NOT the same kind of claim:
+#
+#   w == 2 -> EXACT. The Weyl-chamber coordinates decide the minimum CNOT
+#             count outright (0/1/2/3). This is a decision procedure.
+#   w >= 3 -> operator-Schmidt cut bound. Every 2Q gate crossing a bipartition
+#             multiplies that cut's rank by at most 2, so
+#             #crossing >= log2 OSR. Valid on ANY topology; the max over cuts
+#             is a valid bound on the total. It is TIGHT only for sparse
+#             blocks -- a 4-qubit block's 1|3 cut caps at log2 4 = 2 no matter
+#             how many gates the block holds.
+#
+# Do NOT sum the cuts. That is only valid when the implementation is confined
+# to a tree (every edge a bridge, so no gate crosses two cuts); the real
+# pipeline hands LEAP an all-to-all sub-model, and summing there double-counts
+# and produces "bounds" above a known feasible solution.
+_BLOCKPROF_CERT = os.environ.get('BQPROF_BLOCKPROF_CERT', '1') != '0'
+
+
+def _osr(U: Any, A: tuple[int, ...], n: int) -> int:
+    """Operator-Schmidt rank of an n-qubit unitary across the cut A | rest."""
+    B = [q for q in range(n) if q not in A]
+    perm = list(A) + B
+    T = U.reshape([2] * (2 * n)).transpose([*perm, *[p + n for p in perm]])
+    dA, dB = 2 ** len(A), 2 ** len(B)
+    M = T.reshape(dA, dB, dA, dB).transpose(0, 2, 1, 3).reshape(dA * dA, dB * dB)
+    s = np.linalg.svd(M, compute_uv=False)
+    return int((s > s[0] * 1e-10).sum()) if s[0] > 0 else 1
+
+
+_WEYL: Any = None
+
+
+def _cz_lower_bound(utry: Any) -> tuple[int, str] | tuple[None, None]:
+    """Return (bound, kind) for a block target, or (None, None) on failure."""
+    global _WEYL
+    try:
+        n = int(utry.num_qudits)
+        if any(r != 2 for r in utry.radixes) or n < 2 or n > 6:
+            return None, None
+        U = np.ascontiguousarray(np.asarray(utry), dtype=np.complex128)
+        if n == 2:
+            if _WEYL is None:
+                from qiskit.circuit.library import CXGate
+                from qiskit.synthesis import TwoQubitBasisDecomposer
+                _WEYL = TwoQubitBasisDecomposer(CXGate())
+            return int(_WEYL.num_basis_gates(U)), 'exact'
+        best = 0
+        for k in range(1, n // 2 + 1):
+            for A in itertools.combinations(range(n), k):
+                if k == n - k and 0 not in A:
+                    continue
+                best = max(best, math.ceil(math.log2(_osr(U, A, n))))
+        return best, 'osr'
+    except Exception:
+        return None, None
+
 # Measure how much of the frontier is the SAME circuit reached by a different
 # gate order, before deciding whether merging them is worth building.
 #
@@ -249,6 +312,210 @@ _SPEC_CONTROL = os.environ.get('BQSKIT_SPEC_CONTROL', '1') != '0'
 _SPEC_FILL_GROW = float(os.environ.get('BQSKIT_SPEC_FILL_GROW', '0.40'))
 _SPEC_FILL_HOLD = float(os.environ.get('BQSKIT_SPEC_FILL_HOLD', '0.20'))
 _SPEC_HEADROOM = int(os.environ.get('BQSKIT_SPEC_HEADROOM', '4'))
+
+# BQSKIT_SPEC_DEEPEN lets speculation expand ITS OWN output, not only the
+# frontier. Off by default: it changes what gets DISPATCHED, never what gets
+# returned, but it is unmeasured and the controller around it was tuned
+# without it.
+#
+# WHY IT EXISTS. Speculation peeks the frontier, and the frontier is a
+# measurably thin source: at K=32 a 31-node window found 1.03 new nodes per
+# round -- a 3.3% fill rate -- because exactly one node leaves the frontier per
+# round and the rest were speculated in earlier rounds and memoised. The budget
+# therefore goes unspent while workers idle. The pool is empty because nothing
+# MADE work, not because work could not be placed.
+#
+# The speculation's own successors are not in the frontier. They have no cost
+# yet, so `peek` can never reach them, and they are an unbounded source: s more
+# per node, per level. Because a deepened batch becomes an ordinary flight, the
+# next round sees it as a candidate too, so depth grows on its own -- no level
+# counter is needed and none is kept.
+#
+# WHY EXPANDING AN UN-INSTANTIATED TEMPLATE IS EXACT, NOT APPROXIMATE.
+# `SimpleLayerGenerator.gen_successors` (search/generators/simple.py:173-199)
+# copies the circuit and appends gates chosen from `data.connectivity` alone --
+# it never reads a parameter. And `Circuit.instantiate` re-randomises every
+# parameter from its start generator, discarding the incoming values (this
+# fork already established that instantiate never warm-starts). The template
+# built here is therefore identical to the one the real search would build
+# after instantiating the parent. Only the HIT RATE differs, for a real reason:
+# ranking needs the cost, the cost needs the instantiate, so these candidates
+# are UNRANKED and are taken in dispatch order -- oldest flight first, which is
+# shallowest first.
+#
+# THE COST IS NOT MEMORY. An unused speculation on an otherwise idle worker
+# costs memory, which is not scarce here. It costs LATENCY: worker tasks are
+# not preemptible, so a wrong deep speculation holds a core that the real next
+# round then queues behind. That is the failure mode `_should_promote_delayed`
+# exists to fix -- speculation blocking the critical path by OCCUPYING it
+# rather than by being ahead of it.
+# TRI-STATE, and 'auto' is the design the pool is supposed to implement:
+#
+#   'auto' (default) -- depth opens only when the machine is NOT full AND the
+#                       frontier has already proven it cannot supply more.
+#                       That is the spec: shallow first, depth only to cover
+#                       what shallow could not.
+#   '1'              -- always on. The pre-2026-08-18 behaviour, kept ONLY so
+#                       the two can be A/B-ed; it is the arm that measured
+#                       174/1,745 budget-bearing rounds against 1,019/1,276.
+#   '0'              -- off. No deep source, no idle credit, no reclaim.
+#
+# Why a static flag was wrong. Depth is a RESPONSE to a condition -- "nobody
+# can be given work from the frontier, and workers are idle" -- and a value
+# read once at import cannot express a condition. Read as a constant it forces
+# the choice globally and permanently, which is how the always-on arm came to
+# spend budget on depth in rounds where shallow work was still available.
+_SPEC_DEEPEN_MODE = os.environ.get('BQSKIT_SPEC_DEEPEN', '0').strip().lower()
+if _SPEC_DEEPEN_MODE not in ('auto', '0', '1'):
+    raise ValueError(
+        "BQSKIT_SPEC_DEEPEN must be 'auto', '0' or '1', got %r."
+        % _SPEC_DEEPEN_MODE,
+    )
+# Depth is permitted to exist at all. The per-round decision is separate.
+_SPEC_DEEPEN = _SPEC_DEEPEN_MODE != '0'
+# Depth is forced on every round regardless of idle/exhaustion (old behaviour).
+_SPEC_DEEPEN_ALWAYS = _SPEC_DEEPEN_MODE == '1'
+
+# BQSKIT_SPEC_SIMPLE replaces the K controller with one high-water mark.
+#
+# WHY. Ten gates decide whether a round issues speculative work, chained
+# MULTIPLICATIVELY -- any one closing zeroes the whole thing:
+#
+#   effective_k >= 2 · first_expansion_future is None · critical_batches ·
+#   _budget = k*s - s - _in_flight > 0 · value floor (value_k) ·
+#   _SPEC_CONTROL/_k_probe_allowed · memo+queued dedup ·
+#   _acc + len > _budget · _SPEC_OS_FUSE · expand_k_max
+#
+# Four of them (share, _budget, value_k, contention_ema) take their input from
+# a live reading of idle workers or in-flight tasks -- the exact quantity the
+# producer's own dispatch moves. That is one control loop wearing four hats,
+# and it has now failed seven times in this project, most recently by making
+# deepening switch itself off: the block ran 152 of 1,753 rounds instead of
+# 1,257 of 1,151, and three consecutive diagnoses each patched a term
+# downstream of the one that was actually closed.
+#
+# THE REPLACEMENT IS ONE LINE OF POLICY. The consumer side is already a
+# priority queue that provably never stalls: 1,150,800 paired samples of
+# (pool depth, idle workers) contain ZERO instances of "work queued while a
+# worker sits idle". So the producer's only job is to keep that queue
+# non-empty and bounded:
+#
+#   budget = max(0, HI * s - outstanding)
+#
+# `outstanding` is the work THIS block has dispatched and not yet harvested --
+# a quantity the producer sets directly and reads exactly, not a signal its
+# own action distorts. No idle reading, no overshoot, no value floor, no
+# in-flight subtraction. The loop is gone by construction, not by tuning.
+#
+# Default off: the old path is untouched so the two can be A/B-ed directly.
+_SPEC_SIMPLE = os.environ.get('BQSKIT_SPEC_SIMPLE', '0') != '0'
+_SPEC_HI_ROUNDS = float(os.environ.get('BQSKIT_SPEC_HI_ROUNDS', '8.0'))
+
+# BQSKIT_SPEC_POOL selects the pool sizing arithmetic. 'machine' is the current
+# design (see the branch below); 'legacy' restores the pre-2026-08-18 form
+# VERBATIM.
+#
+# It exists so the control can be an ARM rather than a different checkout.
+# Swapping leap.py between two jobs confounds the code change with the node the
+# job happened to land on -- which is exactly what went wrong on the first
+# smoke test: its `DEEPEN=0` arm was assumed to be the old behaviour, but the
+# budget rewrite is not gated by DEEPEN and applied to all three arms, so that
+# job contained no control at all.
+_SPEC_POOL = os.environ.get('BQSKIT_SPEC_POOL', 'legacy').strip().lower()
+if _SPEC_POOL not in ('machine', 'legacy'):
+    raise ValueError(
+        "BQSKIT_SPEC_POOL must be 'machine' or 'legacy', got %r." % _SPEC_POOL,
+    )
+_SPEC_POOL_LEGACY = _SPEC_POOL == 'legacy'
+
+# `SimpleLayerGenerator.gen_successors` appends exactly three gates per layer
+# (one two-qudit gate plus one single-qudit gate on each end), so a circuit's
+# distance from the frontier in LAYERS is its gate-count delta over three.
+_LAYER_GATES = 3
+
+# How many priority tiers deepening may spend. PRIORITY_CRITICAL is 0 and
+# PRIORITY_SPECULATIVE is 10, so the whole band between them is free; the cap
+# keeps a runaway depth from ever reaching the critical class.
+_SPEC_MAX_TIER = int(os.environ.get('BQSKIT_SPEC_MAX_TIER', '6'))
+
+# Ceiling on deep speculation still outstanding, as a multiple of the worker
+# width. Deep tiers no longer consume the near-speculation budget, so without
+# a separate ceiling they are unbounded: the measured pool peak with deepening
+# and no cap was 1,929 tasks against 112 workers (vs 429 for base). That is
+# not supply, it is a queue nobody will reach. 4x the machine is deep enough
+# to cover several rounds of lookahead and far below the observed flood.
+_SPEC_DEEP_CAP_MULT = float(os.environ.get('BQSKIT_SPEC_DEEP_CAP', '4.0'))
+
+# BQSKIT_MS_DROP_SLOW abandons the slowest starts of a parallel-multistart
+# round once `BQSKIT_MS_KEEP_FRACTION` of them are in and every successor has
+# at least one. Off by default: it can change 2Q/depth, so it is a quality
+# knob, not a scheduling one. See `_collect_dropping_stragglers`.
+_MS_DROP_SLOW = os.environ.get('BQSKIT_MS_DROP_SLOW', '0') != '0'
+_MS_KEEP_FRACTION = float(os.environ.get('BQSKIT_MS_KEEP_FRACTION', '0.75'))
+
+# BQSKIT_MS_DROP_BRANCH relaxes the coverage rule from STARTS to SUCCESSORS.
+#
+# `_collect_dropping_stragglers` today requires every (batch, successor) pair to
+# have at least one result before it will cancel anything, so it can only drop
+# the surplus restarts of a successor that already reported. That is a real but
+# bounded cut: measured 1.12x with byte-identical output (p=0.003, n=7 vs n=4).
+#
+# The barrier it is cutting into is the round's `wait for all s*M`. The rest of
+# that wait is one or two whole successors that are still running -- and those
+# cannot be dropped under a full-coverage rule no matter how long they take.
+#
+# With this flag the rule becomes: once `_MS_BRANCH_FRACTION` of the SUCCESSORS
+# have reported, cancel the remainder. A dropped successor never enters the
+# frontier, so unlike the start-level drop this CHANGES THE SEARCH -- it is a
+# quality knob, not a scheduling one, and 2Q/depth must be read beside the wall.
+#
+# Why this and not true barrier elimination: a barrier-free best-first search
+# needs to await several dispatches at once and take whichever lands first. The
+# runtime has no wait-any across futures (`get_runtime().next` is incremental
+# within ONE map, and `RuntimeFuture._done` documents that polling can
+# deadlock), so overlapping round N+1 with round N's tail is not expressible
+# without changing the runtime first. This is the part of the barrier that IS
+# reachable from here.
+_MS_DROP_BRANCH = os.environ.get('BQSKIT_MS_DROP_BRANCH', '0') != '0'
+_MS_BRANCH_FRACTION = float(
+    os.environ.get('BQSKIT_MS_BRANCH_FRACTION', '0.75'),
+)
+
+# BQSKIT_MS_DYNAMIC sizes the multistart count per round instead of taking the
+# workflow's fixed M.
+#
+#   M* = clamp(W // s, M, M_max)      s = successors this round = C(w,2)
+#
+# WHY W AND NOT THE MEASURED IDLE. Sizing a controller from the live free-core
+# reading is the exact shape that failed five times for the K controller: the
+# controller's own action moves the signal it reads, so it oscillates or pins.
+# W (total workers) and s (a structural property of the width) are both
+# constants within a round, so there is no loop to close.
+#
+# WHY IT ONLY EVER RAISES. `max(default, ...)` -- selection is an argmin over
+# the starts that returned, so adding starts can never select a WORSE circuit.
+# The only risk is wall, which makes this a one-sided bet.
+#
+# WHAT IT COSTS. A round costs the MAX of its s*M tasks, not the mean. Going
+# M=4 -> 16 takes a round from ~24 to ~96 tasks, moving the expected max from
+# roughly p96 to p99 of the task-duration distribution -- and that tail is
+# real: measured within-batch max/median is 1.31 at the median and 2.94 at p90.
+# So this is only worth turning on together with BQSKIT_MS_DROP_SLOW, which
+# removes the tail the extra starts would otherwise buy. They are one
+# mechanism in two flags, not two independent knobs.
+_MS_DYNAMIC = os.environ.get('BQSKIT_MS_DYNAMIC', '0') != '0'
+_MS_MAX = int(os.environ.get('BQSKIT_MS_MAX', '16'))
+
+
+def _dynamic_multistarts(
+    default: int,
+    n_successors: int,
+    worker_width: int,
+) -> int:
+    """Round width in starts: fill the machine, never go below the default."""
+    if not _MS_DYNAMIC or n_successors < 1 or worker_width < 1:
+        return default
+    return max(default, min(_MS_MAX, worker_width // n_successors))
 
 # Deliberately overshoot the free-core reading when sizing K.
 #
@@ -432,6 +699,11 @@ class _SpeculationFlight(NamedTuple):
     epoch: int
     bound_generation: int | None
     n_tasks: int
+    # Which distance tier this flight was dispatched at. 1 = expanded from a
+    # frontier node (the only tier that exists without BQSKIT_SPEC_DEEPEN);
+    # >1 = expanded from speculation's own output, dispatched at strictly
+    # lower priority. Default 1 keeps every pre-existing construction correct.
+    tier: int = 1
 
 
 class _SpeculationMemoEntry(NamedTuple):
@@ -562,6 +834,12 @@ def _leapwaste_aggregate_flush(force: bool = False) -> None:
             'n_after_win_count': 0,
             'sum_n_cleared': 0,
             'n_cleared_count': 0,
+            # Which multistart ordinal won its successor; see
+            # _record_ms_winners. rounds/successors stay separate so "never ran"
+            # and "ran, always ordinal 0" remain distinguishable.
+            'ms_winner_index_hist': {},
+            'ms_winner_rounds': 0,
+            'ms_winner_successors': 0,
             'n_rollbacks': 0,
             'sum_backjump_depth': 0,
             'stack_depth_at_rollback': {},
@@ -756,6 +1034,112 @@ def _instantiate_single_start(
     otherwise draw from unrelated streams and make runs irreproducible.
     """
     return circuit.instantiate(target, seed=seed, multistarts=1, **kwargs)
+
+
+async def _collect_dropping_stragglers(
+    future: RuntimeFuture,
+    owner_of_task: list[tuple[int, int]],
+) -> list[Any]:
+    """Drain a parallel-multistart map, abandoning the slowest starts.
+
+    WHY THE COORDINATOR AND NOT THE TASK. A slow start cannot be killed where
+    it runs: the default instantiater is `Minimization` with `CeresMinimizer`,
+    whose `**kwargs` are TODO-ed and expose no iteration cap, and the solve
+    itself is one uninterruptible C++ call. By the time a task knows it was
+    slow it has already finished, so resampling there LENGTHENS the round. The
+    only place a straggler can actually be dropped is here, where the round is
+    waiting on it.
+
+    THE COST BEING PAID. A round costs the slowest of its tasks. Measured
+    within-batch max/median instantiate duration is 1.31 at the median and
+    2.94 at p90, so the last few starts of a round are worth a multiple of the
+    typical one.
+
+    THE RULE, fixed before the first result is read:
+      - every (batch, successor) pair must have at least one result -- never
+        return a successor with no instantiation at all, that would change the
+        search's branching, not just its parameters;
+      - and at least `_MS_KEEP_FRACTION` of all dispatched starts must be in.
+    Then cancel the rest. Missing starts are simply absent from the argmin, so
+    the caller's selection is over the starts that arrived.
+
+    THIS TRADES QUALITY FOR WALL AND THE TRADE IS NOT FREE. The dropped start
+    may be the one that would have won; on GPU QFactor, a start that is still
+    iterating is sometimes escaping a local minimum rather than failing. So
+    2Q/depth must be read alongside the wall in every arm that sets this.
+    """
+    results: dict[int, Any] = {}
+    covered: set[Any] = set()
+    all_pairs = set(owner_of_task)
+    n = len(owner_of_task)
+    keep = max(1, int(round(n * _MS_KEEP_FRACTION)))
+
+    while len(results) < n:
+        for index, result in await get_runtime().next(future):
+            results[index] = result
+            covered.add(owner_of_task[index])
+        if _MS_DROP_BRANCH:
+            # Successor-level coverage: enough BRANCHES reported, not every
+            # branch. At least one must survive or the round has nothing to
+            # take an argmin over.
+            need = max(1, int(round(len(all_pairs) * _MS_BRANCH_FRACTION)))
+            if len(covered) >= need and len(results) >= keep:
+                break
+        elif len(results) >= keep and covered >= all_pairs:
+            break
+
+    dropped = n - len(results)
+    if dropped > 0:
+        get_runtime().cancel(future)
+
+    # The counter is the whole point of having one: without it a zero result
+    # cannot be told apart from "this code never ran". `ms_rounds` counts every
+    # round that reached here, `ms_dropped` the starts actually abandoned, so
+    # `ms_dropped == 0 and ms_rounds > 0` means the rule never fired, while
+    # `ms_rounds == 0` means the path was not taken at all.
+    _agg = _LEAPWASTE_AGG_STATE
+    _agg['ms_rounds'] = _agg.get('ms_rounds', 0) + 1
+    _agg['ms_tasks'] = _agg.get('ms_tasks', 0) + n
+    _agg['ms_dropped'] = _agg.get('ms_dropped', 0) + dropped
+    if dropped > 0:
+        _agg['ms_rounds_dropping'] = _agg.get('ms_rounds_dropping', 0) + 1
+
+    return [results.get(i) for i in range(n)]
+
+
+def _record_ms_winners(winners: dict[Any, int]) -> None:
+    """Histogram WHICH multistart ordinal actually won its successor.
+
+    This decides whether a larger M can ever pay. Parallel M=16 measured 2Q 74
+    against M=4's 82 on rc_adder_6 (job 1023530) -- real quality headroom -- but
+    at 7.5x the wall. The one attempt to make it cheap bundled dynamic M with
+    BQSKIT_MS_DROP_SLOW and came back 2Q 81, i.e. the gain vanished. The
+    suspicion is that drop-slow cancels the slowest 25% of starts, and that
+    slow-converging starts are the ones finding the better optima. Nothing
+    recorded which ordinal won, so that could never be checked.
+
+    Read it as: no mass at ordinal >= M_default means the extra starts never win
+    and the M route is dead; mass out in the tail means they do win, and
+    drop-slow must not be used at high M.
+
+    Counted per successor over task SLOTS -- advanced before the None check --
+    so a start cancelled by drop-slow still consumes its ordinal and the indices
+    keep meaning the same thing across arms.
+    """
+    if not winners:
+        return
+    agg = _LEAPWASTE_AGG_STATE
+    hist = agg.setdefault('ms_winner_index_hist', {})
+    for ordinal in winners.values():
+        key = str(ordinal)
+        hist[key] = hist.get(key, 0) + 1
+    # Rounds and successors are separate so "the probe never ran" stays
+    # distinguishable from "it ran and every winner was ordinal 0" -- the exact
+    # ambiguity that made BQSKIT_MS_DROP_SLOW first measure a meaningless zero.
+    agg['ms_winner_rounds'] = agg.get('ms_winner_rounds', 0) + 1
+    agg['ms_winner_successors'] = (
+        agg.get('ms_winner_successors', 0) + len(winners)
+    )
 
 
 class LEAPSynthesisPass(SynthesisPass):
@@ -1159,7 +1543,11 @@ class LEAPSynthesisPass(SynthesisPass):
                 and self.parallel_multistart
                 and int(instantiate_options.get('multistarts', 1)) > 1
             ):
-                num_starts = int(instantiate_options['multistarts'])
+                num_starts = _dynamic_multistarts(
+                    int(instantiate_options['multistarts']),
+                    sum(len(_b) for _b in batches),
+                    self.worker_width,
+                )
                 single_options = dict(instantiate_options)
                 single_options.pop('multistarts', None)
                 single_options.pop('seed', None)
@@ -1212,7 +1600,12 @@ class LEAPSynthesisPass(SynthesisPass):
             owner_of_task: list[tuple[int, int]] | None,
         ) -> list[list[Circuit]]:
             """Collect a dispatched map and restore its batch structure."""
-            flat_results = await future
+            if owner_of_task is not None and _MS_DROP_SLOW:
+                flat_results = await _collect_dropping_stragglers(
+                    future, owner_of_task,
+                )
+            else:
+                flat_results = await future
             if owner_of_task is not None:
                 best_circuits: list[dict[int, Circuit]] = [
                     {} for _ in batches
@@ -1220,8 +1613,22 @@ class LEAPSynthesisPass(SynthesisPass):
                 best_costs: list[dict[int, float]] = [
                     {} for _ in batches
                 ]
+                # Ordinal of each start within its successor, advanced over task
+                # SLOTS (before the None check) so a dropped straggler still
+                # consumes its index and ordinals compare across arms.
+                ms_seen: dict[Any, int] = {}
+                ms_winner: dict[Any, int] = {}
                 for task_index, candidate in enumerate(flat_results):
-                    batch_index, successor_index = owner_of_task[task_index]
+                    owner_key = owner_of_task[task_index]
+                    start_ordinal = ms_seen.get(owner_key, 0)
+                    ms_seen[owner_key] = start_ordinal + 1
+                    if candidate is None:
+                        # A dropped straggler under _MS_DROP_SLOW. The
+                        # coverage rule guarantees its successor still has at
+                        # least one start, so the argmin below is over a
+                        # smaller set, never an empty one.
+                        continue
+                    batch_index, successor_index = owner_key
                     candidate_cost = self.cost.calc_cost(candidate, utry)
                     if (
                         successor_index not in best_costs[batch_index]
@@ -1230,6 +1637,8 @@ class LEAPSynthesisPass(SynthesisPass):
                     ):
                         best_costs[batch_index][successor_index] = candidate_cost
                         best_circuits[batch_index][successor_index] = candidate
+                        ms_winner[owner_key] = start_ordinal
+                _record_ms_winners(ms_winner)
 
                 return [
                     [best_circuits[i][j] for j in range(len(batch))]
@@ -1370,11 +1779,21 @@ class LEAPSynthesisPass(SynthesisPass):
                 path = os.path.join(
                     _BLOCKPROF_DIR, f'blockprof_{os.getpid()}.jsonl',
                 )
+                _lb, _kind = (
+                    _cz_lower_bound(utry) if _BLOCKPROF_CERT else (None, None)
+                )
                 with open(path, 'a', encoding='utf-8') as fh:
                     fh.write(json.dumps({
                         'target': digest,
                         'num_qudits': int(utry.num_qudits),
                         'status': status,
+                        # Lower bound on this block's 2Q count, and which
+                        # instrument produced it. 'exact' is a decision
+                        # procedure; 'osr' is a valid but loose bound. Compare
+                        # against final_layer: LEAP appends one 2Q gate per
+                        # layer, so final_layer IS the output 2Q count.
+                        'cz_lb': _lb,
+                        'cz_lb_kind': _kind,
                         'wall_s': round(time.perf_counter() - _bp_start, 4),
                         'final_layer': layer,
                         'final_dist': None if dist is None else float(dist),
@@ -1657,6 +2076,24 @@ class LEAPSynthesisPass(SynthesisPass):
         _overshoot = 1.0 if _SPEC_OVERSHOOT_AUTO else _SPEC_OVERSHOOT
         _fill_ema: float | None = None
         _k_probe_allowed = True
+        # frontier element_id -> structure key, live for the whole synthesis.
+        #
+        # The same frontier nodes are re-walked every round -- 97.9% of the
+        # candidates the loop sees are skipped because they are already queued
+        # or memoised -- and each skip was paying a fresh
+        # circuit_structure_key. Measured: 51.8% of the 60 s spent in the
+        # candidate loop was that one call (spec_key_s 31.1 s of spec_gen_s
+        # 60.0 s), at ~97 us each over 321,618 candidates.
+        #
+        # Safe because ids are unique for the whole synthesis and a given id
+        # always denotes the same circuit object with the same parameters --
+        # which is what the key must capture (see circuit_structure_key: the
+        # parameters are part of the identity, not decoration).
+        _key_cache: dict[int, _CircuitStructureKey] = {}
+        _key_cache_hits = 0
+        # Bound it. Clearing only costs recomputation, never correctness, so
+        # a hard cap is preferable to tracking liveness against the frontier.
+        _KEY_CACHE_CAP = 1 << 16
         best_dists = [best_dist]
 
         # Counted for the aggregate probe only. Local, never on self: the
@@ -1869,6 +2306,46 @@ class LEAPSynthesisPass(SynthesisPass):
                             1.0, min(contention_ema, _SPEC_OS_FUSE),
                         )
                     measured_idle = self._measured_idle_workers()
+
+                    # DEEP SPECULATION MUST NOT SHRINK ITS OWN INPUT.
+                    #
+                    # `share = max(s, measured_idle * overshoot)` and
+                    # `effective_k = 1 + (share - s)//s`, and the whole
+                    # speculation block is gated on `effective_k >= 2`. Deep
+                    # speculation occupies workers, so it lowers
+                    # measured_idle, which lowers share, which drops
+                    # effective_k to 1, which skips the block ENTIRELY --
+                    # near speculation included. Measured: with deepening on
+                    # the block ran 152 of 1,753 rounds; without it, 1,257.
+                    # Speculative tasks fell 32,928 -> 12,864 and critical
+                    # work rose 50%.
+                    #
+                    # The policy that makes counting them as free HONEST, and
+                    # not wishful, is that deep flights are the first thing
+                    # cancelled: they dispatch at strictly lower priority than
+                    # near speculation and than critical, and the cancel path
+                    # below reclaims them when near work needs the room. So a
+                    # worker running deep work is capacity we can take back,
+                    # which is what `share` is supposed to measure.
+                    #
+                    # Three earlier diagnoses of this same symptom were wrong,
+                    # each patched downstream of the real term: the dispatch
+                    # priority (measured 0), the memo hit rate (moved the
+                    # wrong way), and the `_in_flight` subtraction (the budget
+                    # was never reached). The counter that finally located it
+                    # was `in_flight_samples` == `budget_rounds` == 152.
+                    _deep_flying = sum(
+                        f.n_tasks for f in speculation_flights if f.tier > 1
+                    )
+                    if measured_idle is not None and _SPEC_DEEPEN:
+                        measured_idle = min(
+                            self.worker_width,
+                            measured_idle + _deep_flying,
+                        )
+                        if aggregate_enabled:
+                            record_spec_metric('idle_credited_deep', _deep_flying)
+                            record_spec_metric('idle_credit_rounds')
+
                     if measured_idle is not None:
                         share = (
                             float(self.expand_k_max) * float(s)
@@ -2323,7 +2800,23 @@ class LEAPSynthesisPass(SynthesisPass):
             critical_future: RuntimeFuture | None = None
             critical_batches: list[list[Circuit]] = []
             critical_owners: list[tuple[int, int]] | None = None
-            if effective_k >= 2 and first_expansion_future is None:
+            # WHICH GATE CLOSES? Three diagnoses of "deepening makes occupancy
+            # fall" were wrong in a row, each fixed downstream of the real
+            # cause. `in_flight_samples` then showed the budget code runs 152
+            # times out of 1,753 rounds with DEEPEN on -- so the budget was
+            # never the gate, this line is. Count each disjunct separately
+            # instead of guessing a fourth time.
+            if aggregate_enabled:
+                record_spec_metric('gate_rounds')
+                if effective_k < 2:
+                    record_spec_metric('gate_k_lt2')
+                if first_expansion_future is not None:
+                    record_spec_metric('gate_first_expansion')
+                record_spec_metric('gate_effective_k_sum', effective_k)
+            if (
+                (_SPEC_SIMPLE or effective_k >= 2)
+                and first_expansion_future is None
+            ):
                 critical_batches = [
                     node_successors
                     for node_successors, node_results in popped_expansions
@@ -2381,7 +2874,33 @@ class LEAPSynthesisPass(SynthesisPass):
                 # resource rule holds continuously instead of once per batch.
                 _s = max(1, round(succ_ema)) if succ_ema else len(successors)
                 _s = max(1, _s)
-                _in_flight = sum(f.n_tasks for f in speculation_flights)
+                # ONLY NEAR SPECULATION COMPETES FOR THE BUDGET.
+                #
+                # `_budget = k*s - s - _in_flight`, so anything counted in
+                # `_in_flight` suppresses the next round's speculation. Deep
+                # tiers dispatch at strictly lower priority than tier 1 and
+                # than critical, so a worker always prefers those first --
+                # counting deep work against the budget makes deepening
+                # switch ITSELF off, which is exactly what was measured:
+                # with DEEPEN on, only 174 of 1,745 rounds had any budget at
+                # all (vs 1,019 of 1,276 without), speculative tasks FELL
+                # 25,479 -> 17,268, critical work ROSE 33%, and occupancy
+                # dropped 59.6% -> 31.4%. The pool looked full (peak 1,929 vs
+                # 429) because it was stalled work, not flowing supply.
+                #
+                # This is the sixth instance of one controller shape: the
+                # controller reads a signal its own action moves.
+                _near_in_flight = sum(
+                    f.n_tasks for f in speculation_flights if f.tier <= 1
+                )
+                _deep_in_flight = sum(
+                    f.n_tasks for f in speculation_flights if f.tier > 1
+                )
+                _in_flight = _near_in_flight
+                if aggregate_enabled:
+                    record_spec_metric('near_in_flight_sum', _near_in_flight)
+                    record_spec_metric('deep_in_flight_sum', _deep_in_flight)
+                    record_spec_metric('in_flight_samples')
 
                 # Receive window: never ask for more than the machine holds,
                 # less a headroom so a critical batch never queues behind
@@ -2415,13 +2934,134 @@ class LEAPSynthesisPass(SynthesisPass):
                     )))
                     record_spec_metric('k_ctl_sum', _k_ctl)
                     record_spec_metric('k_ctl_rounds')
-                _budget = max(0, (_k_eff * _s) - _s - _in_flight)
+                if _SPEC_SIMPLE:
+                    # High-water mark on NEAR speculation only, sized to fill
+                    # the machine. Two changes, both from measurement.
+                    #
+                    # 1. THE OLD MARK COULD NOT SEE THE MACHINE.
+                    #    `int(_SPEC_HI_ROUNDS * _s)` has no worker term, so the
+                    #    ceiling was 8 * 5.53 = 44 outstanding tasks at EVERY
+                    #    worker count. Group H measured mean outstanding
+                    #    41.4 / 39.7 / 38.4 / 37.4 at W = 14 / 28 / 56 / 112 --
+                    #    pinned at 85-94% of that cap in all four, so it WAS
+                    #    the binding constraint, and outstanding/W fell from
+                    #    2.96x to 0.33x. A pool that cannot see the machine
+                    #    cannot fill it.
+                    #
+                    # 2. DEEP NO LONGER SPENDS THE NEAR BUDGET.
+                    #    Priority already orders near ahead of deep
+                    #    (`_SPEC_PRIORITY + tier` at dispatch below), so
+                    #    rationing between them here as well is double
+                    #    counting, and it is what turned depth into a net
+                    #    loss: 174/1,745 budget-bearing rounds with depth on
+                    #    against 1,019/1,276 with it off. Ordering decides who
+                    #    runs first; the budget only decides how much near
+                    #    work exists to order.
+                    #
+                    # WHY DIVIDING BY contention_ema IS NOT A FUDGE.
+                    # `measured_idle` is a GLOBAL broadcast and this block is
+                    # one of 21-34 running concurrently, so every block reading
+                    # it sees the same free cores and would claim all of them
+                    # -- an n_blocks-fold overshoot in a single round. That is
+                    # the "pool looked full (peak 1,929) because it was stalled
+                    # work, not flowing supply" symptom already on record.
+                    # contention_ema is this block's own measurement of how
+                    # many neighbours it is queueing behind (critical batch
+                    # wall over the fastest batch wall seen), and :2350 already
+                    # uses it for exactly this division. So the fair share is
+                    # idle/contention, and it needs no global block registry.
+                    _outstanding = sum(
+                        f.n_tasks for f in speculation_flights
+                    )
+                    _hi = float(_SPEC_HI_ROUNDS * _s)
+                    if _SPEC_POOL_LEGACY:
+                        # Pre-2026-08-18 arithmetic, verbatim: frontier-relative
+                        # mark, charged against near AND deep together.
+                        _budget = max(0, int(_hi) - _outstanding)
+                    else:
+                        if measured_idle is not None:
+                            _share_of_idle = (
+                                float(measured_idle)
+                                / max(1.0, contention_ema)
+                            )
+                            _hi = max(
+                                _hi, float(_near_in_flight) + _share_of_idle,
+                            )
+                        _budget = max(0, int(_hi) - _near_in_flight)
+                    if aggregate_enabled:
+                        record_spec_metric('simple_outstanding', _outstanding)
+                        record_spec_metric(
+                            'simple_near_outstanding', _near_in_flight,
+                        )
+                        record_spec_metric('simple_hi_sum', int(_hi))
+                        record_spec_metric('simple_rounds')
+                else:
+                    _budget = max(0, (_k_eff * _s) - _s - _in_flight)
+
+                # WHEN DEPTH OPENS.
+                #
+                # The rule is: only when the pool cannot fill the workers AND
+                # shallow has already proven it cannot supply more. Both halves
+                # are load-bearing. Opening on idle alone spends budget on deep
+                # candidates while the frontier still had cheap near work to
+                # give, which is precisely how the always-on arm lost.
+                #
+                # The exhaustion half is NOT a new signal -- it is a wire that
+                # was missing. `_fill_ema` is the fraction of the requested
+                # budget the frontier peek could actually fill, and
+                # `_k_probe_allowed` latches False on the round it drops below
+                # _SPEC_FILL_HOLD (the same branch that emits the existing
+                # `k_ctl_exhausted` counter). The detector was already built
+                # and already correct; nothing read it to decide about depth,
+                # so depth's gates and the frontier's own exhaustion signal sat
+                # on entirely separate inputs.
+                #
+                # Both terms lag one round by construction -- they are computed
+                # after dispatch, below. That is the correct sign: depth opens
+                # the round AFTER shallow was observed to run dry, not on a
+                # prediction that it will.
+                _shallow_dry = (
+                    not _k_probe_allowed
+                    or (
+                        _fill_ema is not None
+                        and _fill_ema < _SPEC_FILL_HOLD
+                    )
+                )
+                # None means the occupancy broadcast is missing or stale, i.e.
+                # "cannot tell", never "the machine is full". Refusing depth on
+                # an unknown would make an attached run with no manager unable
+                # to deepen at all, which is a silent never-fire rather than a
+                # decision.
+                _machine_hungry = measured_idle is None or measured_idle > 0
+                _deep_open = (
+                    _SPEC_DEEPEN
+                    and _deep_in_flight
+                    <= _SPEC_DEEP_CAP_MULT * self.worker_width
+                    and (
+                        _SPEC_DEEPEN_ALWAYS
+                        or (_machine_hungry and _shallow_dry)
+                    )
+                )
+                if aggregate_enabled and _SPEC_DEEPEN:
+                    # Every term separately, because "depth did not fire" has
+                    # three different causes and they need different fixes.
+                    record_spec_metric('deep_rounds')
+                    if _deep_open:
+                        record_spec_metric('deep_open_rounds')
+                    if _shallow_dry:
+                        record_spec_metric('deep_shallow_dry')
+                    if _machine_hungry:
+                        record_spec_metric('deep_machine_hungry')
+                    if _deep_in_flight > _SPEC_DEEP_CAP_MULT * self.worker_width:
+                        record_spec_metric('deep_cap_bound')
+
                 if _budget > 0:
                     queued_keys: set[_CircuitStructureKey] = set()
                     for _flight in speculation_flights:
                         queued_keys.update(_flight.keys)
                     next_keys: list[_CircuitStructureKey] = []
                     next_batches: list[list[Circuit]] = []
+                    next_tiers: list[int] = []
                     _acc = 0
                     # Peek PAST the cached prefix, not merely wider than K.
                     #
@@ -2448,10 +3088,129 @@ class LEAPSynthesisPass(SynthesisPass):
                     record_spec_metric('budget_requested', _budget)
                     record_spec_metric('budget_rounds')
                     _peek = len(speculation_memo) + _k_eff * 2 + 8
-                    for _, circuit, _ in frontier.peek(_peek):
+
+                    def _spec_candidates() -> Iterator[tuple[int, Circuit]]:
+                        """`(tier, circuit)`, nearest to the critical path first.
+
+                        THREE KEYS, IN THIS ORDER, and the ordering is the whole
+                        mechanism -- generating deep work without ordering it is
+                        what makes deepening lose:
+
+                        1. SERVICE CLASS. Critical never competes with
+                           speculation; that is `PRIORITY_CRITICAL` vs
+                           `_SPEC_PRIORITY`, already enforced by the worker's
+                           priority queue.
+                        2. DISTANCE FROM CRITICAL. Frontier nodes are tier 0 --
+                           the search may pop them next round. A candidate one
+                           layer past the frontier is reached with probability
+                           ~1/s, two layers ~1/s^2, so each layer of distance
+                           costs a tier. `gen_successors` appends a fixed
+                           3-gate layer, so `num_operations` measures distance
+                           in layers, and the origin is the SHALLOWEST frontier
+                           node -- the nearest thing the critical path will
+                           touch.
+                        3. EXPECTED TIME, within one tier. Ascending, so the
+                           shortest solve goes first. Not LPT: these tasks are
+                           not preemptible and a wrong deep guess holding a core
+                           is exactly how speculation blocks the critical path
+                           by OCCUPYING it. A short wrong guess releases the
+                           core sooner. `4 ** num_qudits` is constant inside a
+                           block, so `num_operations` (hence `num_params`) is
+                           the only live term.
+
+                        The tier is returned, not just used for sorting: the
+                        caller dispatches one flight per tier at
+                        `_SPEC_PRIORITY + tier`, so the ordering survives into
+                        the worker's queue instead of being lost at dispatch.
+                        """
+                        # The deep source is skipped entirely once enough of
+                        # it is already outstanding -- see _SPEC_DEEP_CAP_MULT.
+                        # element_id comes from itertools.count() in
+                        # Frontier.add (frontier.py:65,74) and Frontier is
+                        # built once per synthesize (leap.py:1961); clear()
+                        # empties the heap but never resets the counter. So an
+                        # id is unique for the whole synthesis and can key a
+                        # cache of its circuit's structure key. Deep
+                        # candidates have no frontier element, so they yield
+                        # None and are computed as before.
+                        if not _deep_open:
+                            # Stay lazy on the default path. `peek` is
+                            # O(frontier) and runs in the block's own
+                            # coroutine, and the caller breaks as soon as the
+                            # budget fills, so materialising the window would
+                            # charge every round for entries never read.
+                            for _eid, _cand, _ in frontier.peek(_peek):
+                                yield 0, _cand, _eid
+                            return
+                        _front = list(frontier.peek(_peek))
+                        for _eid, _cand, _ in _front:
+                            yield 0, _cand, _eid
+
+                        _base = min(
+                            (c.num_operations for _, c, _ in _front),
+                            default=0,
+                        )
+                        _seen_deep: set[int] = set()
+                        _deep: list[tuple[int, int, Circuit]] = []
+
+                        def _offer(_cand: Circuit) -> None:
+                            if id(_cand) in _seen_deep:
+                                return
+                            _seen_deep.add(id(_cand))
+                            _ops = _cand.num_operations
+                            _tier = 1 + max(0, (_ops - _base)) // _LAYER_GATES
+                            _deep.append((min(_tier, _SPEC_MAX_TIER), _ops, _cand))
+
+                        for _flight in speculation_flights:
+                            for _batch in _flight.batches:
+                                for _cand in _batch:
+                                    _offer(_cand)
+                        for _entry in list(speculation_memo.values()):
+                            if _entry.epoch != epoch:
+                                continue
+                            for _cand in (_entry.results or _entry.successors):
+                                _offer(_cand)
+
+                        _deep.sort(key=lambda p: (p[0], p[1]))
+                        for _tier, _ops, _cand in _deep:
+                            yield _tier, _cand, None
+
+                    # TIME THE CANDIDATE LOOP ITSELF.
+                    #
+                    # This loop runs in the BLOCK's own coroutine, and every
+                    # candidate costs a circuit_structure_key (O(gates)) plus a
+                    # gen_successors (which copies the circuit and appends
+                    # gates, s times). None of that is dispatched -- it is
+                    # serial work on the path that decides when the next
+                    # critical batch goes out.
+                    #
+                    # It is instrumented rather than reasoned about because
+                    # two plausible explanations for the pool rewrite's +15%
+                    # wall have already been refuted by measurement: task
+                    # non-preemption (p50 task is 0.51 s and the machine was
+                    # half idle) and critical queueing (critical_stall_s is
+                    # unchanged at 504 -> 491 s). Whatever the answer is, it
+                    # has to be measured here, in the one place the wall grew
+                    # that nothing else accounts for.
+                    _t_gen = time.perf_counter()
+                    _gen_calls = 0
+                    _cand_seen = 0
+                    _cand_skipped = 0
+                    # Last unsplit link. spec_gen_s is 56 s on the machine arm
+                    # and 97.9% of the candidates it walks are SKIPPED, but
+                    # "skipped" covers two different costs: the per-candidate
+                    # circuit_structure_key (O(gates)), and the once-per-round
+                    # frontier.peek walk that feeds the generator. They need
+                    # different fixes -- caching the key per circuit vs not
+                    # re-walking a stale prefix -- so time the key alone.
+                    _key_s = 0.0
+                    for _tier, circuit, _eid in _spec_candidates():
                         if _acc >= _budget:
                             break
+                        _cand_seen += 1
+                        _t_key = time.perf_counter()
                         structure_key = circuit_structure_key(circuit)
+                        _key_s += time.perf_counter() - _t_key
                         memo_entry = speculation_memo.get(structure_key)
                         if (
                             (
@@ -2460,7 +3219,9 @@ class LEAPSynthesisPass(SynthesisPass):
                             )
                             or structure_key in queued_keys
                         ):
+                            _cand_skipped += 1
                             continue
+                        _gen_calls += 1
                         node_successors = list(
                             layer_gen.gen_successors(circuit, data),
                         )
@@ -2474,7 +3235,50 @@ class LEAPSynthesisPass(SynthesisPass):
                         queued_keys.add(structure_key)
                         next_keys.append(structure_key)
                         next_batches.append(node_successors)
+                        # A successor is one layer further from critical than
+                        # the node it came from, so it inherits tier+1. Capped
+                        # so the tier can never reach a class it does not own.
+                        next_tiers.append(min(_tier + 1, _SPEC_MAX_TIER))
 
+                    if aggregate_enabled:
+                        record_spec_metric(
+                            'spec_gen_s', time.perf_counter() - _t_gen,
+                        )
+                        record_spec_metric('spec_gen_calls', _gen_calls)
+                        # Split the timer's two halves. A candidate that is
+                        # SKIPPED still costs a circuit_structure_key (O(gates))
+                        # and its share of the frontier.peek walk, and per-call
+                        # spec_gen_s doubled (4.7 -> 9.5 ms) between the arms
+                        # even though gen_successors itself did not change.
+                        # That points at rescanning already-queued candidates
+                        # rather than at generation, and the two want different
+                        # fixes: dispatching gen_successors helps only the
+                        # second, while not re-walking a stale prefix helps the
+                        # first.
+                        record_spec_metric('spec_cand_seen', _cand_seen)
+                        record_spec_metric('spec_cand_skipped', _cand_skipped)
+                        record_spec_metric('spec_key_s', _key_s)
+                        record_spec_metric('spec_gen_rounds')
+
+                    if _budget > 0:
+                        # MEASURE UNCONDITIONALLY -- there are two consumers
+                        # now, and only one of them is gated by _SPEC_CONTROL.
+                        #
+                        # The _k_ctl controller below is the original consumer
+                        # and keeps its guard. The depth gate above is the new
+                        # one and must NOT inherit it: leaving the measurement
+                        # inside `elif _SPEC_CONTROL` would pin _fill_ema at
+                        # None whenever SPEC_CONTROL=0, so _shallow_dry would
+                        # be permanently False and depth could never open --
+                        # a guard satisfied by a state the system never
+                        # enters, which is the failure this project has now
+                        # diagnosed repeatedly. Computing a ratio costs
+                        # nothing; not computing it costs a silent never-fire.
+                        _fill = _acc / float(_budget)
+                        _fill_ema = (
+                            _fill if _fill_ema is None
+                            else 0.7 * _fill_ema + 0.3 * _fill
+                        )
                     if _SPEC_CONTROL and _budget <= 0 and _k_probe_allowed:
                         # Nothing could be asked, so there is no fill rate to
                         # read -- but a window too small to ask is starving by
@@ -2487,11 +3291,6 @@ class LEAPSynthesisPass(SynthesisPass):
                         # fill rate is exhaustion, not congestion, and backing
                         # off does not refill the frontier -- only an advance
                         # does, which is what _k_probe_allowed gates.
-                        _fill = _acc / float(_budget)
-                        _fill_ema = (
-                            _fill if _fill_ema is None
-                            else 0.7 * _fill_ema + 0.3 * _fill
-                        )
                         if _k_probe_allowed:
                             if (
                                 _fill_ema >= _SPEC_FILL_GROW
@@ -2525,27 +3324,98 @@ class LEAPSynthesisPass(SynthesisPass):
                                 _k_probe_allowed = False
                                 record_spec_metric('k_ctl_exhausted')
 
+                    # Reclaim: if the near budget came out empty while deep
+                    # work is still outstanding, cancel the deepest flight.
+                    # This is the half that makes crediting deep-occupied
+                    # workers as free above an honest statement rather than a
+                    # wish -- without it the credit would promise capacity the
+                    # runtime never gives back.
+                    if (
+                        _SPEC_DEEPEN
+                        and _budget <= 0
+                        and speculation_flights
+                    ):
+                        _deepest = max(
+                            range(len(speculation_flights)),
+                            key=lambda i: speculation_flights[i].tier,
+                        )
+                        if speculation_flights[_deepest].tier > 1:
+                            _f = speculation_flights.pop(_deepest)
+                            try:
+                                get_runtime().cancel(_f.future)
+                            except Exception:
+                                pass
+                            for _k in _f.keys:
+                                speculation_memo.pop(_k, None)
+                            if aggregate_enabled:
+                                record_spec_metric('deep_reclaimed')
+                                record_spec_metric(
+                                    'deep_reclaimed_tasks', _f.n_tasks,
+                                )
+
+                    _t_disp = time.perf_counter()
                     if next_batches:
                         # Count NODES speculated on, matching what a timely
                         # hit is counted against: one node's speculation either
                         # gets used before the critical path reaches it, or it
                         # does not.
                         _spec_issued += len(next_batches)
-                        _future, _owners = dispatch_batches(
-                            next_batches, _SPEC_PRIORITY,
-                        )
-                        speculation_flights.append(_SpeculationFlight(
-                            _future, next_keys, next_batches, _owners,
-                            epoch, current_max_layer, _acc,
-                        ))
+                        # ONE FLIGHT PER TIER, each at its own priority.
+                        #
+                        # Dispatching every tier at one priority is what made
+                        # the first deepening attempt lose: the far candidates
+                        # were GENERATED in the right order and then handed to
+                        # the runtime as an unordered set, so a level-3 guess
+                        # could occupy a core ahead of a level-1 one. The
+                        # worker's queue only knows what the priority says.
+                        #
+                        # `PRIORITY_CRITICAL = 0` and `PRIORITY_SPECULATIVE =
+                        # 10` leave the whole band between them free, and the
+                        # tier is capped so speculation can never reach the
+                        # critical class no matter how deep it runs.
+                        _by_tier: dict[int, tuple[list[Any], list[Any]]] = {}
+                        for _i, _b in enumerate(next_batches):
+                            _t = next_tiers[_i] if _i < len(next_tiers) else 1
+                            _slot = _by_tier.setdefault(_t, ([], []))
+                            _slot[0].append(next_keys[_i])
+                            _slot[1].append(_b)
+                        for _t in sorted(_by_tier):
+                            _tk, _tb = _by_tier[_t]
+                            _n = sum(len(_b) for _b in _tb)
+                            _future, _owners = dispatch_batches(
+                                _tb, _SPEC_PRIORITY + _t - 1,
+                            )
+                            speculation_flights.append(_SpeculationFlight(
+                                _future, _tk, _tb, _owners,
+                                epoch, current_max_layer, _n, _t,
+                            ))
+                            record_spec_metric(f'spec_tier{min(_t, 4)}_tasks', _n)
                         tasks_dispatched += _acc
                         record_spec_metric('spec_tasks', _acc)
                         record_spec_metric('spec_flights')
                         if aggregate_enabled:
+                            # NOTE: this sum is O(every speculated circuit) and
+                            # exists ONLY when counters are on. With the new
+                            # pool sizing there are 1.85x more circuits, so it
+                            # is itself a candidate explanation for a wall
+                            # regression measured WITH LEAPWASTE=1 -- the
+                            # instrument would be part of what it measures.
+                            # Any wall claim has to be confirmed on a run with
+                            # counters OFF.
                             record_spec_metric('spec_payload_ops', sum(
                                 c.num_operations
                                 for batch in next_batches for c in batch
                             ))
+                    if aggregate_enabled:
+                        # Dispatch is NOT covered by spec_gen_s: that timer
+                        # stops when the candidate list is built, and the
+                        # map() calls happen here. spec_flights rose 3.7x
+                        # (402 -> 1476) between the arms, so this is the other
+                        # place the block's own coroutine could be spending
+                        # the missing 31 s.
+                        record_spec_metric(
+                            'spec_dispatch_s', time.perf_counter() - _t_disp,
+                        )
             current_iteration = iteration
             iteration += 1
 
@@ -2693,7 +3563,11 @@ class LEAPSynthesisPass(SynthesisPass):
                 # stream, and here each is seeded explicitly instead. Both are
                 # deterministic, but they are not the same stream, so this is
                 # not the byte-identical change that pipelining assembly was.
-                num_starts = int(instantiate_options['multistarts'])
+                num_starts = _dynamic_multistarts(
+                    int(instantiate_options['multistarts']),
+                    len(successors),
+                    self.worker_width,
+                )
                 single_options = dict(instantiate_options)
                 single_options.pop('multistarts', None)
                 single_options.pop('seed', None)
@@ -2712,7 +3586,7 @@ class LEAPSynthesisPass(SynthesisPass):
                         )
                         owner_of_task.append(successor_index)
 
-                flat_results = await get_runtime().map(
+                _ms_future = get_runtime().map(
                     _instantiate_single_start,
                     flat_circuits,
                     [utry] * len(flat_circuits),
@@ -2723,13 +3597,34 @@ class LEAPSynthesisPass(SynthesisPass):
                     ],
                     **single_options,
                 )
+                # THE SECOND PARALLEL-MULTISTART PATH. `collect_batches` above
+                # is the batched one; this is the main loop's unbatched one,
+                # and they are independent. Hooking only the first made
+                # BQSKIT_MS_DROP_SLOW measure exactly nothing on a round that
+                # came through here -- a no-op indistinguishable from "the
+                # mechanism does not help".
+                if _MS_DROP_SLOW:
+                    flat_results = await _collect_dropping_stragglers(
+                        _ms_future, owner_of_task,
+                    )
+                else:
+                    flat_results = await _ms_future
 
                 # Keep the best start per successor, by the same cost the
                 # sequential path sorts on.
                 circuits = [None] * len(successors)  # type: ignore
                 best_costs: list[float | None] = [None] * len(successors)
+                # Same winner-ordinal probe as the batched path. BOTH paths must
+                # carry it: hooking only one is how the drop-slow counter first
+                # reported a meaningless zero.
+                ms_seen2: dict[Any, int] = {}
+                ms_winner2: dict[Any, int] = {}
                 for task_index, candidate in enumerate(flat_results):
                     owner = owner_of_task[task_index]
+                    start_ordinal = ms_seen2.get(owner, 0)
+                    ms_seen2[owner] = start_ordinal + 1
+                    if candidate is None:
+                        continue
                     candidate_cost = self.cost.calc_cost(candidate, utry)
                     if (
                         best_costs[owner] is None
@@ -2737,6 +3632,8 @@ class LEAPSynthesisPass(SynthesisPass):
                     ):
                         best_costs[owner] = candidate_cost
                         circuits[owner] = candidate
+                        ms_winner2[owner] = start_ordinal
+                _record_ms_winners(ms_winner2)
             else:
                 # The plain path. The leapwaste timing lives INSIDE it, guarded,
                 # rather than in a sibling elif -- a probe that is its own branch

@@ -22,6 +22,8 @@ from bqskit.ir.gates.circuitgate import CircuitGate
 from bqskit.ir.gates.constant.unitary import ConstantUnitaryGate
 from bqskit.ir.gates.parameterized.pauli import PauliGate
 from bqskit.ir.gates.parameterized.unitary import VariableUnitaryGate
+from bqskit.runtime.task import PRIORITY_CRITICAL
+from bqskit.runtime.task import PRIORITY_SPECULATIVE
 from bqskit.ir.location import CircuitLocation
 from bqskit.ir.operation import Operation
 from bqskit.ir.point import CircuitPoint
@@ -325,6 +327,114 @@ class ForEachBlockPass(BasePass):
                     sum(1 for o in block_circuit if o.num_qudits >= 2),
                 )
         dispatch_idx = list(range(len(blocks)))
+        dispatch_seeds = [data.seed] * len(dispatch_idx)
+
+        # BLOCK-LEVEL PORTFOLIO.
+        #
+        # Run R differently-seeded copies of each block and take whichever
+        # finishes first. This is not speculation: every copy is a complete,
+        # valid synthesis of that block, so there is no hit rate and nothing is
+        # wasted on a wrong guess -- only on a slower one.
+        #
+        # WHY IT PAYS. LEAP's per-block runtime is heavy-tailed across seeds
+        # because `Circuit.instantiate` starts from random parameters, so the
+        # number of A* rounds needed to converge is a draw, not a constant.
+        # Measured 2026-08-18 on rc_adder_6, 14 blocks x 24 seeds, 336/336
+        # verified: per-block max/min ran 1.1x to 31.7x, and the pass wall
+        # (a MAX over concurrent blocks, not a sum) fell 23.35 s -> 13.44 s at
+        # R=2 and 11.92 s at R=3.
+        #
+        # WHY R IS DERIVED, NOT SET. The knee is at R=3 on that circuit, but
+        # the quantity that decides it is how much worker capacity is left over
+        # once every block has one copy running. That is a function of cores
+        # and block count, both of which vary per circuit and per machine, so
+        # the default reads them instead of hardcoding a number:
+        #
+        #     R = clamp(1, floor(workers / (S_EST * n_blocks)), R_CAP)
+        #
+        # S_EST is the measured mean A* frontier width -- the number of workers
+        # one block's search can actually keep busy. It is 5.53 at W=14, 28, 56
+        # and 112 alike, i.e. a property of the search rather than of the
+        # machine, which is what makes it usable as a constant here.
+        #
+        # The rule degenerates correctly: when n_blocks * S_EST >= workers
+        # there is no spare capacity, R falls to 1, and this whole block is
+        # exactly the old behaviour. Wide circuits on small machines therefore
+        # pay nothing.
+        _pf_cap = int(os.environ.get('BQSKIT_BLOCK_PORTFOLIO_CAP', '4'))
+        _pf_env = os.environ.get('BQSKIT_BLOCK_PORTFOLIO', 'auto').strip().lower()
+        if _pf_env == 'auto':
+            try:
+                _pf_workers = int(os.environ.get(
+                    'BQSKIT_RUNAHEAD_WORKERS', str(os.cpu_count() or 1),
+                ))
+            except ValueError:
+                _pf_workers = os.cpu_count() or 1
+            _S_EST = 5.53
+            _pf_r = int(_pf_workers // (_S_EST * max(1, len(blocks))))
+            _pf_r = max(1, min(_pf_r, _pf_cap))
+        else:
+            _pf_r = max(1, int(_pf_env))
+
+        if _pf_r > 1 and len(blocks) > 0:
+            # Distinct seeds. A large odd stride keeps replicas apart under any
+            # downstream modular hashing of the seed.
+            # data.seed is `int | None` and defaults to None (passdata.py:60),
+            # so the base copy keeps whatever it was given -- R=1 is byte-for-
+            # byte the old call -- and only the replicas need a concrete
+            # offset.
+            _pf_base_seed = data.seed if data.seed is not None else 0
+            for _k in range(1, _pf_r):
+                dispatch_idx.extend(range(len(blocks)))
+                # THE SEED IS MULTIPLIED DOWNSTREAM, so it must stay small.
+                #
+                # LEAP derives its per-start seeds as
+                #     base_seed * num_starts + start_index      (leap.py:2022)
+                # and numpy's legacy seeding rejects anything outside
+                # [0, 2**32) (utils/random.py -> mtrand.seed). A large,
+                # well-spread replica seed therefore blows the range the moment
+                # it is multiplied -- reducing mod 2**32 here is NOT enough,
+                # which is exactly how the first two attempts died.
+                #
+                # Reduce mod a PRIME just under 2**16. Two reasons:
+                #
+                #  - Headroom. Seeds stay below 65521, so the downstream
+                #    product survives num_starts up to ~65000 before reaching
+                #    2**32 -- far beyond anything the pass will ask for.
+                #  - Distinctness for free. 65521 is prime and the stride is
+                #    not a multiple of it, so k -> (base + k*stride) mod 65521
+                #    is injective for every R below the modulus. A composite
+                #    modulus would only guarantee that for strides coprime to
+                #    it, which is a condition someone would eventually break
+                #    by changing the stride.
+                dispatch_seeds.extend(
+                    [(_pf_base_seed + _k * 100003) % 65521] * len(blocks),
+                )
+        # DEMOTE THE REPLICAS, or they steal instead of filling.
+        #
+        # Measured 2026-08-18 (job 1030323, rc_adder_6, W=112): dispatching
+        # replicas at the SAME priority as the base copies took the pass from
+        # 144.9 s to 314.8 s while occupancy rose 51.7% -> 70.2% and
+        # core-seconds went 8,443 -> 24,816. That is a 2.2x LOSS, and it is
+        # the third time today the same shape appeared -- extra work at equal
+        # urgency does not fill idle capacity, it competes for busy capacity.
+        #
+        # The band between PRIORITY_CRITICAL (0) and PRIORITY_SPECULATIVE (10)
+        # is free, so replicas sit in the middle: they yield to any base copy
+        # that has work, and they outrank speculation, which is right because
+        # a replica is a complete synthesis that will be USED if it wins,
+        # while a speculation is a guess that is discarded 32% of the time.
+        _PF_PRIORITY = (PRIORITY_CRITICAL + PRIORITY_SPECULATIVE) // 2
+        dispatch_priority = [
+            PRIORITY_CRITICAL if _i < len(blocks) else _PF_PRIORITY
+            for _i in range(len(dispatch_idx))
+        ]
+        _foreach_emit({
+            'event': 'portfolio', 'replicas': _pf_r,
+            'n_blocks': len(blocks), 'n_dispatch': len(dispatch_idx),
+            'replica_priority': _PF_PRIORITY,
+        })
+
         n_dispatch = len(dispatch_idx)
         if n_dispatch > 0:
             future = get_runtime().map(
@@ -335,8 +445,9 @@ class ForEachBlockPass(BasePass):
                 [subnumberings[i] for i in dispatch_idx],
                 [cycles[i] for i in dispatch_idx],
                 [self.calculate_error_bound] * n_dispatch,
-                [data.seed] * n_dispatch,
+                dispatch_seeds,
                 [pass_down_datas[i] for i in dispatch_idx],
+                task_priority=dispatch_priority,
                 cost_hints=[
                     float(4 ** len(blocks[i][1].location))
                     for i in dispatch_idx
@@ -382,6 +493,9 @@ class ForEachBlockPass(BasePass):
         n_error_rejected = 0
         max_block_error = 0.0
         num_remaining = n_dispatch
+        _pf_blocks_won = 0
+        _pf_won_by_replica = 0
+        _pf_late = 0
 
         while num_remaining > 0:
             _fetched = await get_runtime().next(future)
@@ -390,6 +504,18 @@ class ForEachBlockPass(BasePass):
                 subcircuit, block_data = result
                 num_remaining -= 1
                 block_index = dispatch_idx[index]
+                # FIRST COPY WINS. A later copy of a block already answered is
+                # dropped here rather than reconciled: the copies are
+                # independent syntheses of the same target, so picking between
+                # them on anything other than arrival order would make the
+                # result depend on how many of them happened to finish, which
+                # is the one thing a race must not do.
+                if completed_subcircuits[block_index] is not None:
+                    _pf_late += 1
+                    continue
+                if _pf_r > 1 and index >= len(blocks):
+                    _pf_won_by_replica += 1
+                _pf_blocks_won += 1
                 completed_subcircuits[block_index] = subcircuit
                 completed_block_datas[block_index] = block_data
 
@@ -449,6 +575,31 @@ class ForEachBlockPass(BasePass):
                 else:
                     block_data['replaced'] = False
             _postprocess_cpu += time.perf_counter() - _t_chunk
+
+            # STOP AS SOON AS EVERY BLOCK HAS AN ANSWER.
+            #
+            # This is the half that makes the portfolio a win rather than a
+            # loss. Draining the whole map would make the pass wait for the
+            # SLOWEST copy of every block -- a max over R*n draws instead of a
+            # min over R -- which is strictly worse than not replicating at
+            # all. The losing copies are abandoned here.
+            #
+            # cancel() cannot stop a copy that has already started (worker.py
+            # discards cancelled tasks when popping them from the ready queue,
+            # so only unstarted ones are reclaimed). That bounds what this
+            # gives back in core-seconds, but it does not affect the wall:
+            # what matters here is that the pass stops WAITING.
+            if _pf_r > 1 and _pf_blocks_won >= num_blocks:
+                get_runtime().cancel(future)
+                break
+
+        _foreach_emit({
+            'event': 'portfolio_done', 'replicas': _pf_r,
+            'blocks_won': _pf_blocks_won,
+            'won_by_replica': _pf_won_by_replica,
+            'late_dropped': _pf_late,
+            'dispatched': n_dispatch,
+        })
 
         _t_drain_end = time.perf_counter()
 
