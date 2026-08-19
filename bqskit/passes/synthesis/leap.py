@@ -54,7 +54,6 @@ _SPEC_YIELD = (
 _SPEC_CONTROL = os.environ.get('BQSKIT_SPEC_CONTROL', '1') != '0'
 _SPEC_FILL_GROW = float(os.environ.get('BQSKIT_SPEC_FILL_GROW', '0.40'))
 _SPEC_FILL_HOLD = float(os.environ.get('BQSKIT_SPEC_FILL_HOLD', '0.20'))
-_SPEC_HEADROOM = int(os.environ.get('BQSKIT_SPEC_HEADROOM', '4'))
 # ===================================================================================
 
 # ==================== HPC: overshoot ===============================================

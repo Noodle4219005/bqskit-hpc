@@ -1,6 +1,7 @@
 """This module implements the Frontier class."""
 from __future__ import annotations
 
+import os  # HPC
 import heapq
 import itertools
 from typing import Any

@@ -591,12 +591,17 @@ class Worker:
         # Remove task
         self._tasks.pop(task.return_address, None)
 
-        # Cancel any open tasks
-        for mailbox_id in self._active_task.owned_mailboxes:
+        # Cancel any open tasks. Iterate over a COPY: cancel() removes from
+        # owned_mailboxes, and mutating the list being walked skips the next
+        # entry. Drop the ownership record on the ready path too -- popping
+        # the mailbox while leaving its id here is what produced a dangling id
+        # for a later cancel() to index.
+        for mailbox_id in list(self._active_task.owned_mailboxes):
             # If task is complete, simply discard result
             if mailbox_id in self._mailboxes:
                 if self._mailboxes[mailbox_id].ready:
                     self._mailboxes.pop(mailbox_id)
+                    self._active_task.owned_mailboxes.remove(mailbox_id)
                     continue
 
             # Otherwise send a cancel message
@@ -805,11 +810,19 @@ class Worker:
         return x
 
     def cancel(self, future: RuntimeFuture) -> None:
-        """Cancel all tasks associated with `future`."""
+        """Cancel all tasks associated with `future`.
+
+        Tolerates a mailbox that is already gone. Indexing it unguarded raised
+        KeyError inside the worker loop, which killed the worker and reached
+        the client as "Server connection unexpectedly closed".
+        """
         assert self._active_task is not None
-        num_slots = self._mailboxes[future.mailbox_id].expected_num_results
-        self._active_task.owned_mailboxes.remove(future.mailbox_id)
-        self._mailboxes.pop(future.mailbox_id)
+        mailbox = self._mailboxes.pop(future.mailbox_id, None)
+        if future.mailbox_id in self._active_task.owned_mailboxes:
+            self._active_task.owned_mailboxes.remove(future.mailbox_id)
+        if mailbox is None:
+            return
+        num_slots = mailbox.expected_num_results
         addrs = [
             RuntimeAddress(self._id, future.mailbox_id, slot_id)
             for slot_id in range(num_slots)
