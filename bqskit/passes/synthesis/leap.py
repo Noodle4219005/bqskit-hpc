@@ -311,7 +311,6 @@ _SPEC_VALUE_FLOOR = float(os.environ.get('BQSKIT_SPEC_VALUE_FLOOR', '0.02'))
 _SPEC_CONTROL = os.environ.get('BQSKIT_SPEC_CONTROL', '1') != '0'
 _SPEC_FILL_GROW = float(os.environ.get('BQSKIT_SPEC_FILL_GROW', '0.40'))
 _SPEC_FILL_HOLD = float(os.environ.get('BQSKIT_SPEC_FILL_HOLD', '0.20'))
-_SPEC_HEADROOM = int(os.environ.get('BQSKIT_SPEC_HEADROOM', '4'))
 
 # BQSKIT_SPEC_DEEPEN lets speculation expand ITS OWN output, not only the
 # frontier. Off by default: it changes what gets DISPATCHED, never what gets
@@ -411,22 +410,6 @@ _SPEC_DEEPEN_ALWAYS = _SPEC_DEEPEN_MODE == '1'
 _SPEC_SIMPLE = os.environ.get('BQSKIT_SPEC_SIMPLE', '0') != '0'
 _SPEC_HI_ROUNDS = float(os.environ.get('BQSKIT_SPEC_HI_ROUNDS', '8.0'))
 
-# BQSKIT_SPEC_POOL selects the pool sizing arithmetic. 'machine' is the current
-# design (see the branch below); 'legacy' restores the pre-2026-08-18 form
-# VERBATIM.
-#
-# It exists so the control can be an ARM rather than a different checkout.
-# Swapping leap.py between two jobs confounds the code change with the node the
-# job happened to land on -- which is exactly what went wrong on the first
-# smoke test: its `DEEPEN=0` arm was assumed to be the old behaviour, but the
-# budget rewrite is not gated by DEEPEN and applied to all three arms, so that
-# job contained no control at all.
-_SPEC_POOL = os.environ.get('BQSKIT_SPEC_POOL', 'legacy').strip().lower()
-if _SPEC_POOL not in ('machine', 'legacy'):
-    raise ValueError(
-        "BQSKIT_SPEC_POOL must be 'machine' or 'legacy', got %r." % _SPEC_POOL,
-    )
-_SPEC_POOL_LEGACY = _SPEC_POOL == 'legacy'
 
 # `SimpleLayerGenerator.gen_successors` appends exactly three gates per layer
 # (one two-qudit gate plus one single-qudit gate on each end), so a circuit's
@@ -2973,21 +2956,14 @@ class LEAPSynthesisPass(SynthesisPass):
                     _outstanding = sum(
                         f.n_tasks for f in speculation_flights
                     )
+                    # Frontier-relative high-water mark, charged against near
+                    # AND deep together. Sizing it to the MACHINE instead --
+                    # idle workers divided by this block's own contention --
+                    # was implemented, measured at 0.92x wall, and removed:
+                    # supply was never the limit, so a bigger pool only bought
+                    # contention.
                     _hi = float(_SPEC_HI_ROUNDS * _s)
-                    if _SPEC_POOL_LEGACY:
-                        # Pre-2026-08-18 arithmetic, verbatim: frontier-relative
-                        # mark, charged against near AND deep together.
-                        _budget = max(0, int(_hi) - _outstanding)
-                    else:
-                        if measured_idle is not None:
-                            _share_of_idle = (
-                                float(measured_idle)
-                                / max(1.0, contention_ema)
-                            )
-                            _hi = max(
-                                _hi, float(_near_in_flight) + _share_of_idle,
-                            )
-                        _budget = max(0, int(_hi) - _near_in_flight)
+                    _budget = max(0, int(_hi) - _outstanding)
                     if aggregate_enabled:
                         record_spec_metric('simple_outstanding', _outstanding)
                         record_spec_metric(
